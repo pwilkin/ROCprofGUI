@@ -120,12 +120,15 @@ pub fn load_capture_options(
     {
         return crate::rocpd::load(&path);
     }
+    if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("rgp")) {
+        return crate::rgp::load(&path);
+    }
     match path.file_name().and_then(|p|p.to_str()) {
         Some("filenames.json" | "code.json" | "occupancy.json") => load_ui(path.parent().unwrap(), load_wave_states),
         _ if path.extension().is_some_and(|x|x == "att") => crate::decoder::decode_with_wave_states(&path, &Default::default(), &std::sync::atomic::AtomicBool::new(false), load_wave_states),
         _ if path.extension().is_some_and(|x|x == "csv") => load_csv(&path),
         _ if path.extension().is_some_and(|x|x == "json") => load_spm(&path, sampling_method),
-        _ => Err("Open a decoded ui_output directory, rocprofv3 kernel trace CSV, SPM results JSON, or a ROCm SDK ROCPD database. Raw ATT requires the decoder Python package and V2 library.".into()),
+        _ => Err("Open a decoded ui_output directory, rocprofv3 kernel trace CSV, SPM results JSON, a ROCm SDK ROCPD database, or a RADV Vulkan .rgp capture. Raw ATT requires the decoder Python package and V2 library.".into()),
     }
 }
 fn att_selection(name: &str) -> Option<AttCounterSelection> {

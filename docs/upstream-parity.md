@@ -58,7 +58,7 @@ All-suite run, 2026-09-22, one tree state, no source change between suites, no e
 
 | Suite | Command | Result |
 |---|---|---|
-| Rust (core) | `cargo test -p profile-core --offline` | 254 passed, 0 failed, 12 ignored |
+| Rust (core) | `cargo test -p profile-core --offline` | 260 passed, 0 failed, 12 ignored |
 | Rust (host) | `cargo test -p rocprof-studio --offline` | 5 passed, 0 failed |
 | Frontend | `npm test` | 197 passed (55 files) |
 | Browser | `npm run test:ui` | 130 passed, 0 failed, 3 skipped |

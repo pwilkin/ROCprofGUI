@@ -688,6 +688,11 @@ fn load_input_checked(
         .is_some_and(|e| e.eq_ignore_ascii_case("rocprof-capture"))
     {
         crate::capture_archive::read(&path, &cancelled)
+    } else if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("rgp"))
+    {
+        crate::rgp::load(&path)
     } else if (path.is_dir() && !path.join("filenames.json").exists())
         || path
             .extension()

@@ -18,6 +18,7 @@ mod pc_sampling_csv;
 pub mod plot_files;
 pub mod project;
 mod realtime;
+pub mod rgp;
 pub mod rocpd;
 pub mod se_clock;
 pub mod source_files;

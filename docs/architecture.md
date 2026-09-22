@@ -25,6 +25,7 @@ flowchart LR
 | Layer | Location | Responsibility |
 |---|---|---|
 | Profile core | `crates/profile-core` | JSON/CSV imports, scoped sidecar access, timestamp normalization, wave reads, interval union, headless import CLI |
+| RADV RGP reader | `crates/profile-core/src/rgp.rs` | Chunked RGP container parsing and derived-SPM counter import from Mesa RADV Vulkan captures |
 | Native host | `src-tauri` | Tauri window, native open dialog, background import tasks, capture handles and lifetime |
 | Bridge | `src/bridge.ts` | Typed IPC and explicitly synthetic browser fixture |
 | Analysis | `src/analysis.ts` | Visible-range wave statistics, occupancy sweep, safe scalar expression parser |

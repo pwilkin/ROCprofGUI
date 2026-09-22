@@ -14,7 +14,7 @@ npm ci
 npm run tauri dev
 ```
 
-Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace CSV, `filenames.json`, an SPM results JSON, or host-trap/stochastic PC sampling JSON. The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches rocprofv3 against an argv, and the kernel-tuning worker compiles candidates and can write a replacement kernel source back to disk. Both are described under [MCP server](#mcp-server) and [Kernel tuning](#kernel-tuning); neither runs unless invoked.
+Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture. The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches rocprofv3 against an argv, and the kernel-tuning worker compiles candidates and can write a replacement kernel source back to disk. Both are described under [MCP server](#mcp-server) and [Kernel tuning](#kernel-tuning); neither runs unless invoked.
 
 The browser preview uses an explicitly synthetic example capture:
 
@@ -203,6 +203,23 @@ Known rough edges, none of them hardware-dependent:
 Timing deltas reported by a session are **not a claimed speedup**: no counterbalanced A/B or clock-stability experiment is run. The qualification host was gfx1151, and the sampled kernel contains no WMMA or LDS instructions, so WMMA-heavy kernels and LDS bank-conflict behavior are unqualified.
 
 What this surface does **not** do: there is no replay-equivalence gate proving a replayed kernel behaves like the original, no experiment structure over an immutable baseline, and no staged qualification of a candidate before its timings are reported. Read a session's output as a measurement of what it actually ran, not as a validated speedup.
+
+## RADV Vulkan captures
+
+A `.rgp` capture written by Mesa's RADV driver can be opened directly. This is the only route to real hardware counters on GPUs that ROCm's AQLprofile filter excludes, such as gfx1151.
+
+```bash
+MESA_VK_TRACE=rgp MESA_VK_TRACE_PER_SUBMIT=1 ./your-vulkan-app
+# writes /tmp/<app>_<timestamp>.rgp
+```
+
+`MESA_VK_TRACE_PER_SUBMIT` matters for compute: the frame-based trigger never fires without a swapchain. Because the filename has one-second granularity, a program issuing many submits per second overwrites its own captures — put the work you care about in one submit, or space submits out.
+
+What is imported: the `DERIVED_SPM` counter section, as device-wide counter series with their capture-reported names, units and groups, plus ASIC identity and topology. RADV writes only the derived SPM form on GFX10 and later; there is no raw `SPM_DB` section to read. Counters are sampled on a fixed 4,096-shader-clock interval that no environment variable changes, and they are **not** attributed to a dispatch or a wave.
+
+What is **not** imported: thread traces. A capture's SQTT sections are detected and reported in a warning, but RADV thread-trace timestamps are not usable without normalisation — measured captures span implausible clock ranges and contain negative state durations, while the SPM timestamps in the same file are sound. See [blocked inputs](docs/blocked-inputs.md) for the measurements.
+
+Counters require `RADV_THREAD_TRACE_CACHE_COUNTERS` (default on) — despite the name it is the SPM master switch, and a capture taken with it off has no counter section to import.
 
 ## Diagnostic reports
 
