@@ -1,0 +1,42 @@
+--- a/kerncap/src/replay.cpp
++++ b/kerncap/src/replay.cpp
+@@ -1126,13 +1126,19 @@
+         restore_memory();
+         restore_module_variables();
+ 
++        hipEvent_t start_event, stop_event;
++        if (hipEventCreate(&start_event) != hipSuccess || hipEventCreate(&stop_event) != hipSuccess) {
++            std::cerr << "Failed to create GPU timing events\n";
++            return 1;
++        }
+         for (size_t iter = 0; iter < iterations; ++iter) {
+             if (iter > 0 && recopy) {
+                 restore_memory();
+                 restore_module_variables();
+             }
+ 
+-            hipModuleLaunchKernel(
++            if (hipEventRecord(start_event, 0) != hipSuccess) return 1;
++            hipError_t launch_status = hipModuleLaunchKernel(
+                 hip_function,
+                 blocks[0], blocks[1], blocks[2],
+                 block[0], block[1], block[2],
+@@ -1142,8 +1148,16 @@
+                 extra
+             );
+ 
+-            hipDeviceSynchronize();
+-        }
++            if (launch_status != hipSuccess || hipEventRecord(stop_event, 0) != hipSuccess || hipEventSynchronize(stop_event) != hipSuccess) {
++                std::cerr << "HIP kernel launch or completion failed: " << hipGetErrorString(launch_status) << "\n";
++                return 1;
++            }
++            float elapsed_ms = 0;
++            if (hipEventElapsedTime(&elapsed_ms, start_event, stop_event) != hipSuccess) return 1;
++            result.raw_ns.push_back(static_cast<uint64_t>(elapsed_ms * 1000000.0));
++        }
++        hipEventDestroy(start_event);
++        hipEventDestroy(stop_event);
+ 
+     } else {
+         hsa_queue_t* queue = nullptr;

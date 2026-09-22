@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/profile-core", "src-tauri"]
+default-members = ["crates/profile-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.93"
+
+[profile.dev]
+debug = 0

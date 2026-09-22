@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Local analysis window with an explicit open dialog; no shell or network plugin.",
+  "windows": ["main", "tuning-*"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}

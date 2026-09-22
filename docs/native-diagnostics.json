@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 1,
+  "kind": "rocprof-studio-diagnostics",
+  "generatedAt": "2026-09-19T15:46:22.560Z",
+  "application": {
+    "name": "rocprof studio",
+    "version": "0.1.0"
+  },
+  "runtime": {
+    "backendVersion": "0.1.0",
+    "cpuArchitecture": "x86_64",
+    "decoder": {
+      "library": null,
+      "python": "python3",
+      "status": "configuration only; availability not probed by export",
+      "timeoutSeconds": 300
+    },
+    "environment": "desktop",
+    "inputHash": null,
+    "inputIdentity": "live reference, not fingerprinted",
+    "inputPath": "/devel/tools/rocprofgui/fixtures/rocpd/sdk-3.0.4.db",
+    "os": "linux"
+  },
+  "capture": {
+    "name": "sdk-3.0.4.db",
+    "format": "ROCPD",
+    "architecture": "Unknown",
+    "clock": {
+      "unit": "ns",
+      "origin": "1000000000",
+      "start": 0,
+      "end": 300000
+    },
+    "metadata": {
+      "readOnly": "true",
+      "rocpdSchemaAdapter": "ROCm SDK dispatch/symbol schema (3.x column contract)"
+    },
+    "warnings": [
+      "ROCPD kernel dispatch records do not prove graph replay coverage. No detailed SQTT tokens were inferred from dispatch rows."
+    ]
+  },
+  "inventory": {
+    "waveIndexes": 0,
+    "residencyIntervals": 0,
+    "instructions": 0,
+    "dispatches": 2,
+    "sampledCounters": [
+      {
+        "index": 0,
+        "name": "SQ_WAVES",
+        "scope": "process 100 · agent 00ecde8307b8_SCHEMA_3_0_4:1 · [{\"dimension_name\":\"DIMENSION_XCC\",\"index\":0},{\"dimension_name\":\"DIMENSION_SHADER_ENGINE\",\"index\":0},{\"dimension_name\":\"DIMENSION_INSTANCE\",\"index\":0}]",
+        "unit": "unspecified",
+        "sampleCount": 1,
+        "firstTimestamp": 50000,
+        "lastTimestamp": 50000
+      },
+      {
+        "index": 1,
+        "name": "SQ_WAVES",
+        "scope": "process 100 · agent 00ecde8307b8_SCHEMA_3_0_4:1 · [{\"dimension_name\":\"DIMENSION_XCC\",\"index\":0},{\"dimension_name\":\"DIMENSION_SHADER_ENGINE\",\"index\":1},{\"dimension_name\":\"DIMENSION_INSTANCE\",\"index\":0}]",
+        "unit": "unspecified",
+        "sampleCount": 1,
+        "firstTimestamp": 50000,
+        "lastTimestamp": 50000
+      }
+    ],
+    "eventCounters": {
+      "records": 0,
+      "definitions": 0,
+      "missingValues": 0,
+      "ambiguousDispatchAssociations": 0,
+      "withoutDispatch": 0
+    },
+    "markers": {
+      "records": 0,
+      "points": 0,
+      "incompleteScopes": 0
+    },
+    "registeredSources": 0,
+    "inlineSourceSnapshots": 0
+  },
+  "measurementAvailability": {
+    "dispatchResources": {
+      "vgpr": {
+        "known": 0,
+        "missing": 2
+      },
+      "sgpr": {
+        "known": 0,
+        "missing": 2
+      },
+      "lds": {
+        "known": 0,
+        "missing": 2
+      },
+      "scratch": {
+        "known": 0,
+        "missing": 2
+      }
+    },
+    "pcIssuedRows": 0,
+    "pcStalledRows": 0,
+    "stallReasonRows": 0,
+    "coverageMeaning": "Presence counts describe imported fields; they do not prove collection completeness or replay coverage."
+  },
+  "workspace": {
+    "location": {
+      "waveId": "",
+      "instruction": 0,
+      "iteration": 0,
+      "range": [
+        0,
+        300000
+      ],
+      "timeline": "wave"
+    },
+    "view": "evidence",
+    "mode": "capture",
+    "timeline": "wave",
+    "independentRanges": false,
+    "timelineRanges": {},
+    "plotAxes": {},
+    "plotRanges": {},
+    "histogramBins": 16,
+    "scalarCounters": [],
+    "nonhidden": false,
+    "includeIdle": false,
+    "history": [
+      {
+        "waveId": "",
+        "instruction": 0,
+        "iteration": 0,
+        "range": [
+          0,
+          300000
+        ]
+      }
+    ],
+    "historyIndex": 0
+  },
+  "definitions": {
+    "version": 1,
+    "selected": "default",
+    "files": [
+      {
+        "id": "default",
+        "name": "derived_counters.txt",
+        "text": "Total := sum[SQ_INSTS_VALU, axis=[XCC,SE,CU]]"
+      }
+    ]
+  },
+  "definitionState": "Current editor drafts; may differ from the last successful tensor evaluation.",
+  "sourceRegistry": [],
+  "sourceReplacements": [],
+  "analysis": {
+    "hidden": {
+      "available": false,
+      "pending": false,
+      "model": null
+    },
+    "loadedWave": null
+  },
+  "qualification": {
+    "replayCoverageVerified": false,
+    "nativeTimingControlAttached": false,
+    "correctnessGateAttached": false,
+    "runtimeLibraryMappingVerified": false,
+    "thermalContentionControlAttached": false
+  },
+  "limitations": [
+    "This manifest is diagnostic context, not a portable capture or a performance qualification.",
+    "Raw inputs, trace samples and source text are not embedded. Input hashes are not computed by this export.",
+    "Definition text, capture metadata and local paths are included; source replacement hashes identify text without proving its revision."
+  ]
+}

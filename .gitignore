@@ -1,0 +1,15 @@
+/node_modules/
+/target/
+/dist/
+/test-results/
+/playwright-report/
+/src-tauri/gen/
+*.log
+
+*.tsbuildinfo
+
+/.decoder-venv/
+
+/.codex/
+/third_party/decoder-python/build/
+/.synagent/

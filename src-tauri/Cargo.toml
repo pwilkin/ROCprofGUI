@@ -1,0 +1,20 @@
+[package]
+name = "rocprof-studio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+profile-core = { path = "../crates/profile-core" }
+tiny_http = "0.12"
+libc = "0.2"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

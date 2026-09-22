@@ -1,0 +1,40 @@
+import { test, expect } from "@playwright/test";
+
+test("range fields preserve opposite-bound drafts and follow own-bound updates", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(async () => {
+    const path = "/tests/range-bound-harness.tsx";
+    (await import(path)).mount();
+  });
+  const host = page.locator("#range-bound-test");
+  const start = host.getByLabel("Range start");
+  const end = host.getByLabel("Range end");
+  await end.fill("650");
+  await host.getByRole("button", { name: "External start", exact: true }).click();
+  await expect(host.locator("output")).toHaveText("[100,1000]");
+  await expect(end).toHaveValue("650");
+  await end.press("Enter");
+  await expect(host.locator("output")).toHaveText("[100,650]");
+  await start.fill("250");
+  await host.getByRole("button", { name: "External end", exact: true }).click();
+  await expect(host.locator("output")).toHaveText("[100,800]");
+  await expect(start).toHaveValue("250");
+  await start.press("Enter");
+  await expect(host.locator("output")).toHaveText("[250,800]");
+  await end.fill("700");
+  await host.getByRole("button", { name: "External end", exact: true }).click();
+  await expect(end).toHaveValue("700");
+  await end.press("Escape");
+  await expect(end).toHaveValue("800");
+  await start.fill("900");
+  await start.press("Enter");
+  await expect(start).toHaveValue("250");
+  await expect(host).toContainText("Enter a finite bound");
+  await start.fill("200");
+  await host.getByRole("button", { name: "External start", exact: true }).click();
+  await expect(start).toHaveValue("100");
+  await end.fill("750");
+  await host.getByRole("button", { name: "External start", exact: true }).click();
+  await expect(start).toHaveValue("100");
+  await expect(end).toHaveValue("750");
+});
