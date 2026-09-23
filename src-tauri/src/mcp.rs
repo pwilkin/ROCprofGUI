@@ -1638,11 +1638,23 @@ mod tests {
     }
     #[test]
     fn rgp_captures_are_collected_by_process_name_and_submit_order() {
+        // Removes what the test put in /tmp even when an assertion fails.
+        struct Cleanup(Vec<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = if p.is_dir() { fs::remove_dir_all(p) } else { fs::remove_file(p) };
+                }
+            }
+        }
         let job = tempfile_dir();
         let tag = format!("rpgtest{}", std::process::id());
+        let mut cleanup = Cleanup(vec![job.clone(), PathBuf::from(format!("/tmp/other{tag}_submit0.rgp"))]);
         let started = std::time::SystemTime::now();
         for n in [10, 2, 1] {
-            fs::write(format!("/tmp/{tag}_2026.01.01_00.00.00_submit{n}.rgp"), b"x").unwrap();
+            let path = PathBuf::from(format!("/tmp/{tag}_2026.01.01_00.00.00_submit{n}.rgp"));
+            fs::write(&path, b"x").unwrap();
+            cleanup.0.push(path);
         }
         fs::write(format!("/tmp/other{tag}_submit0.rgp"), b"x").unwrap();
         let files = collect_rgp(&format!("/usr/bin/{tag}"), started, &job).unwrap();
@@ -1651,8 +1663,6 @@ mod tests {
         assert!(names[0].ends_with("submit1.rgp") && names[2].ends_with("submit10.rgp"), "{names:?}");
         assert!(files.iter().all(|p| p.starts_with(job.join("rgp"))));
         assert!(!Path::new(&format!("/tmp/{tag}_2026.01.01_00.00.00_submit1.rgp")).exists());
-        let _ = fs::remove_file(format!("/tmp/other{tag}_submit0.rgp"));
-        let _ = fs::remove_dir_all(&job);
     }
     fn tempfile_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rpg-mcp-test-{}-{}", std::process::id(), random().unwrap()));

@@ -231,8 +231,15 @@ Limits:
 - **Source recovery:** automatic only for ggml's Vulkan shader build. Other projects can replay and time the captured SPIR-V, but not edit it.
 - **Pipeline names:** the dispatch must have one, from the application's debug names or labels. A kernel identified only by pipeline hash cannot be selected.
 - **Capture size:** a capture holds every bound range, and ggml binds the rest of its compute buffer as the output range, so one matrix-multiply capture is about 250–530 MB. Sessions live under `~/.rocprofgui/shader-tuning/sessions`.
-- **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it. Replay runs the dispatch between buffer restores, at clocks a sustained application may not hold; on llama.cpp a 30% isolated gain was 4% inside the application. Confirm a variant in the application before relying on it.
+- **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it. A default replay is a best case. Inputs are restored between dispatches, so the GPU never runs under sustained load. On an APU the replay's buffers usually land in the VRAM carve-out, where the application's data may not. On llama.cpp both mattered, but only for higher-occupancy variants: a 30% isolated gain was 4% inside the application (open-work's ninth pass). Confirm a variant in the application before relying on it.
 - **Driver:** the replay compiles with whatever driver the session's environment selects. A session created from an MCP `profile_run` inherits that run's `VK_DRIVER_FILES`, so a session profiled on a patched Mesa tunes for that Mesa's compiler. Mesa 26.0.8 and 26.2.0 compile the same IQ4_NL shader to 192 and 120 VGPRs at pad 2.
+
+`vkreplay` can also be run by hand on a session's capture directory, to reproduce application conditions:
+
+- `--mode sustained` restores the inputs once, then dispatches back to back. This is only valid for a dispatch that does not read what it writes.
+- `--memory gtt` puts the bound buffers in host-visible system memory, and `--memory app` in the memory type ggml uses on unified-memory GPUs.
+- `--flush-mb N` evicts the caches before each dispatch.
+- `--counters` adds the driver's performance counters, including GPU cycles and cache hit ratios. Cycles over time give the clock the dispatch actually ran at.
 
 ## RADV Vulkan captures (experimental)
 

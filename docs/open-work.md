@@ -103,6 +103,43 @@ Tool follow-ups this exposed, none done:
 - **Cross-driver replay.** `vkreplay` refuses a capture made on another driver with a bare `vkCreateDevice failed (-8)`. It should name the unsupported feature, or drop it with a note.
 - **Driver in results.** Replay results and sessions should show the driver version they ran on.
 
+**Ninth pass — why replay and application disagree, 2026-09-23.** All measurements are on the FFN gate/up matmul (m=12288) with Mesa 26.2.0.
+
+Method:
+- `vkreplay` gained `--mode sustained`, `--memory device|app|gtt`, `--flush-mb` and `--counters` (VK_KHR_performance_query).
+- In-application times per dispatch came from a test-only line in ggml's perf logger, in a scratch copy of llama.cpp.
+
+Four causes, all measured:
+- **Placement.** The VRAM carve-out on this APU is 2 GB, mostly used by the desktop, so llama.cpp's weights live in GTT, while a replay's buffers fit in VRAM.
+  - In the application, pad 2 takes 1950–3050 µs per layer, and each layer's time is stable across repetitions. Pad 4 takes 2450–2650 µs everywhere.
+  - Forcing every weight into GTT (`GGML_VK_PREFER_HOST_MEMORY`) removes the uniformly fast final layers.
+  - Two layers 50% apart in the application replay identically in VRAM (1693 and 1697 µs).
+  - Fresh GTT allocations in replay give 2120–2953 µs for pad 2 and 2303–2394 µs for pad 4.
+- **Cycles, not clock.** At a steady ~2.45 GHz, the GTT slowdowns are up to 45% more GPU cycles.
+  - The L2 hit rate is 79% at 8 waves regardless of placement.
+  - At 12 waves it is 53% in VRAM and 45–51% in GTT, with lower L1 hits.
+  - More workgroups in flight cost cache hits, and scattered 4 KB pages cost more. This fits physically addressed cache and channel mapping, or address translation; the available counters cannot separate the two.
+- **Sustained load.** Back to back, cycles do not change, but the clock falls from about 2.45 GHz to 2.37 GHz at 8 waves, and to 1.87–1.92 GHz at 12 waves. Replay's default restore between dispatches never gets there.
+- **Sampling.** A session captures one layer's dispatch from one allocation. The application averages 64 dispatches over 64 weight regions.
+
+**Spec-compliant alternative to pad 2.** Keep pad 4 and stage f16 results in `buf_a`. The main loop ends on a barrier, so `buf_a` is free by the time results are stored.
+- **Compiler:** shared memory drops from 23.5 to 21.5 KB, giving 120 VGPRs and 12 waves on Mesa 26.2.
+- **Correctness:** outputs are bit-identical, and `test-backend-ops` MUL_MAT (1128/1128) and MUL_MAT_ID (937/937) pass on 26.2 and 26.0.8.
+- **Replay:** −24% in VRAM and −15% sustained in GTT, with the same per-allocation spread as pad 2.
+- **Application:** pp512 +6% (1099 → 1169 t/s). FFN gate/up −1.5%, FFN down +0.2%, the other IQ4_NL shapes −22%.
+- **Mesa 26.0.8:** 192 VGPRs and 8 waves, no gain.
+- **Scope:** bf16 variants are excluded, because their `buf_a` holds bf16.
+
+The patch is in `.synagent/archive/`; nothing has been sent anywhere.
+
+For these matmuls, higher occupancy trades L2 hits for latency hiding. It pays only while the weights sit in VRAM-like memory and the clock holds. A larger carve-out (a firmware setting) would test the first condition; that is untested.
+
+RADV's instruction counters report VALU equal to SALU and VMEM equal to SMEM, so only cycles and hit ratios were used.
+
+Tool follow-ups, none done:
+- **Cost indicators in session runs.** Runs should report cycles, clock and hit ratios. Pad 2's L2 drop from 79% to 53% was visible before any application run.
+- **Application-like conditions.** Sessions should offer sustained and GTT runs, and a sweep over fresh allocations, beside the default best case.
+
 Found along the way:
 - **The first capture read 1 GB back from uncached write-combined memory and took 166 s.** Host-cached staging memory brought it to 2.5 s.
 - **`profile_run`'s RADV mode failed if another process removed a `/tmp` entry mid-scan.** It now examines only its own files.

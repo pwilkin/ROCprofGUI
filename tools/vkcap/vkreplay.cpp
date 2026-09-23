@@ -2,9 +2,13 @@
 //
 //   vkreplay CAPTURE_DIR [--spirv FILE] [--iterations N] [--no-validate]
 //            [--isa FILE] [--dump-outputs DIR]
+//            [--mode stateless|sustained] [--memory device|app|gtt] [--flush-mb N] [--counters]
 //
 // Each timed iteration restores every captured input from a pristine copy, so a
 // dispatch that writes its own inputs is measured on the same data every time.
+// --mode, --memory and --flush-mb change the conditions the dispatch runs under,
+// to compare an isolated timing with the application's. --counters adds the
+// driver's performance counters (VK_KHR_performance_query), including GPU cycles.
 // Validation replays once more and compares every bound buffer byte for byte with
 // what the application's own dispatch left there. Prints one JSON object.
 #include <vulkan/vulkan.h>
@@ -123,7 +127,7 @@ struct Replay {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t family = 0;
-    bool executable_properties = false, debug_utils = false;
+    bool executable_properties = false, debug_utils = false, want_counters = false, performance_query = false;
     std::vector<std::string> notes;
 
     uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
@@ -135,8 +139,15 @@ struct Replay {
             if ((bits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & want) == want) return i;
         die("no suitable memory type");
     }
+    // A type with exactly these properties: a placement experiment must not drift
+    // into cached or device-local memory the way the preference above does.
+    uint32_t memory_type_exact(uint32_t bits, VkMemoryPropertyFlags want) {
+        for (uint32_t i = 0; i < mem.memoryTypeCount; i++)
+            if ((bits & (1u << i)) && mem.memoryTypes[i].propertyFlags == want) return i;
+        die("no memory type with exactly the requested properties");
+    }
 
-    Buffer buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props_) {
+    Buffer buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props_, bool exact = false) {
         Buffer b;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = std::max<VkDeviceSize>(size, 4);
@@ -146,7 +157,7 @@ struct Replay {
         vkGetBufferMemoryRequirements(device, b.buffer, &req);
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.allocationSize = req.size;
-        alloc.memoryTypeIndex = memory_type(req.memoryTypeBits, props_);
+        alloc.memoryTypeIndex = exact ? memory_type_exact(req.memoryTypeBits, props_) : memory_type(req.memoryTypeBits, props_);
         check(vkAllocateMemory(device, &alloc, nullptr, &b.memory), "vkAllocateMemory");
         check(vkBindBufferMemory(device, b.buffer, b.memory, 0), "vkBindBufferMemory");
         return b;
@@ -199,12 +210,18 @@ struct Replay {
         bool exec_listed = std::find(names.begin(), names.end(), VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) != names.end();
         if (!exec_listed && supported(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) names.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
         executable_properties = std::find(names.begin(), names.end(), VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) != names.end();
+        if (want_counters) {
+            bool listed = std::find(names.begin(), names.end(), VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME) != names.end();
+            if (!listed && supported(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME)) names.push_back(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME);
+            performance_query = std::find(names.begin(), names.end(), VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME) != names.end();
+            if (!performance_query) notes.push_back("performance counters were requested, but the driver does not support VK_KHR_performance_query");
+        }
         std::vector<const char *> ext;
         for (auto &n : names) ext.push_back(n.c_str());
 
         // Rebuild the application's feature chain from the captured structure bodies.
         std::vector<std::vector<uint8_t>> chain;
-        bool exec_feature = false;
+        bool exec_feature = false, perf_feature = false;
         for (auto &ft : cap.features) {
             auto body = slurp(cap.dir + "/" + ft.file);
             std::vector<uint8_t> s(sizeof(VkBaseOutStructure) + body.size());
@@ -214,6 +231,17 @@ struct Replay {
                 exec_feature = true;
                 ((VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR *)s.data())->pipelineExecutableInfo = executable_properties;
             }
+            if (ft.stype == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR) {
+                perf_feature = true;
+                if (performance_query) ((VkPhysicalDevicePerformanceQueryFeaturesKHR *)s.data())->performanceCounterQueryPools = VK_TRUE;
+            }
+            chain.push_back(std::move(s));
+        }
+        if (performance_query && !perf_feature) {
+            std::vector<uint8_t> s(sizeof(VkPhysicalDevicePerformanceQueryFeaturesKHR));
+            auto *f = (VkPhysicalDevicePerformanceQueryFeaturesKHR *)s.data();
+            f->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR;
+            f->performanceCounterQueryPools = VK_TRUE;
             chain.push_back(std::move(s));
         }
         if (executable_properties && !exec_feature) {
@@ -280,8 +308,9 @@ struct Replay {
     }
 
     int run(int argc, char **argv) {
-        std::string spirv_path, isa_path, dump_dir;
+        std::string spirv_path, isa_path, dump_dir, mode = "stateless", memory = "device";
         int iterations = 20;
+        uint64_t flush_mb = 0;
         bool validate = true;
         cap = load(argv[1]);
         spirv_path = cap.dir + "/" + cap.spirv;
@@ -293,9 +322,23 @@ struct Replay {
             else if (a == "--no-validate") validate = false;
             else if (a == "--isa") isa_path = value();
             else if (a == "--dump-outputs") dump_dir = value();
+            else if (a == "--mode") mode = value();
+            else if (a == "--memory") memory = value();
+            else if (a == "--flush-mb") flush_mb = std::stoull(value());
+            else if (a == "--counters") want_counters = true;
             else die("unknown argument " + a);
         }
         if (iterations < 1 || iterations > 100000) die("iterations must be between 1 and 100000");
+        if (mode != "stateless" && mode != "sustained") die("--mode must be stateless or sustained");
+        // Where the dispatch's buffers live. "device" is device-local memory, which a
+        // small replay usually gets in VRAM; "app" is what ggml asks for on UMA
+        // (device-local, host-visible, coherent); "gtt" is host-visible,
+        // non-device-local memory, i.e. system pages mapped through the GART.
+        VkMemoryPropertyFlags work_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        bool work_exact = false;
+        if (memory == "app") { work_memory |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT; work_exact = true; }
+        else if (memory == "gtt") { work_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT; work_exact = true; }
+        else if (memory != "device") die("--memory must be device, app or gtt");
         create_device();
 
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -308,7 +351,7 @@ struct Replay {
         const VkBufferUsageFlags work_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         std::vector<Buffer> work, pristine;
         for (auto &g : cap.buffers) {
-            work.push_back(buffer(g.size, work_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+            work.push_back(buffer(g.size, work_usage, work_memory, work_exact));
             pristine.push_back(buffer(g.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
             auto data = slurp(cap.dir + "/" + g.in);
             if (data.size() != g.size) die("input " + g.in + " has the wrong size");
@@ -448,15 +491,142 @@ struct Replay {
         qpi.queryCount = 2 * (uint32_t)iterations;
         VkQueryPool queries;
         check(vkCreateQueryPool(device, &qpi, nullptr, &queries), "vkCreateQueryPool");
+        // Stateless: restore every input before each timed dispatch. Sustained: restore
+        // once and dispatch back to back, as an application keeps the GPU busy; only
+        // valid for timing a dispatch that does not read what it writes. Either can
+        // copy a scratch buffer before each dispatch to evict the caches.
+        Buffer flush_src, flush_dst;
+        if (flush_mb) {
+            flush_src = buffer(flush_mb << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            flush_dst = buffer(flush_mb << 20, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
+        auto flush = [&](VkCommandBuffer cb) {
+            if (!flush_mb) return;
+            barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkBufferCopy region{0, 0, flush_mb << 20};
+            vkCmdCopyBuffer(cb, flush_src.buffer, flush_dst.buffer, 1, &region);
+            barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        };
         VkCommandBuffer cb = begin();
         vkCmdResetQueryPool(cb, queries, 0, qpi.queryCount);
+        if (mode == "sustained") restore(cb);
         for (int i = 0; i < iterations; i++) {
-            restore(cb);
+            if (mode == "stateless") restore(cb);
+            else barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            flush(cb);
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 2 * i);
             dispatch(cb);
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 2 * i + 1);
         }
         submit(cb);
+        if (mode == "sustained") notes.push_back("sustained mode: inputs were restored once, so timings are valid only if the dispatch does not read what it writes");
+
+        // Driver performance counters, under the same conditions but in separate
+        // dispatches, since a counter query drains the GPU around its command.
+        // Timestamps bracket each one too, so cycles over time give the clock the
+        // dispatch actually ran at.
+        std::string counters = "null";
+        if (performance_query) {
+            auto enum_counters = (PFN_vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR)vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR");
+            auto get_passes = (PFN_vkGetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR)vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR");
+            auto acquire = (PFN_vkAcquireProfilingLockKHR)vkGetDeviceProcAddr(device, "vkAcquireProfilingLockKHR");
+            auto release = (PFN_vkReleaseProfilingLockKHR)vkGetDeviceProcAddr(device, "vkReleaseProfilingLockKHR");
+            uint32_t cn = 0;
+            enum_counters(physical, family, &cn, nullptr, nullptr);
+            std::vector<VkPerformanceCounterKHR> kinds(cn, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_KHR});
+            std::vector<VkPerformanceCounterDescriptionKHR> descs(cn, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_DESCRIPTION_KHR});
+            enum_counters(physical, family, &cn, kinds.data(), descs.data());
+            std::vector<uint32_t> indices;
+            for (uint32_t i = 0; i < cn; i++)
+                if (kinds[i].scope == VK_PERFORMANCE_COUNTER_SCOPE_COMMAND_KHR) indices.push_back(i);
+            VkQueryPoolPerformanceCreateInfoKHR pci{VK_STRUCTURE_TYPE_QUERY_POOL_PERFORMANCE_CREATE_INFO_KHR};
+            pci.queueFamilyIndex = family;
+            pci.counterIndexCount = (uint32_t)indices.size();
+            pci.pCounterIndices = indices.data();
+            uint32_t passes = 0;
+            get_passes(physical, &pci, &passes);
+            const uint32_t n = (uint32_t)std::min(iterations, 20);
+            VkQueryPoolCreateInfo pqi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            pqi.pNext = &pci;
+            pqi.queryType = VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR;
+            pqi.queryCount = n;
+            VkQueryPool pool_perf, pool_time;
+            check(vkCreateQueryPool(device, &pqi, nullptr, &pool_perf), "vkCreateQueryPool (performance)");
+            VkQueryPoolCreateInfo tqi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            tqi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            tqi.queryCount = 2 * n;
+            check(vkCreateQueryPool(device, &tqi, nullptr, &pool_time), "vkCreateQueryPool (timestamps)");
+            VkAcquireProfilingLockInfoKHR lock{VK_STRUCTURE_TYPE_ACQUIRE_PROFILING_LOCK_INFO_KHR};
+            lock.timeout = UINT64_MAX;
+            check(acquire(device, &lock), "vkAcquireProfilingLockKHR");
+            // A performance query cannot be reset in the command buffer that begins it.
+            VkCommandBuffer reset = begin();
+            vkCmdResetQueryPool(reset, pool_perf, 0, n);
+            submit(reset);
+            VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            ai.commandPool = pool;
+            ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ai.commandBufferCount = 1;
+            VkCommandBuffer mcb;
+            check(vkAllocateCommandBuffers(device, &ai, &mcb), "vkAllocateCommandBuffers");
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            check(vkBeginCommandBuffer(mcb, &bi), "vkBeginCommandBuffer");
+            vkCmdResetQueryPool(mcb, pool_time, 0, 2 * n);
+            if (mode == "sustained") restore(mcb);
+            for (uint32_t i = 0; i < n; i++) {
+                if (mode == "stateless") restore(mcb);
+                else barrier(mcb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                flush(mcb);
+                vkCmdBeginQuery(mcb, pool_perf, i, 0);
+                vkCmdWriteTimestamp(mcb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool_time, 2 * i);
+                dispatch(mcb);
+                vkCmdWriteTimestamp(mcb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool_time, 2 * i + 1);
+                vkCmdEndQuery(mcb, pool_perf, i);
+            }
+            check(vkEndCommandBuffer(mcb), "vkEndCommandBuffer");
+            std::vector<double> pass_ns;
+            for (uint32_t p = 0; p < passes; p++) {
+                VkPerformanceQuerySubmitInfoKHR psi{VK_STRUCTURE_TYPE_PERFORMANCE_QUERY_SUBMIT_INFO_KHR};
+                psi.counterPassIndex = p;
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                si.pNext = &psi;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &mcb;
+                check(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit (counters)");
+                check(vkQueueWaitIdle(queue), "vkQueueWaitIdle");
+                std::vector<uint64_t> st(2 * n);
+                check(vkGetQueryPoolResults(device, pool_time, 0, 2 * n, st.size() * 8, st.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults (timestamps)");
+                for (uint32_t i = 0; i < n; i++) pass_ns.push_back((st[2 * i + 1] - st[2 * i]) * (double)props.limits.timestampPeriod);
+            }
+            std::vector<VkPerformanceCounterResultKHR> res(n * indices.size());
+            check(vkGetQueryPoolResults(device, pool_perf, 0, n, res.size() * sizeof(res[0]), res.data(), indices.size() * sizeof(res[0]), VK_QUERY_RESULT_WAIT_BIT),
+                  "vkGetQueryPoolResults (counters)");
+            release(device);
+            auto value = [&](const VkPerformanceCounterKHR &k, const VkPerformanceCounterResultKHR &r) -> double {
+                switch (k.storage) {
+                case VK_PERFORMANCE_COUNTER_STORAGE_INT32_KHR: return r.int32;
+                case VK_PERFORMANCE_COUNTER_STORAGE_INT64_KHR: return (double)r.int64;
+                case VK_PERFORMANCE_COUNTER_STORAGE_UINT32_KHR: return r.uint32;
+                case VK_PERFORMANCE_COUNTER_STORAGE_UINT64_KHR: return (double)r.uint64;
+                case VK_PERFORMANCE_COUNTER_STORAGE_FLOAT32_KHR: return r.float32;
+                default: return r.float64;
+                }
+            };
+            auto median_of = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+            std::ostringstream c;
+            c.precision(10);
+            c << "{\"passes\":" << passes << ",\"dispatches\":" << n << ",\"durationNs\":" << median_of(pass_ns) << ",\"values\":{";
+            for (size_t j = 0; j < indices.size(); j++) {
+                std::vector<double> v;
+                for (uint32_t i = 0; i < n; i++) v.push_back(value(kinds[indices[j]], res[i * indices.size() + j]));
+                c << (j ? "," : "") << json_string(descs[indices[j]].name) << ":" << median_of(v);
+            }
+            c << "}}";
+            counters = c.str();
+            vkDestroyQueryPool(device, pool_perf, nullptr);
+            vkDestroyQueryPool(device, pool_time, nullptr);
+        }
         std::vector<uint64_t> stamps(qpi.queryCount);
         check(vkGetQueryPoolResults(device, queries, 0, qpi.queryCount, stamps.size() * 8, stamps.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults");
         std::vector<double> ns;
@@ -557,10 +727,11 @@ struct Replay {
         o.precision(10);
         o << "{\"device\":" << json_string(props.deviceName) << ",\"driverVersion\":" << props.driverVersion
           << ",\"name\":" << json_string(cap.name) << ",\"groups\":[" << cap.groups[0] << "," << cap.groups[1] << "," << cap.groups[2] << "]"
-          << ",\"execution\":{\"mode\":\"stateless\"},\"timing\":{\"unit\":\"ns\",\"median\":" << median << ",\"mean\":" << mean
+          << ",\"execution\":{\"mode\":" << json_string(mode) << ",\"memory\":" << json_string(memory) << ",\"flushBytes\":" << (flush_mb << 20)
+          << "},\"timing\":{\"unit\":\"ns\",\"median\":" << median << ",\"mean\":" << mean
           << ",\"min\":" << sorted.front() << ",\"max\":" << sorted.back() << ",\"samples\":[";
         for (size_t i = 0; i < ns.size(); i++) o << (i ? "," : "") << ns[i];
-        o << "]},\"statistics\":" << stats << ",\"validation\":" << validation << ",\"notes\":[";
+        o << "]},\"statistics\":" << stats << ",\"counters\":" << counters << ",\"validation\":" << validation << ",\"notes\":[";
         for (size_t i = 0; i < notes.size(); i++) o << (i ? "," : "") << json_string(notes[i]);
         o << "]}\n";
         fputs(o.str().c_str(), stdout);
@@ -572,7 +743,8 @@ struct Replay {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: vkreplay CAPTURE_DIR [--spirv FILE] [--iterations N] [--no-validate] [--isa FILE] [--dump-outputs DIR]\n");
+        fprintf(stderr, "usage: vkreplay CAPTURE_DIR [--spirv FILE] [--iterations N] [--no-validate] [--isa FILE] [--dump-outputs DIR]\n"
+                        "                [--mode stateless|sustained] [--memory device|app|gtt] [--flush-mb N] [--counters]\n");
         return 2;
     }
     try {
