@@ -217,9 +217,11 @@ A session runs in four steps:
 2. **Find source.** For ggml's Vulkan backend, the captured SPIR-V is matched against the build's generated shaders. The comparison ignores the capabilities, extensions and execution modes an application may add at run time; ggml adds fp16 float controls. The generator then reruns for that one source through a logging `glslc`, which recovers the exact compile command, confirmed by rebuilding to identical bytes. Every file that compile reads becomes editable.
 3. **Run.** The captured shader, or an edited variant compiled with the recovered command, is replayed in isolation:
    - The application's run-time SPIR-V edits are reapplied to each variant.
-   - Every timed iteration restores all inputs from pristine copies, and GPU timestamps bracket the dispatch.
-   - Validation compares every bound buffer byte for byte with what **the application's own dispatch** produced, not with another replay.
-   - The driver's compiler statistics (VGPRs, SGPRs, LDS, spills, wave limit) and ISA are reported.
+   - By default every timed iteration restores all inputs from pristine copies, and GPU timestamps bracket the dispatch: the isolated best case. **Replay conditions** change that. *Sustained* dispatches back to back after one restore, as an application keeps the GPU busy. *Buffers in* chooses device-local memory, ggml's unified-memory type, system memory (GTT), or *auto*, which is system memory on integrated GPUs. *Replays* repeats the run with fresh allocations and reports their spread. A cache flush can precede each dispatch. *Application-like* selects sustained, auto and three replays.
+   - Validation compares every bound buffer byte for byte with what **the application's own dispatch** produced, not with another replay. A sustained run also checks that two back-to-back dispatches still produce the same outputs, i.e. that the dispatch does not read what it writes.
+   - The driver's compiler statistics (VGPRs, SGPRs, LDS, spills, wave limit) and ISA are reported. With performance counters (on by default), so are GPU cycles, the clock the dispatch ran at, and the L0, L1 and L2 hit rates.
+   - Deltas compare a run with the latest earlier run made under the same conditions.
+   - The run records the driver version and GPU it replayed on.
    - A run can also be traced with RADV, and the trace opened here.
 4. **Save** writes the edited files back, refusing if a file changed on disk since it was read, and keeps a backup.
 
@@ -231,13 +233,13 @@ Limits:
 - **Source recovery:** automatic only for ggml's Vulkan shader build. Other projects can replay and time the captured SPIR-V, but not edit it.
 - **Pipeline names:** the dispatch must have one, from the application's debug names or labels. A kernel identified only by pipeline hash cannot be selected.
 - **Capture size:** a capture holds every bound range, and ggml binds the rest of its compute buffer as the output range, so one matrix-multiply capture is about 250–530 MB. Sessions live under `~/.rocprofgui/shader-tuning/sessions`.
-- **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it. A default replay is a best case. Inputs are restored between dispatches, so the GPU never runs under sustained load. On an APU the replay's buffers usually land in the VRAM carve-out, where the application's data may not. On llama.cpp both mattered, but only for higher-occupancy variants: a 30% isolated gain was 4% inside the application (open-work's ninth pass). Confirm a variant in the application before relying on it.
+- **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it. A default replay is a best case. Inputs are restored between dispatches, so the GPU never runs under sustained load. On an APU the replay's buffers usually land in the VRAM carve-out, where the application's data may not. On llama.cpp both mattered, but only for higher-occupancy variants: a 30% isolated gain was 4% inside the application (open-work's ninth pass). Application-like conditions predicted that (+1.7% against −24% in the best case), and the drop in L2 hit rate showed why. Confirm a variant in the application before relying on it.
 - **Driver:** the replay compiles with whatever driver the session's environment selects. A session created from an MCP `profile_run` inherits that run's `VK_DRIVER_FILES`, so a session profiled on a patched Mesa tunes for that Mesa's compiler. Mesa 26.0.8 and 26.2.0 compile the same IQ4_NL shader to 192 and 120 VGPRs at pad 2.
 
-`vkreplay` can also be run by hand on a session's capture directory, to reproduce application conditions:
+The replay conditions and counters are `vkreplay` options, which can also be run by hand on a session's capture directory:
 
 - `--mode sustained` restores the inputs once, then dispatches back to back. This is only valid for a dispatch that does not read what it writes.
-- `--memory gtt` puts the bound buffers in host-visible system memory, and `--memory app` in the memory type ggml uses on unified-memory GPUs.
+- `--memory gtt` puts the bound buffers in host-visible system memory, `--memory app` in the memory type ggml uses on unified-memory GPUs, and `--memory auto` in system memory on integrated GPUs and device-local memory otherwise.
 - `--flush-mb N` evicts the caches before each dispatch.
 - `--counters` adds the driver's performance counters, including GPU cycles and cache hit ratios. Cycles over time give the clock the dispatch actually ran at.
 

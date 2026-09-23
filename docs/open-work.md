@@ -136,14 +136,32 @@ For these matmuls, higher occupancy trades L2 hits for latency hiding. It pays o
 
 RADV's instruction counters report VALU equal to SALU and VMEM equal to SMEM, so only cycles and hit ratios were used.
 
-Tool follow-ups, none done:
-- **Cost indicators in session runs.** Runs should report cycles, clock and hit ratios. Pad 2's L2 drop from 79% to 53% was visible before any application run.
-- **Application-like conditions.** Sessions should offer sustained and GTT runs, and a sweep over fresh allocations, beside the default best case.
+**Tenth pass — replay conditions and counters in sessions, 2026-09-23.** Vulkan tuning runs take `conditions`:
+- `mode`: stateless or sustained;
+- `memory`: device, app, gtt, or auto (gtt on integrated GPUs);
+- `flushMb`;
+- `repeats`: replays with fresh allocations, reported as a spread.
+
+`autoCounters` (default on) adds GPU cycles, the clock the dispatch ran at, and L0, L1 and L2 hit rates. The UI and MCP both expose them, with Best case and Application-like presets.
+
+- **Validation.** A sustained run validates two back-to-back dispatches, so a dispatch that reads its own output is caught.
+- **Deltas.** They pair a run with the latest run under the same conditions, and each run records its driver version and memory placement.
+
+**Checked end to end through MCP** on the FFN gate/up dispatch, Mesa 26.2, with the pad-4 staging edit (in µs):
+
+| Conditions | Baseline | Edit | Change | L2 hit rate |
+|---|---|---|---|---|
+| Best case | 2370 | 1812 | −23.6% | 79% → 54% |
+| Application-like (sustained, GTT, 3 replays) | 2472 | 2513 | +1.7% | 79% → 47% |
+
+- **Spread:** the replay spread doubled, from 5.7% to 12.2%.
+- **Prediction:** inside llama-bench the same edit measured −1.5% on this shape, which the application-like conditions predicted.
+
+Four worker tests, and assertions in the browser test, cover the conditions, the counter metrics, delta pairing and the sustained check.
 
 Found along the way:
 - **The first capture read 1 GB back from uncached write-combined memory and took 166 s.** Host-cached staging memory brought it to 2.5 s.
 - **`profile_run`'s RADV mode failed if another process removed a `/tmp` entry mid-scan.** It now examines only its own files.
-- **Not fixed:** `tests/test_tuning_worker.py` still creates its temporary directories under `.codex/kernel-tuning/tests`, the last `.codex` path in the tree.
 
 Still open and unchanged: everything in §3, §4, §7, §8, §9 and §11.
 

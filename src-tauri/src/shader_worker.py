@@ -296,11 +296,49 @@ def dependencies(glslc, argv, source, root, log):
 
 # ---- replay ------------------------------------------------------------------------
 
-def replay(cfg, capture, spirv, run, log, iterations, validate):
-    argv = [cfg['replay'], str(capture), '--spirv', str(spirv), '--iterations', str(iterations), '--isa', str(run / 'isa.txt')]
+DEFAULT_CONDITIONS = {'mode': 'stateless', 'memory': 'device', 'flushMb': 0, 'repeats': 1}
+
+
+def conditions_of(request):
+    """The conditions a run's replay uses. The default is the isolated best case;
+    sustained mode and system memory approximate an application that keeps the GPU
+    busy and whose buffers do not fit in VRAM, and repeats replay with fresh
+    allocations to show how much placement moves the timing."""
+    c = {**DEFAULT_CONDITIONS, **(request.get('conditions') or {})}
+    if c['mode'] not in ('stateless', 'sustained'):
+        raise ValueError('conditions.mode must be stateless or sustained')
+    if c['memory'] not in ('device', 'app', 'gtt', 'auto'):
+        raise ValueError('conditions.memory must be device, app, gtt or auto')
+    c['flushMb'], c['repeats'] = int(c['flushMb']), int(c['repeats'])
+    if not 0 <= c['flushMb'] <= 1024:
+        raise ValueError('conditions.flushMb must be between 0 and 1024')
+    if not 1 <= c['repeats'] <= 10:
+        raise ValueError('conditions.repeats must be between 1 and 10')
+    return {k: c[k] for k in DEFAULT_CONDITIONS}
+
+
+def replay_argv(cfg, capture, spirv, iterations, conditions, validate=True, counters=False, isa=None):
+    argv = [cfg['replay'], str(capture), '--spirv', str(spirv), '--iterations', str(iterations),
+            '--mode', conditions['mode'], '--memory', conditions['memory']]
+    if conditions['flushMb']:
+        argv += ['--flush-mb', str(conditions['flushMb'])]
+    if isa:
+        argv += ['--isa', str(isa)]
+    if counters:
+        argv.append('--counters')
     if not validate:
         argv.append('--no-validate')
-    output = run / 'replay.json'
+    return argv
+
+
+def driver_of(result):
+    """Vulkan's standard version packing, which Mesa uses: major.minor.patch."""
+    v = int(result.get('driverVersion') or 0)
+    return {'version': f'{v >> 22}.{(v >> 12) & 0x3ff}.{v & 0xfff}', 'deviceType': result.get('deviceType'),
+            'device': result.get('device'), 'memory': (result.get('execution') or {}).get('memory')}
+
+
+def replay(cfg, argv, output, log):
     with output.open('wb') as stdout, Path(log).open('ab') as stderr:
         stderr.write(('\n$ ' + shlex.join(argv) + '\n').encode())
         stderr.flush()
@@ -336,16 +374,51 @@ def metric(value=None, unit='', reason=None):
     return {'value': value, 'unit': unit, 'reason': reason}
 
 
-def metrics_for(result, isa_text, work):
-    timing = result['timing']
-    us = timing['median'] / 1000
+COUNTER_METRICS = {'L0 hit rate': 'L0 cache hit ratio', 'L1 hit rate': 'L1 cache hit ratio', 'L2 hit rate': 'L2 cache hit ratio'}
+
+
+def counter_metrics(results, requested):
+    """Cycles, the clock they imply, and cache hit rates, from vkreplay --counters:
+    medians over the counted dispatches, then over the replays."""
+    counted = [r['counters'] for r in results if isinstance(r.get('counters'), dict)]
+    if not counted:
+        reason = 'Not supported by this driver' if requested else 'Counters not requested'
+        return {name: metric(None, unit, reason) for name, unit in
+                [('GPU cycles', 'cycles'), ('Clock', 'MHz'), *[(n, '%') for n in COUNTER_METRICS]]}
+    def med(values):
+        values = sorted(v for v in values if v is not None)
+        return values[len(values) // 2] if values else None
+    cycles = med(c['values'].get('GPU active cycles') for c in counted)
+    clock = med(c['values']['GPU active cycles'] / c['durationNs'] * 1e3 for c in counted
+                if c['values'].get('GPU active cycles') and c.get('durationNs'))
+    out = {
+        'GPU cycles': metric(cycles, 'cycles', 'Median over separately counted dispatches; each is drained around its counter query, which adds a small fixed cost'),
+        'Clock': metric(clock, 'MHz', 'GPU active cycles over the counted dispatches\' duration: the clock the dispatch actually ran at'),
+    }
+    for name, counter in COUNTER_METRICS.items():
+        value = med(c['values'].get(counter) for c in counted)
+        out[name] = metric(value, '%', None if value is not None else 'Not reported by this driver')
+    return out
+
+
+def metrics_for(results, isa_text, work, counters=False):
+    """Metrics of a run. results holds one vkreplay result per replay; with several,
+    each had fresh allocations, and the duration is the median of their medians."""
+    result = results[0]
+    medians = [r['timing']['median'] / 1000 for r in results]
+    us = sorted(medians)[len(medians) // 2]
     if not us > 0:
         raise ValueError('Replay returned no valid GPU timing')
     stats = result.get('statistics', {})
     def stat(name, unit, reason=None):
         return metric(stats.get(name), unit, None if name in stats else reason or 'Not reported by this driver')
+    timing = result['timing']
+    if len(results) == 1:
+        duration_reason = f"Median of {len(timing['samples'])} timed dispatches; range {timing['min'] / 1000:.4g}–{timing['max'] / 1000:.4g} µs"
+    else:
+        duration_reason = f"Median of {len(results)} replays with fresh allocations; their medians range {min(medians):.4g}–{max(medians):.4g} µs"
     out = {
-        'GPU duration': metric(us, 'µs', f"Median of {len(timing['samples'])} timed dispatches; range {timing['min'] / 1000:.4g}–{timing['max'] / 1000:.4g} µs"),
+        'GPU duration': metric(us, 'µs', duration_reason),
         'Launch throughput': metric(1e6 / us, 'dispatches/s'),
         'VGPRs': stat('VGPRs', 'registers/lane'),
         'SGPRs': stat('SGPRs', 'registers'),
@@ -363,6 +436,10 @@ def metrics_for(result, isa_text, work):
         out['Compute throughput'] = metric(flops / us / 1e6, 'TFLOP/s', 'User-supplied FLOPs per dispatch')
     if nbytes > 0:
         out['Memory throughput'] = metric(nbytes / us / 1e3, 'GB/s', 'User-supplied bytes per dispatch')
+    if len(results) > 1:
+        out['Replay spread'] = metric(100 * (max(medians) - min(medians)) / us, '%',
+                                      'Range of the per-replay medians over their median. A large spread means the timing depends on where the buffers land')
+    out.update(counter_metrics(results, counters))
     return out
 
 
@@ -478,15 +555,28 @@ def main(root, request):
         iterations = int(request.get('iterations', 20))
         if not 1 <= iterations <= 10000:
             raise ValueError('Iterations must be between 1 and 10,000')
-        phase('Timing the isolated dispatch')
-        result = replay(cfg, capture, spirv, run, log, iterations, request.get('validate', True))
+        conditions = conditions_of(request)
+        counters = request.get('autoCounters', True) is not False
         isa_path = run / 'isa.txt'
+        results = []
+        for i in range(conditions['repeats']):
+            phase('Timing the isolated dispatch' + (f" (replay {i + 1} of {conditions['repeats']}, fresh allocations)" if conditions['repeats'] > 1 else ''))
+            first = i == 0
+            argv = replay_argv(cfg, capture, spirv, iterations, conditions, validate=first and request.get('validate', True),
+                               counters=counters, isa=isa_path if first else None)
+            results.append(replay(cfg, argv, run / ('replay.json' if first else f'replay-{i + 1}.json'), log))
+        result = results[0]
         isa_text = isa_path.read_text(errors='replace') if isa_path.exists() else ''
-        metrics = metrics_for(result, isa_text, request.get('work', {}))
+        metrics = metrics_for(results, isa_text, request.get('work', {}), counters)
         v = result.get('validation')
+        notes = []
         if isinstance(v, dict):
             differing = [g for g in v['groups'] if g['mismatched']]
             validation = {'status': 'bitwise match' if v['match'] else 'output differs', 'mismatchedRegions': [f"buffer {g['group']}" for g in differing], 'groups': v['groups']}
+            if 'sustainedMatch' in v:
+                validation['sustainedMatch'] = v['sustainedMatch']
+                if not v['sustainedMatch']:
+                    notes.append('A second back-to-back dispatch changed the outputs: this dispatch reads what it writes, so sustained timings measure different work than the application\'s dispatch.')
         else:
             validation = {'status': 'not checked'}
         trace = None
@@ -496,16 +586,23 @@ def main(root, request):
                 trace = trace_replay(cfg, capture, spirv, run, log)
             except Exception as error:
                 trace = {'error': str(error)}
-        previous = state.get('runs', [])[-1] if state.get('runs') else None
+        # Deltas only against the latest run made under the same conditions and work.
+        previous = next((r for r in reversed(state.get('runs', []))
+                         if r.get('conditions', DEFAULT_CONDITIONS) == conditions and r.get('work', {}) == request.get('work', {})), None)
         for label, value in metrics.items():
             old = (previous or {}).get('metrics', {}).get(label, {})
-            if value['value'] is not None and old.get('value') is not None and old.get('unit') == value['unit'] and (previous or {}).get('work', {}) == request.get('work', {}):
+            if value['value'] is not None and old.get('value') is not None and old.get('unit') == value['unit']:
                 value['delta'] = value['value'] - old['value']
                 value['deltaPercent'] = 100 * value['delta'] / abs(old['value']) if old['value'] else None
-        notes = list(result.get('notes', []))
+        notes = list(dict.fromkeys(n for r in results for n in r.get('notes', []))) + notes
+        if 'sustainedMatch' in validation:
+            # vkreplay's caveat about sustained timing; the two-dispatch check settled it.
+            notes = [n for n in notes if not n.startswith('sustained mode:')]
         if variant and file_digest(spirv) == state['snapshotHashes'].get('shader.spv'):
             notes.insert(0, 'The edited source compiles to the same SPIR-V as the captured shader: the edit does not change this variant (it may be in a preprocessor branch the recipe does not compile).')
         record = {'number': number, 'variant': variant, 'iterations': iterations, 'work': request.get('work', {}),
+                  'conditions': conditions, 'counters': counters, 'driver': driver_of(result),
+                  'comparedWith': previous['number'] if previous else None,
                   'codeHash': digest(json.dumps(edits, sort_keys=True).encode()) if variant else 'captured',
                   'spirvHash': file_digest(spirv), 'metrics': metrics, 'validation': validation, 'statistics': result.get('statistics', {}),
                   'notes': notes, 'trace': trace, 'edits': sorted(edits), 'directory': str(run)}

@@ -81,6 +81,39 @@ class InputTests(unittest.TestCase):
         self.assertIsNone(w.expected_groups({'grid': 'Not recorded', 'workgroup': '256 × 1 × 1'}))
         self.assertIsNone(w.expected_groups({'grid': '100 × 1 × 1', 'workgroup': '64 × 1 × 1'}))
 
+    def test_conditions_default_to_the_isolated_best_case(self):
+        self.assertEqual(w.conditions_of({}), w.DEFAULT_CONDITIONS)
+        c = w.conditions_of({'conditions': {'mode': 'sustained', 'memory': 'auto', 'repeats': '3'}})
+        self.assertEqual(c, {'mode': 'sustained', 'memory': 'auto', 'flushMb': 0, 'repeats': 3})
+        for bad in ({'mode': 'burst'}, {'memory': 'vram'}, {'repeats': 0}, {'repeats': 11}, {'flushMb': 2048}):
+            with self.assertRaises(ValueError):
+                w.conditions_of({'conditions': bad})
+
+    def test_replay_command_carries_conditions(self):
+        cfg = {'replay': '/rt/vkreplay'}
+        c = w.conditions_of({'conditions': {'mode': 'sustained', 'memory': 'gtt', 'flushMb': 64}})
+        self.assertEqual(w.replay_argv(cfg, '/cap', '/v.spv', 50, c, validate=False, counters=True, isa='/run/isa.txt'),
+                         ['/rt/vkreplay', '/cap', '--spirv', '/v.spv', '--iterations', '50', '--mode', 'sustained', '--memory', 'gtt',
+                          '--flush-mb', '64', '--isa', '/run/isa.txt', '--counters', '--no-validate'])
+        self.assertEqual(w.replay_argv(cfg, '/cap', '/v.spv', 20, w.DEFAULT_CONDITIONS)[5:],
+                         ['20', '--mode', 'stateless', '--memory', 'device'])
+
+    def test_counters_become_cycles_clock_and_hit_rates(self):
+        def result(median_us, cycles, counted_ns, l2):
+            return {'timing': {'median': median_us * 1e3, 'min': median_us * 1e3, 'max': median_us * 1e3, 'samples': [median_us * 1e3]},
+                    'statistics': {}, 'counters': {'passes': 2, 'dispatches': 20, 'durationNs': counted_ns,
+                                                   'values': {'GPU active cycles': cycles, 'L0 cache hit ratio': 87.5, 'L1 cache hit ratio': 25.0, 'L2 cache hit ratio': l2}}}
+        m = w.metrics_for([result(1000, 5e6, 2e6, 50.0), result(1200, 6e6, 2.4e6, 48.0), result(1100, 5.5e6, 2.2e6, 49.0)], '', {}, True)
+        self.assertEqual(m['GPU duration']['value'], 1100)
+        self.assertIn('3 replays with fresh allocations', m['GPU duration']['reason'])
+        self.assertAlmostEqual(m['Replay spread']['value'], 100 * 200 / 1100)
+        self.assertEqual(m['GPU cycles']['value'], 5.5e6)
+        self.assertAlmostEqual(m['Clock']['value'], 2500)
+        self.assertEqual((m['L2 hit rate']['value'], m['L2 hit rate']['unit']), (49.0, '%'))
+        single = w.metrics_for([{'timing': {'median': 1e6, 'min': 1e6, 'max': 1e6, 'samples': [1e6]}, 'statistics': {}, 'counters': None}], '', {}, False)
+        self.assertNotIn('Replay spread', single)
+        self.assertEqual((single['Clock']['value'], single['Clock']['reason']), (None, 'Counters not requested'))
+
     def test_environment_is_validated_and_tracing_removed(self):
         env = w.application_env({'env': {'VK_DRIVER_FILES': '/icd.json', 'MESA_VK_TRACE': 'rgp'}})
         self.assertEqual(env['VK_DRIVER_FILES'], '/icd.json')
@@ -155,6 +188,69 @@ class SessionTests(unittest.TestCase):
         self.state(captured=str(c), snapshotHashes=hashes, recipe={'shaderDir': str(self.root)}, files=[{'path': str(self.root / 'a.comp'), 'hash': '', 'code': ''}])
         with self.assertRaisesRegex(ValueError, 'Only files the shader compile reads'):
             w.main(self.root, {'op': 'run', 'variant': True, 'edits': {'/etc/passwd': 'x'}})
+
+    def fake_replay(self):
+        """A vkreplay stand-in: slower in sustained mode and system memory, and a
+        little slower on every call, like fresh allocations landing differently."""
+        script = self.root / 'vkreplay'
+        script.write_text(f'''#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+a = sys.argv
+calls = Path({str(self.root / 'calls')!r})
+n = int(calls.read_text()) if calls.exists() else 0
+calls.write_text(str(n + 1))
+mode, memory = a[a.index('--mode') + 1], a[a.index('--memory') + 1]
+memory = 'gtt' if memory == 'auto' else memory
+us = (1200 if mode == 'sustained' else 1000) * (1.5 if memory == 'gtt' else 1) + 10 * n
+if '--isa' in a:
+    Path(a[a.index('--isa') + 1]).write_text('v_wmma_f16_16x16x16_f16 v[0:7]')
+validation = 'not checked' if '--no-validate' in a else {{'match': True, 'groups': [{{'group': 0, 'bytes': 16, 'mismatched': 0}}]}}
+if mode == 'sustained' and isinstance(validation, dict):
+    validation['sustainedMatch'] = False
+notes = ['sustained mode: inputs were restored once, so timings are valid only if the dispatch does not read what it writes'] if mode == 'sustained' else []
+counters = {{'passes': 2, 'dispatches': 20, 'durationNs': us * 1100, 'values': {{'GPU active cycles': us * 2750, 'L2 cache hit ratio': 79.0}}}} if '--counters' in a else None
+print(json.dumps({{'device': 'Test GPU', 'deviceType': 'integrated', 'driverVersion': (26 << 22) | (2 << 12),
+                  'execution': {{'mode': mode, 'memory': memory}}, 'timing': {{'median': us * 1e3, 'min': us * 1e3, 'max': us * 1e3, 'samples': [us * 1e3]}},
+                  'statistics': {{'VGPRs': 120}}, 'counters': counters, 'validation': validation, 'notes': notes}}))
+''')
+        script.chmod(0o755)
+        return script
+
+    def test_runs_report_conditions_counters_and_compare_like_with_like(self):
+        c = self.capture()
+        (c / 'capture_complete').write_text('')
+        hashes = {p.name: w.file_digest(p) for p in c.iterdir() if p.is_file()}
+        self.state(captured=str(c), snapshotHashes=hashes, dispatch=w.read_capture(c))
+        state = json.loads((self.root / 'session.json').read_text())
+        state['config']['replay'] = str(self.fake_replay())
+        (self.root / 'session.json').write_text(json.dumps(state))
+
+        w.main(self.root, {'op': 'run', 'variant': False})
+        w.main(self.root, {'op': 'run', 'variant': False, 'autoCounters': False,
+                           'conditions': {'mode': 'sustained', 'memory': 'auto', 'repeats': 3}})
+        runs = w.main(self.root, {'op': 'run', 'variant': False})['runs']
+
+        best, app, again = runs
+        self.assertEqual(best['conditions'], w.DEFAULT_CONDITIONS)
+        self.assertEqual(best['driver'], {'version': '26.2.0', 'deviceType': 'integrated', 'device': 'Test GPU', 'memory': 'device'})
+        self.assertAlmostEqual(best['metrics']['Clock']['value'], 2500)
+        self.assertEqual(best['metrics']['L2 hit rate']['value'], 79.0)
+        # Three replays in system memory under sustained load, without counters.
+        self.assertEqual(app['driver']['memory'], 'gtt')
+        self.assertEqual(app['metrics']['GPU duration']['value'], 1800 + 20)
+        self.assertIn('Replay spread', app['metrics'])
+        self.assertEqual(app['metrics']['Clock']['reason'], 'Counters not requested')
+        self.assertFalse(app['validation']['sustainedMatch'])
+        # The failed two-dispatch check is reported once, in the worker's words.
+        self.assertEqual([n for n in app['notes'] if 'reads what it writes' in n or 'restored once' in n][1:], [])
+        self.assertIn('reads what it writes', app['notes'][-1])
+        self.assertEqual(len(list(Path(app['directory']).glob('replay*.json'))), 3)
+        # No deltas across conditions; the third run compares with the first.
+        self.assertIsNone(app['comparedWith'])
+        self.assertNotIn('delta', app['metrics']['GPU duration'])
+        self.assertEqual(again['comparedWith'], 1)
+        self.assertEqual(again['metrics']['GPU duration']['delta'], 40)
 
     def test_save_refuses_external_changes_and_keeps_a_backup(self):
         source = self.root / 'shader.comp'

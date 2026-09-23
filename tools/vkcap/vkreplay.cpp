@@ -2,7 +2,7 @@
 //
 //   vkreplay CAPTURE_DIR [--spirv FILE] [--iterations N] [--no-validate]
 //            [--isa FILE] [--dump-outputs DIR]
-//            [--mode stateless|sustained] [--memory device|app|gtt] [--flush-mb N] [--counters]
+//            [--mode stateless|sustained] [--memory device|app|gtt|auto] [--flush-mb N] [--counters]
 //
 // Each timed iteration restores every captured input from a pristine copy, so a
 // dispatch that writes its own inputs is measured on the same data every time.
@@ -330,16 +330,19 @@ struct Replay {
         }
         if (iterations < 1 || iterations > 100000) die("iterations must be between 1 and 100000");
         if (mode != "stateless" && mode != "sustained") die("--mode must be stateless or sustained");
+        if (memory != "device" && memory != "app" && memory != "gtt" && memory != "auto") die("--memory must be device, app, gtt or auto");
+        create_device();
         // Where the dispatch's buffers live. "device" is device-local memory, which a
         // small replay usually gets in VRAM; "app" is what ggml asks for on UMA
         // (device-local, host-visible, coherent); "gtt" is host-visible,
-        // non-device-local memory, i.e. system pages mapped through the GART.
+        // non-device-local memory, i.e. system pages mapped through the GART; "auto"
+        // is gtt on an integrated GPU, where large application buffers usually end
+        // up, and device-local memory on a discrete one.
+        if (memory == "auto") memory = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "gtt" : "device";
         VkMemoryPropertyFlags work_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         bool work_exact = false;
         if (memory == "app") { work_memory |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT; work_exact = true; }
         else if (memory == "gtt") { work_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT; work_exact = true; }
-        else if (memory != "device") die("--memory must be device, app or gtt");
-        create_device();
 
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.queueFamilyIndex = family;
@@ -635,12 +638,16 @@ struct Replay {
         std::sort(sorted.begin(), sorted.end());
         double median = sorted[sorted.size() / 2], mean = std::accumulate(ns.begin(), ns.end(), 0.0) / ns.size();
 
-        // Validation against the application's own post-dispatch contents.
-        std::string validation = "\"not checked\"";
-        if (validate) {
+        // Validation against the application's own post-dispatch contents: one
+        // dispatch for correctness and, for sustained timing, which repeats the
+        // dispatch over its own outputs, two back to back.
+        auto check_outputs = [&](int dispatches, bool dump, std::string &groups) {
             cb = begin();
             restore(cb);
-            dispatch(cb);
+            for (int d = 0; d < dispatches; d++) {
+                if (d) barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                dispatch(cb);
+            }
             barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             std::vector<Buffer> down;
             for (size_t g = 0; g < cap.buffers.size(); g++) {
@@ -664,17 +671,28 @@ struct Replay {
                     if (got[i] != expected[i]) { mismatched++; if (first == UINT64_MAX) first = i; }
                     if (expected[i] != input[i]) changed++;
                 }
-                if (!dump_dir.empty()) {
+                if (dump) {
                     std::ofstream out(dump_dir + "/out_" + std::to_string(g) + ".bin", std::ios::binary);
                     out.write((const char *)got, cap.buffers[g].size);
                 }
                 vkUnmapMemory(device, down[g].memory);
+                vkDestroyBuffer(device, down[g].buffer, nullptr);
+                vkFreeMemory(device, down[g].memory, nullptr);
                 all = all && mismatched == 0;
                 v << (g ? "," : "") << "{\"group\":" << g << ",\"bytes\":" << cap.buffers[g].size << ",\"writtenByApplication\":" << changed
                   << ",\"mismatched\":" << mismatched << ",\"firstMismatch\":" << (first == UINT64_MAX ? std::string("null") : std::to_string(first)) << "}";
             }
             v << "]";
-            validation = std::string("{\"match\":") + (all ? "true" : "false") + ",\"groups\":" + v.str() + "}";
+            groups = v.str();
+            return all;
+        };
+        std::string validation = "\"not checked\"";
+        if (validate) {
+            std::string groups, repeated;
+            bool match = check_outputs(1, !dump_dir.empty(), groups);
+            validation = std::string("{\"match\":") + (match ? "true" : "false");
+            if (mode == "sustained") validation += std::string(",\"sustainedMatch\":") + (check_outputs(2, false, repeated) ? "true" : "false");
+            validation += ",\"groups\":" + groups + "}";
         }
 
         // Compiler statistics and ISA, when the driver exposes them.
@@ -725,7 +743,9 @@ struct Replay {
 
         std::ostringstream o;
         o.precision(10);
-        o << "{\"device\":" << json_string(props.deviceName) << ",\"driverVersion\":" << props.driverVersion
+        const char *device_type = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+                                  : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete" : "other";
+        o << "{\"device\":" << json_string(props.deviceName) << ",\"deviceType\":\"" << device_type << "\",\"driverVersion\":" << props.driverVersion
           << ",\"name\":" << json_string(cap.name) << ",\"groups\":[" << cap.groups[0] << "," << cap.groups[1] << "," << cap.groups[2] << "]"
           << ",\"execution\":{\"mode\":" << json_string(mode) << ",\"memory\":" << json_string(memory) << ",\"flushBytes\":" << (flush_mb << 20)
           << "},\"timing\":{\"unit\":\"ns\",\"median\":" << median << ",\"mean\":" << mean
@@ -744,7 +764,7 @@ struct Replay {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: vkreplay CAPTURE_DIR [--spirv FILE] [--iterations N] [--no-validate] [--isa FILE] [--dump-outputs DIR]\n"
-                        "                [--mode stateless|sustained] [--memory device|app|gtt] [--flush-mb N] [--counters]\n");
+                        "                [--mode stateless|sustained] [--memory device|app|gtt|auto] [--flush-mb N] [--counters]\n");
         return 2;
     }
     try {

@@ -2211,3 +2211,4 @@ select {
 .mcp-lock-card { max-width: 680px; padding: 14px 22px; border: 1px solid #e6b66c; border-radius: 10px; background: #19212ff2; color: #eef4ff; box-shadow: 0 5px 25px #0008; }
 .mcp-lock-card strong { font-size: 18px; }.mcp-lock-card p { margin: 7px 0; }.mcp-lock-card button { color: #fff; background: #994129; padding: 8px 16px; }
 .mcp-connection { position: fixed; bottom: 8px; right: 12px; z-index: 900; max-width: 560px; padding: 6px 12px; background: #19212f; color: #eef4ff; border: 1px solid #526075; border-radius: 8px; font-size: 12px; }
+.tuning-conditions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:16px 0 0;padding:12px 14px;border:1px solid var(--border);border-radius:8px;}.tuning-conditions legend{font-weight:600;padding:0 6px;}.tuning-conditions label{display:flex;align-items:center;gap:8px;}.tuning-conditions input[type="number"]{width:70px;}.tuning-conditions p{flex-basis:100%;margin:0;font-size:12px;color:var(--muted);}

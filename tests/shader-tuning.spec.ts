@@ -56,8 +56,12 @@ test("Vulkan shader session edits recovered sources, sends only changed files, a
         { number: 1, variant: false, iterations: 50, directory: "/r1", validation: { status: "bitwise match" }, notes: [],
           metrics: { "GPU duration": metric(961.3, "µs"), VGPRs: metric(192, "registers/lane") } },
         { number: 2, variant: true, iterations: 50, directory: "/r2", edits: [source], trace: "/r2/trace.rgp",
-          validation: { status: "bitwise match" }, notes: ["The edited source compiles to the same SPIR-V as the captured shader: the edit does not change this variant."],
-          metrics: { "GPU duration": metric(695.3, "µs", -266), VGPRs: metric(120, "registers/lane", -72) } },
+          conditions: { mode: "sustained", memory: "auto", flushMb: 0, repeats: 3 }, counters: true, comparedWith: null,
+          driver: { version: "26.2.0", deviceType: "integrated", device: "AMD Radeon 8060S Graphics", memory: "gtt" },
+          validation: { status: "bitwise match", sustainedMatch: false },
+          notes: ["The edited source compiles to the same SPIR-V as the captured shader: the edit does not change this variant."],
+          metrics: { "GPU duration": metric(695.3, "µs"), VGPRs: metric(120, "registers/lane"), "L2 hit rate": metric(49.1, "%"),
+            Clock: metric(2450, "MHz"), "Replay spread": metric(31.5, "%") } },
       ],
     };
     w.__TAURI_INTERNALS__ = {
@@ -86,15 +90,25 @@ test("Vulkan shader session edits recovered sources, sends only changed files, a
   await expect(page.getByRole("status").first()).toContainText("bitwise match");
   await expect(page.getByRole("note").first()).toContainText("does not change this variant");
   await expect(page.getByText("/r2/trace.rgp")).toBeVisible();
-  await expect(page.getByText("Δ -266 µs")).toBeVisible();
+  // The run says how it was replayed, on what, and why it has no deltas.
+  await expect(page.getByText(/back to back after one restore · buffers in system memory \(GTT\) · 3 replays with fresh allocations/)).toBeVisible();
+  await expect(page.getByText("no earlier run under these conditions to compare with", { exact: false })).toBeVisible();
+  await expect(page.getByText(/driver 26\.2\.0/)).toBeVisible();
+  await expect(page.getByRole("status").first()).toContainText("Two back-to-back dispatches: outputs differ");
+  await expect(page.locator(".tuning-metrics h3")).toHaveText(["GPU duration", "Replay spread", "Clock", "L2 hit rate", "VGPRs"]);
+  await expect(page.getByRole("option", { name: /Run 2 .* sustained auto ×3/ })).toBeAttached();
 
   await editor.fill("layout(constant_id = 12) const uint SHMEM_STRIDE_PAD = 2;\n");
   await expect(page.getByRole("tab", { name: "mul_mm.comp •" })).toBeVisible();
   await page.getByLabel("Trace the run (RADV thread trace)").check();
+  await page.getByRole("button", { name: "Application-like" }).click();
+  await expect(page.getByLabel("Replay mode")).toHaveValue("sustained");
+  await expect(page.getByLabel("Replays with fresh allocations")).toHaveValue("3");
   await page.getByRole("button", { name: "Build & run edited shader" }).click();
   await expect.poll(() => page.evaluate(() => (window as any).requests.length)).toBe(1);
   const run = await page.evaluate(() => (window as any).requests[0]);
-  expect(run).toMatchObject({ op: "run", variant: true, iterations: 20, validate: true, trace: true });
+  expect(run).toMatchObject({ op: "run", variant: true, iterations: 20, validate: true, trace: true, autoCounters: true,
+    conditions: { mode: "sustained", memory: "auto", flushMb: 0, repeats: 3 } });
   // Only the changed file is sent.
   expect(Object.keys(run.edits)).toEqual(["/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders/mul_mm.comp"]);
   expect(run.config.env).toEqual({ GGML_VK_DEBUG_MARKERS: "1" });

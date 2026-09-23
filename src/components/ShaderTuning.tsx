@@ -22,15 +22,26 @@ type Metric = {
   delta?: number;
   deltaPercent?: number | null;
 };
+type Conditions = {
+  mode: "stateless" | "sustained";
+  memory: "device" | "app" | "gtt" | "auto";
+  flushMb: number;
+  repeats: number;
+};
 type Run = {
   number: number;
   variant: boolean;
   iterations: number;
   metrics: Record<string, Metric>;
+  conditions?: Conditions;
+  counters?: boolean;
+  driver?: { version: string; deviceType?: string; device?: string; memory?: string };
+  comparedWith?: number | null;
   validation?: {
     status: string;
     mismatchedRegions?: string[];
     groups?: { group: number; bytes: number; mismatched: number }[];
+    sustainedMatch?: boolean;
   };
   notes?: string[];
   trace?: string | { error: string } | null;
@@ -71,6 +82,12 @@ const number = (v: number) =>
 const metricOrder = [
   "GPU duration",
   "Launch throughput",
+  "Replay spread",
+  "GPU cycles",
+  "Clock",
+  "L0 hit rate",
+  "L1 hit rate",
+  "L2 hit rate",
   "VGPRs",
   "SGPRs",
   "Max waves per SIMD",
@@ -85,6 +102,30 @@ const metricOrder = [
 const metricRank = (name: string) =>
   metricOrder.includes(name) ? metricOrder.indexOf(name) : metricOrder.length;
 const fileName = (path: string) => path.split("/").pop() || path;
+const BEST_CASE: Conditions = { mode: "stateless", memory: "device", flushMb: 0, repeats: 1 };
+const APPLICATION_LIKE: Conditions = { mode: "sustained", memory: "auto", flushMb: 0, repeats: 3 };
+const memoryNames: Record<string, string> = {
+  device: "device-local memory",
+  app: "the memory type ggml uses on unified-memory GPUs",
+  gtt: "system memory (GTT)",
+  auto: "system memory on integrated GPUs, device-local otherwise",
+};
+/** One line saying how a run's replay was made, for the run header. */
+function describeConditions(run: Run) {
+  const c = run.conditions || BEST_CASE,
+    parts = [
+      c.mode === "sustained" ? "back to back after one restore" : "inputs restored before every dispatch",
+      `buffers in ${memoryNames[run.driver?.memory || c.memory] || c.memory}`,
+    ];
+  if (c.flushMb) parts.push(`${c.flushMb} MiB cache flush before each dispatch`);
+  if (c.repeats > 1) parts.push(`${c.repeats} replays with fresh allocations`);
+  return parts.join(" · ");
+}
+const shortConditions = (run: Run) => {
+  const c = run.conditions || BEST_CASE;
+  if (JSON.stringify(c) === JSON.stringify(BEST_CASE)) return "best case";
+  return [c.mode, c.memory, c.repeats > 1 ? `×${c.repeats}` : ""].filter(Boolean).join(" ");
+};
 
 export function ShaderTuning({ id }: { id: string }) {
   const [status, setStatus] = useState<Status | null>(null),
@@ -99,7 +140,9 @@ export function ShaderTuning({ id }: { id: string }) {
     [work, setWork] = useState<Record<string, string>>({}),
     [runIndex, setRunIndex] = useState(-1),
     [validate, setValidate] = useState(true),
-    [trace, setTrace] = useState(false);
+    [trace, setTrace] = useState(false),
+    [conditions, setConditions] = useState<Conditions>(BEST_CASE),
+    [counters, setCounters] = useState(true);
   const initialized = useRef(false),
     filesLoaded = useRef(false),
     stopped = useRef(false),
@@ -341,6 +384,66 @@ export function ShaderTuning({ id }: { id: string }) {
             ) : (
               <p>Find the shader source to edit it. The captured SPIR-V can be replayed now.</p>
             )}
+            <fieldset className="tuning-conditions">
+              <legend>Replay conditions</legend>
+              <label>
+                Dispatches
+                <select
+                  aria-label="Replay mode"
+                  value={conditions.mode}
+                  onChange={(e) => setConditions({ ...conditions, mode: e.target.value as Conditions["mode"] })}
+                >
+                  <option value="stateless">Stateless: inputs restored before each</option>
+                  <option value="sustained">Sustained: back to back, like an application</option>
+                </select>
+              </label>
+              <label>
+                Buffers in
+                <select
+                  aria-label="Replay memory"
+                  value={conditions.memory}
+                  onChange={(e) => setConditions({ ...conditions, memory: e.target.value as Conditions["memory"] })}
+                >
+                  <option value="device">Device-local memory</option>
+                  <option value="app">ggml's unified-memory type</option>
+                  <option value="gtt">System memory (GTT)</option>
+                  <option value="auto">Auto: system memory on integrated GPUs</option>
+                </select>
+              </label>
+              <label>
+                Replays
+                <input
+                  aria-label="Replays with fresh allocations"
+                  type="number"
+                  min="1"
+                  max="10"
+                  value={conditions.repeats}
+                  onChange={(e) => setConditions({ ...conditions, repeats: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                Cache flush (MiB)
+                <input
+                  aria-label="Cache flush before each dispatch in MiB"
+                  type="number"
+                  min="0"
+                  max="1024"
+                  value={conditions.flushMb}
+                  onChange={(e) => setConditions({ ...conditions, flushMb: Number(e.target.value) })}
+                />
+              </label>
+              <button type="button" onClick={() => setConditions(BEST_CASE)}>
+                Best case
+              </button>
+              <button type="button" onClick={() => setConditions(APPLICATION_LIKE)}>
+                Application-like
+              </button>
+              <p>
+                The default replay is a best case. An application keeps the GPU busy, which can lower its clock, and
+                on an integrated GPU its large buffers usually live in system memory, where a kernel's cache behavior
+                can depend on which pages each allocation gets. Several replays show that spread.
+              </p>
+            </fieldset>
             <div className="tuning-actions">
               <label>
                 <input type="checkbox" checked={validate} onChange={(e) => setValidate(e.target.checked)} /> Check
@@ -349,6 +452,10 @@ export function ShaderTuning({ id }: { id: string }) {
               <label>
                 <input type="checkbox" checked={trace} onChange={(e) => setTrace(e.target.checked)} /> Trace the run
                 (RADV thread trace)
+              </label>
+              <label>
+                <input type="checkbox" checked={counters} onChange={(e) => setCounters(e.target.checked)} /> Collect
+                performance counters (cycles, clock, cache hit rates)
               </label>
               <label>
                 Iterations
@@ -363,13 +470,26 @@ export function ShaderTuning({ id }: { id: string }) {
               </label>
               <button
                 disabled={busy}
-                onClick={() => void action("run", { variant: false, iterations, validate, trace, work })}
+                onClick={() =>
+                  void action("run", { variant: false, iterations, validate, trace, work, conditions, autoCounters: counters })
+                }
               >
                 Run captured baseline
               </button>
               <button
                 disabled={busy || !session.recipe}
-                onClick={() => void action("run", { variant: true, edits: changed, iterations, validate, trace, work })}
+                onClick={() =>
+                  void action("run", {
+                    variant: true,
+                    edits: changed,
+                    iterations,
+                    validate,
+                    trace,
+                    work,
+                    conditions,
+                    autoCounters: counters,
+                  })
+                }
               >
                 <Play size={15} />
                 Build & run edited shader
@@ -395,7 +515,8 @@ export function ShaderTuning({ id }: { id: string }) {
             <option value={-1}>Latest run</option>
             {runs.map((r, i) => (
               <option key={r.number} value={i}>
-                Run {r.number} · {r.variant ? `edited (${(r.edits || []).map(fileName).join(", ")})` : "captured"}
+                Run {r.number} · {r.variant ? `edited (${(r.edits || []).map(fileName).join(", ")})` : "captured"} ·{" "}
+                {shortConditions(r)}
               </option>
             ))}
           </select>
@@ -403,14 +524,26 @@ export function ShaderTuning({ id }: { id: string }) {
         {selected ? (
           <>
             <p>
-              Run {selected.number} · {selected.iterations} iterations · inputs restored for every iteration · deltas
-              against run {selected.number - 1}
+              Run {selected.number} · {selected.iterations} iterations · {describeConditions(selected)} ·{" "}
+              {selected.comparedWith === undefined
+                ? `deltas against run ${selected.number - 1}`
+                : selected.comparedWith === null
+                  ? "no earlier run under these conditions to compare with"
+                  : `deltas against run ${selected.comparedWith}, the latest under the same conditions`}
             </p>
+            {selected.driver && (
+              <p>
+                Replayed on {selected.driver.device || "the captured GPU"} ({selected.driver.deviceType || "unknown type"})
+                with driver {selected.driver.version}.
+              </p>
+            )}
             <p role="status">
               Output validation: {selected.validation?.status || "not checked"}
               {selected.validation?.mismatchedRegions?.length
                 ? ` · ${selected.validation.mismatchedRegions.join(", ")} differ`
                 : "."}
+              {selected.validation?.sustainedMatch !== undefined &&
+                ` Two back-to-back dispatches: ${selected.validation.sustainedMatch ? "same outputs" : "outputs differ"}.`}
             </p>
             {(selected.notes || []).map((n) => (
               <p key={n} role="note">
