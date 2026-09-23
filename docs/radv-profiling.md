@@ -32,6 +32,7 @@ Build from a copy of the source into a private prefix; this replaces nothing on 
 ```bash
 tar xf mesa-26.2.0.tar.xz && cd mesa-26.2.0
 patch -p1 < /path/to/rocprofgui/docs/radv-rocprof-compat.patch
+patch -p1 < /path/to/rocprofgui/docs/radv-compute-trigger.patch
 meson setup build --prefix="$HOME/radv-compat" -Dbuildtype=release -Dlibdir=lib \
   -Dvulkan-drivers=amd -Dgallium-drivers=[] -Dplatforms=[] -Dvulkan-layers=[] \
   -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dvideo-codecs=[] -Dtools=[] \
@@ -39,12 +40,12 @@ meson setup build --prefix="$HOME/radv-compat" -Dbuildtype=release -Dlibdir=lib 
 ninja -C build install
 ```
 
-The patch adds one option, `RADV_THREAD_TRACE_ROCPROF_COMPAT`, which defaults to off, so the patched driver behaves exactly like stock 26.2.0 unless it is set. With it on, GFX11 and GFX11.5 program the thread-trace token-exclusion set AMD's aqlprofile uses:
+The instruction-timing patch adds one option, `RADV_THREAD_TRACE_ROCPROF_COMPAT`, which defaults to off, so the patched driver behaves exactly like stock 26.2.0 unless it is set. With it on, GFX11 and GFX11.5 program the thread-trace token-exclusion set AMD's aqlprofile uses:
 - VMEM execution, ALU execution, event, utilization counter and wave allocation are excluded;
 - BOP events, which aqlprofile does not set, are dropped;
 - RADV's register tokens are kept, because the decoder recovers dispatches from them.
 
-GFX10 and GFX12 are untouched.
+GFX10 and GFX12 are untouched by the instruction-timing patch. The separate `radv-compute-trigger.patch` makes `MESA_VK_TRACE_TRIGGER` capture one graphics or compute queue submit after the file appears, without tracing model loading. It has no effect until a trigger file is configured. This patch is against Mesa 26.2.0 and is experimental; the stock driver remains available as a separate build.
 
 ## Step 2: capture
 
@@ -56,7 +57,7 @@ export LD_LIBRARY_PATH=$HOME/radv-compat/lib:$LD_LIBRARY_PATH   # plus a newer l
 MESA_VK_TRACE=rgp MESA_VK_TRACE_PER_SUBMIT=1 RADV_THREAD_TRACE_ROCPROF_COMPAT=true ./your-vulkan-app
 ```
 
-RADV writes one file per queue submit, `/tmp/<process>_<timestamp>_submit<N>.rgp`; the directory is fixed in Mesa. Without a swapchain, the frame-based trigger never fires, so compute programs need `MESA_VK_TRACE_PER_SUBMIT`.
+RADV writes per-submit captures to `/tmp/<process>_<timestamp>_submit<N>.rgp`; the directory is fixed in Mesa. Stock Mesa checks `MESA_VK_TRACE_TRIGGER` in the swapchain present path, so a headless compute program produces no trace from a file trigger. Use per-submit mode on stock Mesa, or the compute-trigger patch above to arm one later submit.
 
 Useful variables:
 
@@ -69,7 +70,7 @@ Useful variables:
 | `RADV_SPM_COUNTERS_CONFIG=<file>` | Raw hardware events instead of RADV's derived counters (Mesa 26.2); see below |
 | `GGML_VK_DEBUG_MARKERS=1` | llama.cpp: emit debug labels, so every kernel is named after its ggml shader |
 
-Tracing slows the application down, and every submit writes a file: a llama.cpp model load alone writes one per upload chunk. Keep runs short, and watch free space in `/tmp`.
+Per-submit tracing slows the application down, and every submit writes a file: a llama.cpp model load alone writes one per upload chunk. Keep runs short, and watch free space in `/tmp`.
 
 ### Through MCP
 
@@ -81,6 +82,18 @@ The desktop app's MCP server (see the README's "MCP server" section) can run the
  "env": {"VK_DRIVER_FILES": "/home/you/radv-compat/share/vulkan/icd.d/radeon_icd.x86_64.json",
          "RADV_THREAD_TRACE_ROCPROF_COMPAT": "true", "GGML_VK_DEBUG_MARKERS": "1"}}
 ```
+
+For a long-lived headless compute server, use `profile_start` with a Mesa build containing `radv-compute-trigger.patch`. It starts the argv with `MESA_VK_TRACE=rgp`, `MESA_VK_TRACE_PER_SUBMIT=0`, and a private `MESA_VK_TRACE_TRIGGER` file, then returns immediately with an ID and log paths. Wait for readiness, call `profile_trigger` with that ID, send one inference request, and use `profile_status` until `savedMessages` increases before calling `profile_stop`. Only one live profile can run at once. The patch captures the first eligible queue submit after the trigger, which may be an upload or setup submit rather than the inference kernel you want; inspect the returned trace. Stock Mesa cannot use this workflow for a headless compute server.
+
+```json
+{"cwd": "/path/to/llama.cpp/build/bin",
+ "argv": ["/path/to/llama.cpp/build/bin/llama-server", "-m", "model.gguf"],
+ "env": {"VK_DRIVER_FILES": "/home/you/radv-compat/share/vulkan/icd.d/radeon_icd.x86_64.json",
+         "LD_LIBRARY_PATH": "/home/you/radv-compat/lib",
+         "RADV_THREAD_TRACE_INSTRUCTION_TIMING": "false", "GGML_VK_DEBUG_MARKERS": "1"}}
+```
+
+Call `profile_start` with that object. Use its `id` for `profile_trigger`, `profile_status`, and `profile_stop`. On the tested gfx1201 machine, the private patched ICD is at `.codex/radv-26.2.0-trigger/share/vulkan/icd.d/radeon_icd.x86_64.json`, and its `LD_LIBRARY_PATH` uses `.codex/radv-26.2.0/lib` for libdrm 2.4.133. The stop result lists retained files, the number of RADV save messages, the number of distinct save paths, and warnings when names were reused or files are missing. Per-submit profiling can repeatedly save to the same second-resolution filename; earlier traces are then irrecoverable. An interrupted `profile_run` reports its retained artifacts and logs in the error.
 
 ### Sizing a capture
 
@@ -122,7 +135,7 @@ The importer marks these as hardware counters, warns that they are not GPU total
 
 ## Known limits
 
-- Qualified only on gfx1151; the patch does nothing on GFX10 or GFX12.
+- Full instruction timing is qualified on gfx1151; the patch does nothing on GFX10 or GFX12. Stock Mesa 26.2.0 occupancy mode is also verified on gfx1201. GFX12 default instruction timing reported lost trace data on a small ADD case, including with a one-engine timing mask.
 - Instruction-level detail covers the one CU the hardware traces. Occupancy covers every CU.
 - Dispatches are point events. Kernel time comes from wave occupancy, not from dispatch start/end records.
 - A capture holds one submit. There is no multi-submit timeline yet.

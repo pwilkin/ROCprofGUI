@@ -1508,6 +1508,30 @@ test("global-to-wave navigation and history preserve independent timeline ranges
   await expect(page.getByLabel("Range end")).toHaveValue("1000");
 });
 
+test("line plots keep labels readable as the workspace resizes", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 2284, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Occupancy", exact: true }).click();
+  const chart = page.getByRole("img", { name: "Shader engine 0 occupancy" });
+  const measure = () => chart.evaluate((svg: SVGSVGElement) => {
+    const bounds = svg.getBoundingClientRect();
+    const label = svg.querySelector("text")!.getBoundingClientRect();
+    return { width: bounds.width, height: bounds.height, viewWidth: svg.viewBox.baseVal.width, labelWidth: label.width };
+  });
+  await expect.poll(async () => (await measure()).viewWidth).toBeGreaterThan(1800);
+  const wide = await measure();
+  expect(wide.height).toBeGreaterThan(300);
+  expect(Math.abs(wide.viewWidth - (wide.width - 30))).toBeLessThan(2);
+  await chart.screenshot({ path: testInfo.outputPath("occupancy-wide.png") });
+  await page.setViewportSize({ width: 1000, height: 900 });
+  await expect.poll(async () => (await measure()).viewWidth).toBeLessThan(850);
+  const narrow = await measure();
+  expect(narrow.height).toBeLessThan(wide.height);
+  expect(Math.abs(narrow.viewWidth - (narrow.width - 30))).toBeLessThan(2);
+  expect(Math.abs(narrow.labelWidth - wide.labelWidth)).toBeLessThan(2);
+  await chart.screenshot({ path: testInfo.outputPath("occupancy-narrow.png") });
+});
+
 test("line plots apply independent vertical bounds, clip exports and reject invalid ranges", async ({
   page,
 }) => {

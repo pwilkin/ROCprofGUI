@@ -901,6 +901,7 @@ fn load_csv_reader(
     if col("Sample_Timestamp").is_some() {
         return crate::pc_sampling_csv::load(path, reader, cancelled);
     }
+    let pmc = col("Counter_Name").is_some() && col("Counter_Value").is_some();
     for name in ["Kernel_Name", "Start_Timestamp", "End_Timestamp"] {
         if col(name).is_none() {
             return Err(format!("Not a rocprofv3 kernel trace CSV: missing {name}"));
@@ -936,9 +937,24 @@ fn load_csv_reader(
     c.origin = origin.to_string();
     let mut seen = BTreeSet::new();
     let mut duplicates = 0;
+    let mut counter_points: BTreeMap<String, Vec<[f64; 2]>> = BTreeMap::new();
     for (row, start, end) in rows {
         crate::cancellable_read::check(cancelled)?;
         let get = |name: &str| col(name).and_then(|i| row.get(i)).unwrap_or("").trim();
+        if pmc {
+            let name = get("Counter_Name");
+            let value = get("Counter_Value")
+                .parse::<f64>()
+                .map_err(|_| "Invalid dispatch counter value")?;
+            if name.is_empty() || !value.is_finite() {
+                return Err("Invalid dispatch counter name or value".into());
+            }
+            let midpoint = (start - origin) as f64 + (end - start) as f64 / 2.;
+            counter_points
+                .entry(name.to_owned())
+                .or_default()
+                .push([midpoint, value]);
+        }
         let key = (
             get("Process_Id").to_owned(),
             get("Agent_Id").to_owned(),
@@ -987,9 +1003,25 @@ fn load_csv_reader(
         c.end = c.end.max(d.end);
         c.dispatches.push(d);
     }
+    if pmc {
+        c.format = "rocprofv3 dispatch counter CSV".into();
+        c.counters = counter_points
+            .into_iter()
+            .map(|(name, points)| Series {
+                spm_clock: None,
+                definition: None,
+                att: None,
+                name,
+                unit: "value".into(),
+                scope: "GPU · Dispatch counters".into(),
+                points,
+            })
+            .collect();
+        c.warnings.push("Counter values are per-dispatch measurements placed at each dispatch midpoint, not continuous time samples; counter support varies by GPU and metric.".into());
+    }
     c.warnings.push("Replay coverage is unknown. Retained PM4 can omit graph-replay dispatches; correlate against HIP/API records before claiming complete kernel shares.".into());
     c.warnings.push("Summed kernel duration can exceed elapsed time when queues overlap. Dispatch CSV cannot provide wave occupancy or ISA hotspots.".into());
-    if duplicates > 0 {
+    if duplicates > 0 && !pmc {
         c.warnings.push(format!("Removed {duplicates} exact duplicate dispatch records. Counter passes with different timestamps are not merged."));
     }
     c.metadata

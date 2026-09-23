@@ -27,6 +27,10 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(w.kernel_base('void k_bin_bcast<&(op_add(float, float)), float>(float*)'), 'k_bin_bcast')
         self.assertEqual(w.kernel_base('space::kernel<int>(float*)'), 'kernel')
 
+    def test_mangled_att_kernel_matches_kerncap_name(self):
+        self.assertEqual(w.canonical_kernel('_Z5saxpyPKfS0_Pfi'), 'saxpy(float const*, float const*, float*, int)')
+        self.assertEqual(w.canonical_kernel('saxpy(float const*, float const*, float*, int) [clone .kd]'), 'saxpy(float const*, float const*, float*, int)')
+
     def test_template_braces_comments_and_strings(self):
         text = 'int outside;\ntemplate<int N>\nstatic __global__ void kernel(float* p) {\n // }\n const char *a = "}";\n if (N) { p[0]=1; }\n}\nint after;'
         start, opening, end = w.source_regions(text, 'kernel')[0]

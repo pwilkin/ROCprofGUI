@@ -18,7 +18,7 @@ import { PlotAxesContext } from "../plotAxes";
 import { axisBounds, axisFraction } from "../chartAxis";
 import { PlotExport } from "./PlotExport";
 import { canvasPlot, svgPlot } from "../plotExport";
-import { useEffect, useRef, useState, useId, useContext, useMemo } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useId, useContext, useMemo } from "react";
 import type { Range } from "../types";
 import { fmt } from "../types";
 import { insideRect } from "../timelineLayout";
@@ -675,7 +675,7 @@ export function LineChart({
   xBounds,
   color = "#7cc4a4",
   label,
-  height = 145,
+  height: fixedHeight,
   step = false,
   axisKey,
 }: {
@@ -691,6 +691,18 @@ export function LineChart({
 }) {
   const display = useContext(DisplayScaleContext);
   const svg = useRef<SVGSVGElement>(null);
+  const host = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(900);
+  useLayoutEffect(() => {
+    const element = host.current;
+    if (!element) return;
+    const resize = () => setWidth(Math.max(1, Math.round(element.getBoundingClientRect().width - 30)));
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const height = fixedHeight ?? Math.round(Math.max(180, Math.min(320, width / 6)));
   const [lodBias, setLodBias] = useAnalysisPreference<number>(
     "plot.lodBias",
     0,
@@ -732,8 +744,7 @@ export function LineChart({
   if (step && preceding) selected.unshift([range[0], preceding[1]]);
   if (step && selected.length)
     selected.push([range[1], selected[selected.length - 1][1]]);
-  const width = 900,
-    left = 48,
+  const left = 48,
     right = 12,
     top = 14,
     bottom = 25;
@@ -771,7 +782,7 @@ export function LineChart({
     )
     .join(" ");
   return (
-    <div className="line-plot">
+    <div className="line-plot" ref={host}>
       <details className="plot-lod">
         <summary>Line detail: LOD bias {lodBias}</summary>
         <label>
@@ -931,6 +942,7 @@ export function LineChart({
       <svg
         ref={svg}
         className="line-chart"
+        style={{ height: height + 5 }}
         viewBox={`0 0 ${width} ${height}`}
         role="img"
         aria-label={label}

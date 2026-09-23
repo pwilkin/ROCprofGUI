@@ -36,6 +36,8 @@ flowchart LR
 | Kernel tuning | `src-tauri/src/tuning.rs`, `tuning_worker.py`, `tuning_calibration.py` | Input capture, Kerncap replay, candidate compilation and source write-back |
 | Application data | `src-tauri/src/appdir.rs` | Single owner of the writable data directory: `$ROCPROFGUI_HOME`, else `~/.rocprofgui`. Nothing the app writes goes to the working directory |
 
+A headless launch starts MCP without creating a Tauri runtime. A later GUI launch sends an authenticated local attach request and exits; the original main thread initializes Tauri, retaining the same `Store`, tuning sessions and MCP listener. Closing the attached window hides it, and a later launch shows it again. The attached launcher passes its display session variables to the service so the service can begin without a graphical environment.
+
 Commands and ownership:
 
 The host registers 46 Tauri commands (39 in `main.rs`, 3 in `mcp.rs`, 4 in `tuning.rs`). Only the few below are given in full here; the rest are covered by the same paged-transfer and cancellation conventions.

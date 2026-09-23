@@ -24,6 +24,10 @@ pub fn set_bundled_python_package(path: std::path::PathBuf) -> Result<(), String
         .map_err(|_| "Bundled decoder package was already configured".into())
 }
 
+pub fn bundled_python_package_configured() -> bool {
+    BUNDLED_PYTHON_PACKAGE.get().is_some()
+}
+
 pub struct DecoderConfig {
     pub python: std::ffi::OsString,
     pub library: Option<std::ffi::OsString>,

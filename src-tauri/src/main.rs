@@ -1529,8 +1529,14 @@ fn main() {
     let store = Arc::new(Store::default());
     let tuning = Arc::new(tuning::Tuning::default());
     let control = Arc::new(mcp::Control::default());
-    if options.headless {
-        mcp::headless(options, store, tuning, control).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
+    let was_headless = options.headless;
+    if was_headless {
+        let attached = mcp::headless(options.clone(), store.clone(), tuning.clone(), control.clone())
+            .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
+        if !attached { return; }
+    } else if mcp::try_attach(&options)
+        .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) }) {
+        eprintln!("Opened the GUI in the running rocprof-studio service");
         return;
     }
     let shutdown_control=control.clone();
@@ -1551,14 +1557,20 @@ fn main() {
             }
         })
         .setup(move |app| {
-            let package = app.path().resource_dir()?.join("decoder-python.zip");
-            profile_core::decoder::set_bundled_python_package(package)?;
+            if !profile_core::decoder::bundled_python_package_configured() {
+                let package = app.path().resource_dir()?.join("decoder-python.zip");
+                profile_core::decoder::set_bundled_python_package(package)?;
+            }
             if let Ok(parent) = app.path().app_cache_dir() {
                 tauri::async_runtime::spawn_blocking(move || {
                     let _ = profile_core::token_directory::TokenDirectory::reap(&parent.join("token-index"));
                 });
             }
-            mcp::start(options.clone(), store.clone(), tuning.clone(), control.clone(), Some(app.handle().clone()))?;
+            if was_headless {
+                mcp::attach_gui(&control, app.handle().clone());
+            } else {
+                mcp::start(options.clone(), store.clone(), tuning.clone(), control.clone(), Some(app.handle().clone()))?;
+            }
             Ok(())
         })
         .invoke_handler(mcp::guard(tauri::generate_handler![
@@ -1611,5 +1623,17 @@ fn main() {
         ]))
         .build(tauri::generate_context!())
         .expect("Tauri runtime failed")
-        .run(move |_,event| { if matches!(event, tauri::RunEvent::Exit) { mcp::shutdown(&shutdown_control,&shutdown_tuning); } });
+        .run(move |app, event| {
+            if was_headless {
+                if let tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { api, .. }, .. } = &event {
+                    if label == "main" {
+                        api.prevent_close();
+                        if let Some(window) = app.get_webview_window("main") { let _ = window.hide(); }
+                    }
+                }
+            }
+            if matches!(event, tauri::RunEvent::Exit) {
+                mcp::shutdown(&shutdown_control, &shutdown_tuning);
+            }
+        });
 }

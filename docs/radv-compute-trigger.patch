@@ -1,0 +1,57 @@
+--- a/src/amd/vulkan/layers/radv_sqtt_layer.c
++++ b/src/amd/vulkan/layers/radv_sqtt_layer.c
+@@ -18,6 +18,10 @@
+ #include "ac_rgp.h"
+ #include "ac_sqtt.h"
+ #include "util/u_memory.h"
++
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ 
+ void
+ radv_sqtt_emit_relocated_shaders(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline)
+@@ -785,8 +789,15 @@
+    if (submitCount == 0 && _fence != VK_NULL_HANDLE)
+       return device->layer_dispatch.rgp.QueueSubmit2(_queue, 0, NULL, _fence);
+ 
++   bool trace_submit = instance->vk.trace_per_submit;
++#ifndef _WIN32
++   if (!trace_submit && !queue->sqtt_present && is_gfx_or_ace && instance->vk.trace_trigger_file &&
++       access(instance->vk.trace_trigger_file, W_OK) == 0)
++      trace_submit = unlink(instance->vk.trace_trigger_file) == 0;
++#endif
++
+    /* Only consider queue events on graphics/compute when enabled. */
+-   if (((!device->sqtt_enabled || !radv_sqtt_queue_events_enabled()) && !instance->vk.trace_per_submit) ||
++   if (((!device->sqtt_enabled || !radv_sqtt_queue_events_enabled()) && !trace_submit) ||
+        !is_gfx_or_ace)
+       return device->layer_dispatch.rgp.QueueSubmit2(_queue, submitCount, pSubmits, _fence);
+ 
+@@ -804,7 +815,7 @@
+    if (queue->sqtt_present)
+       return radv_sqtt_wsi_submit(_queue, submitCount, pSubmits, _fence);
+ 
+-   if (instance->vk.trace_per_submit) {
++   if (trace_submit) {
+       /* Make sure to lock in case of multithreaded submissions. */
+       simple_mtx_lock(&device->sqtt.lock);
+       radv_sqtt_start_capturing(queue);
+@@ -938,7 +949,7 @@
+       FREE(new_cmdbufs);
+    }
+ 
+-   if (instance->vk.trace_per_submit) {
++   if (trace_submit) {
+       if (!radv_sqtt_stop_capturing(queue)) {
+          fprintf(stderr,
+                  "radv: Failed to capture RGP for this submit because the buffer is too small and auto-resizing "
+@@ -959,7 +970,7 @@
+    util_dynarray_fini(&timed_cmdbufs);
+    FREE(new_cmdbufs);
+ 
+-   if (instance->vk.trace_per_submit) {
++   if (trace_submit) {
+       simple_mtx_unlock(&device->sqtt.lock);
+    }
+    return result;

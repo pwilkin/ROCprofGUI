@@ -14,7 +14,7 @@ npm ci
 npm run tauri dev
 ```
 
-Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture (experimental). The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches an argv under rocprofv3 or under RADV Vulkan tracing, and the kernel- and shader-tuning workers compile candidates and can write replacement source back to disk. They are described under [MCP server](#mcp-server), [Kernel tuning](#kernel-tuning) and [Shader tuning](#shader-tuning-vulkan-experimental); none runs unless invoked.
+Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace or counter-collection CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture (experimental). The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches an argv under rocprofv3 or under RADV Vulkan tracing, and the kernel- and shader-tuning workers compile candidates and can write replacement source back to disk. They are described under [MCP server](#mcp-server), [Kernel tuning](#kernel-tuning) and [Shader tuning](#shader-tuning-vulkan-experimental); none runs unless invoked.
 
 The browser preview uses an explicitly synthetic example capture:
 
@@ -31,6 +31,8 @@ npm run tauri build -- --debug --no-bundle
 # Keep target/debug/decoder-python.zip beside target/debug/rocprof-studio
 ```
 
+For a direct Cargo release build, run `npm run build` followed by `cargo build --release -p rocprof-studio --features custom-protocol`. The `custom-protocol` feature embeds the frontend; omitting it makes the window try the development URL at `localhost:1420`.
+
 To build a local Debian installer while keeping generated package files under `.codex`:
 
 ```bash
@@ -46,7 +48,7 @@ This rebuilds the app, stages a copy for Tauri's bundle patching, and packages t
 - Nested instrumentation marker timeline and flamegraph with source navigation.
 
 - Decoded rocprofv3 JSON, including wave indexes, lazy wave tokens, ISA/source snapshots, occupancy, ATT counters, wave states and dispatch resource metadata.
-- rocprofv3 kernel-trace CSV and standalone SPM JSON import.
+- rocprofv3 kernel-trace CSV, per-dispatch counter-collection CSV and standalone SPM JSON import.
 - Read-only ROCPD kernel dispatch, event-associated PMC and timestamped SPM import, including UUID-partitioned ROCm SDK databases.
 - Raw ATT import through an isolated decoder V2 process, including code-object disassembly, cancellation and automatic temporary-output cleanup.
 - Target-wave, CU-wave, SIMD activity, global residency, and dispatch timelines with shared range, zoom, pan and cycle measurement.
@@ -178,9 +180,9 @@ ROCPROF_GUI_TEST_ATT=/path/to/raw/trace cargo test -p profile-core --test decode
 
 The desktop app starts a Model Context Protocol server **by default** on every launch. This is a deliberate choice, not an oversight: the server is the supported way to drive the analysis core from an agent or script, and it is on unless you pass `--no-mcp`.
 
-It binds loopback `127.0.0.1:8765` only and never a routable interface. Requests without a matching `Authorization: Bearer <token>` header are rejected with 401. The token is 32 bytes read from `/dev/urandom`, written once with `create_new` and mode `0600`, and reused on later launches; a token shorter than 32 characters or outside `[A-Za-z0-9_-]` is refused. It exposes 27 tools over the same analysis core as the GUI, with caps of 32 connections and 16 sessions. One tool runs at a time; a concurrent call is rejected with `-32001` rather than queued. There is no event replay or resumption, and cancelling a tool does not roll back writes it already made.
+It binds loopback `127.0.0.1:8765` only and never a routable interface. Requests without a matching `Authorization: Bearer <token>` header are rejected with 401. The token is 32 bytes read from `/dev/urandom`, written once with `create_new` and mode `0600`, and reused on later launches; a token shorter than 32 characters or outside `[A-Za-z0-9_-]` is refused. It exposes 31 tools over the same analysis core as the GUI, with caps of 32 connections and 16 sessions. One tool runs at a time; a concurrent call is rejected with `-32001` rather than queued. There is no event replay or resumption, and cancelling a tool does not roll back writes it already made.
 
-Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and kernel-tuning sessions under `kernel-tuning/sessions/`. An analysis job deletes its folder when it succeeds and keeps only its logs when it fails; `profile_run` output stays until you delete it, since it is the capture itself. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
+Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and kernel-tuning sessions under `kernel-tuning/sessions/`. An analysis job deletes its folder when it succeeds and keeps only its logs when it fails; `profile_run` and `profile_start` output stays until you delete it, since it is the capture itself. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
 
 ```bash
 rocprof-studio --no-mcp                      # do not start the server
@@ -189,7 +191,9 @@ rocprof-studio --mcp-token-file PATH         # write the bearer token elsewhere
 rocprof-studio --headless                    # serve MCP without a window
 ```
 
-Two of the tools are not read-only. `profile_run` executes an argv you supply under rocprofv3, or with `tracer: "radv"` under RADV Vulkan tracing (experimental), and returns output files to import. It takes optional `env` variables (the runner's own `LD_PRELOAD`, `HSA_TOOLS_*` and `TMPDIR` handling cannot be overridden) and `timeoutSeconds` (default 600, at most 3600); it uses no shell and can be cancelled. RADV writes its captures to a fixed `/tmp` path, so a RADV run moves the files it wrote into the job folder, after checking there is room. The tuning tools compile and run candidate kernels, and the tuning worker can write a kernel source file back to disk. Any local process that can read the token file can drive both, so on a shared or multi-user host either run with `--no-mcp` or keep the token file readable only by the account running the app.
+Headless mode does not initialize the graphical toolkit and runs with `DISPLAY` and `WAYLAND_DISPLAY` unset. From a graphical session, launch `rocprof-studio` with the same MCP port and `ROCPROFGUI_HOME`/token-file settings: the launcher authenticates to the running service, exits, and the existing process opens the GUI with its current captures and tuning sessions. Closing that window hides it while the service continues; launching the GUI again shows the same window. Without a running service, a normal GUI launch starts one. A headless process needs the desktop libraries installed to load the binary, even though it needs no display server until a GUI attaches.
+
+Profiling and tuning tools can launch programs and write files. `profile_run` executes an argv you supply under rocprofv3, or with `tracer: "radv"` under RADV Vulkan per-submit tracing (experimental), and returns output files to import. For long-lived Vulkan servers, `profile_start` launches a file-trigger RADV run and returns immediately; `profile_trigger` arms a capture, `profile_status` checks progress, and `profile_stop` collects files and reports overwritten filenames. Headless compute requires a RADV build with [the compute-trigger patch](docs/radv-compute-trigger.patch); stock Mesa checks file triggers only during swapchain presentation. It takes optional `env` variables (the runner's own `LD_PRELOAD`, `HSA_TOOLS_*` and `TMPDIR` handling cannot be overridden) and `timeoutSeconds` (default 600, at most 3600); it uses no shell and can be cancelled. RADV writes its captures to a fixed `/tmp` path, so a RADV run moves the files it wrote into the job folder, after checking there is room. The tuning tools compile and run candidate kernels, and the tuning worker can write a kernel source file back to disk. Any local process that can read the token file can drive both, so on a shared or multi-user host either run with `--no-mcp` or keep the token file readable only by the account running the app.
 
 `capture_analyze` shells out to Node.js at runtime, because it reuses the frontend's own analysis modules through an esbuild bundle. Set `ROCPROF_MCP_NODE` to select a specific interpreter. Node.js is also required at **build** time: `src-tauri/build.rs` runs `scripts/build-mcp-analysis.mjs` and fails the build if it is missing. That build script declares `cargo:rerun-if-changed=../src`, so editing the TypeScript frontend rebuilds the Rust crate.
 
@@ -211,6 +215,8 @@ What this surface does **not** do: there is no replay-equivalence gate proving a
 
 "Tune shader" on a dispatch in a RADV capture opens the Vulkan counterpart of kernel tuning: capture one dispatch, replay it in isolation, and compare edited variants against it. It needs a GPU, and a runtime that `scripts/setup-shader-tuning.py` builds into `~/.rocprofgui/shader-tuning/runtime`: the `VK_LAYER_ROCPROF_capture` capture layer and the `vkreplay` harness, both from `tools/vkcap/`. The MCP tuning tools drive the same sessions.
 
+The [gfx1201 validation report](docs/gfx1201-validation.md) records RADV and ROCm capture, replay, correctness, and application benchmark results on the Radeon AI PRO R9700.
+
 A session runs in four steps:
 
 1. **Capture.** The application runs again under the capture layer, which stops at the dispatch with the traced pipeline name and workgroup count. It records the SPIR-V, the specialization and push constants, the device's enabled extensions and features, and every bound buffer range, copied immediately **before and after** the dispatch. When the capture came from an MCP `profile_run`, the session reruns the same command and environment. llama.cpp names its pipelines only with `GGML_VK_DEBUG_MARKERS=1`, which sessions set by default.
@@ -219,7 +225,7 @@ A session runs in four steps:
    - The application's run-time SPIR-V edits are reapplied to each variant.
    - By default every timed iteration restores all inputs from pristine copies, and GPU timestamps bracket the dispatch: the isolated best case. **Replay conditions** change that. *Sustained* dispatches back to back after one restore, as an application keeps the GPU busy. *Buffers in* chooses device-local memory, ggml's unified-memory type, system memory (GTT), or *auto*, which is system memory on integrated GPUs. *Replays* repeats the run with fresh allocations and reports their spread. A cache flush can precede each dispatch. *Application-like* selects sustained, auto and three replays.
    - Validation compares every bound buffer byte for byte with what **the application's own dispatch** produced, not with another replay. A sustained run also checks that two back-to-back dispatches still produce the same outputs, i.e. that the dispatch does not read what it writes.
-   - The driver's compiler statistics (VGPRs, SGPRs, LDS, spills, wave limit) and ISA are reported. With performance counters (on by default), so are GPU cycles, the clock the dispatch ran at, and the L0, L1 and L2 hit rates.
+   - The driver's compiler statistics (VGPRs, SGPRs, LDS, spills, wave limit) and ISA are reported. Where `VK_KHR_performance_query` is available, performance counters (on by default) also report GPU cycles, the clock the dispatch ran at, and the L0, L1 and L2 hit rates. Mesa 26.2.0 does not advertise this extension on GFX12, so those counter fields remain unavailable on gfx1201.
    - Deltas compare a run with the latest earlier run made under the same conditions.
    - The run records the driver version and GPU it replayed on.
    - A run can also be traced with RADV, and the trace opened here.
@@ -273,6 +279,8 @@ RADV's default token mask includes ALU- and VMEM-execution tokens that `rocprof-
 [`docs/radv-rocprof-compat.patch`](docs/radv-rocprof-compat.patch) adds an opt-in `RADV_THREAD_TRACE_ROCPROF_COMPAT` option to Mesa 26.2.0. On GFX11 and GFX11.5 it programs the token mask AMD's aqlprofile uses, so the stream holds only tokens the decoder knows. Default behaviour is unchanged, and GFX10 and GFX12 are untouched. On gfx1151 every instruction is then attributed exactly: each row of a 64-iteration loop body is hit 64 times per wave, and a 4,096-workgroup × 4,096-iteration dispatch decodes with all 4,096 waves in occupancy and 4,096 hits per loop row on every traced wave. [docs/radv-profiling.md](docs/radv-profiling.md) gives the build and capture steps.
 
 The importer infers the mode from the stream, since the RGP file does not record the mask: a stream with execution tokens used RADV's default mask, one without them and with attributed instructions is full, and anything else is occupancy only.
+
+On gfx1201 with stock Mesa 26.2.0, occupancy-mode RGP traces decode with named dispatches, four shader engines and SPM counters. GFX12 streams bypass the GFX11 token sanitizer. The default instruction-timing trace lost data even for a small ADD dispatch, including with timing limited to one shader engine; counters still import. The GFX11 compatibility patch does not enable GFX12 instruction timing.
 
 Every thread trace must pass four checks before its waves are shown, and failing any one rejects the whole trace rather than showing part of it:
 

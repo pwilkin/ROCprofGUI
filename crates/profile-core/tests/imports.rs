@@ -48,6 +48,19 @@ fn csv_preserves_nanosecond_precision_and_dispatch_identity() {
     assert!(c.warnings.iter().any(|w| w.contains("1 exact duplicate")));
 }
 #[test]
+fn rocprofv3_counter_csv_keeps_per_dispatch_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("counter_collection.csv");
+    fs::write(&path, "Process_Id,Agent_Id,Queue_Id,Dispatch_Id,Kernel_Name,Start_Timestamp,End_Timestamp,Counter_Name,Counter_Value\n1,0,2,9,k,18000000000000001,18000000000000011,SQ_WAVES_sum,2048\n1,0,2,9,k,18000000000000001,18000000000000011,GL2C_EA_RDREQ_sum,0\n").unwrap();
+    let c = load_capture(&path).unwrap();
+    assert_eq!(c.format, "rocprofv3 dispatch counter CSV");
+    assert_eq!(c.dispatches.len(), 1);
+    assert_eq!(c.counters.len(), 2);
+    assert_eq!(c.counters.iter().find(|s| s.name == "SQ_WAVES_sum").unwrap().points, vec![[5., 2048.]]);
+    assert!(c.warnings.iter().any(|w| w.contains("per-dispatch measurements")));
+}
+
+#[test]
 fn csv_rejects_negative_duration_and_missing_headers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("trace.csv");

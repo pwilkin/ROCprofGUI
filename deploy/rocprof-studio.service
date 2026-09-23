@@ -1,0 +1,17 @@
+[Unit]
+Description=rocprof studio headless MCP server
+
+[Service]
+Type=simple
+ExecStart=/home/ilintar/.local/bin/rocprof-studio --headless
+WorkingDirectory=/home/ilintar
+Environment=ROCPROFGUI_HOME=/home/ilintar/.rocprofgui
+Environment=VK_DRIVER_FILES=/devel/tools/rocprofgui/.codex/radv-26.2.0-trigger/share/vulkan/icd.d/radeon_icd.x86_64.json
+Environment=LD_LIBRARY_PATH=/devel/tools/rocprofgui/.codex/radv-26.2.0/lib
+Environment=PATH=/home/ilintar/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/rocm/bin
+UMask=0077
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

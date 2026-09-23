@@ -5,12 +5,14 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
+    process::Child,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::Manager;
 
@@ -60,7 +62,7 @@ impl Options {
                     o.token_file = PathBuf::from(args.next().ok_or("Missing token file")?)
                 }
                 "--help" => {
-                    println!("rocprof-studio [--headless] [--mcp-port 8765] [--mcp-token-file PATH] [--no-mcp]\nThe token file defaults to ~/.rocprofgui/mcp/token; set ROCPROFGUI_HOME to relocate the whole data directory.\nMCP: http://127.0.0.1:PORT/mcp (Streamable HTTP/SSE), /sse (legacy SSE). Authorization: Bearer <token file contents>.");
+                    println!("rocprof-studio [--headless] [--mcp-port 8765] [--mcp-token-file PATH] [--no-mcp]\nA GUI launch reuses the running service on the selected MCP port.\nThe token file defaults to ~/.rocprofgui/mcp/token; set ROCPROFGUI_HOME to relocate the whole data directory.\nMCP: http://127.0.0.1:PORT/mcp (Streamable HTTP/SSE), /sse (legacy SSE). Authorization: Bearer <token file contents>.");
                     std::process::exit(0);
                 }
                 _ => return Err(format!("Unknown option: {a}")),
@@ -75,6 +77,72 @@ impl Options {
         Ok(o)
     }
 }
+const ATTACH_ENV: &[&str] = &[
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS", "GDK_BACKEND", "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP", "XDG_DATA_DIRS",
+];
+
+fn validate_attach_environment(value: &Value) -> Result<BTreeMap<String, String>, String> {
+    let object = value["environment"].as_object().ok_or("Missing display environment")?;
+    if object.keys().any(|key| !ATTACH_ENV.contains(&key.as_str())) {
+        return Err("Unsupported display environment variable".into());
+    }
+    let mut environment = BTreeMap::new();
+    for (key, value) in object {
+        let value = value.as_str().ok_or("Display environment values must be strings")?;
+        if value.len() > 4096 || value.contains('\0') {
+            return Err("Invalid display environment value".into());
+        }
+        environment.insert(key.clone(), value.to_owned());
+    }
+    if !environment.get("DISPLAY").is_some_and(|v| !v.is_empty())
+        && !environment.get("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+    {
+        return Err("Launch the GUI from a graphical session with DISPLAY or WAYLAND_DISPLAY set".into());
+    }
+    Ok(environment)
+}
+
+pub fn try_attach(o: &Options) -> Result<bool, String> {
+    if !o.enabled || o.port == 0 {
+        return Ok(false);
+    }
+    let address = SocketAddr::from(([127, 0, 0, 1], o.port));
+    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+        Ok(stream) => stream,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(e) => return Err(format!("Cannot reach MCP port {}: {e}", o.port)),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+    let token = fs::read_to_string(&o.token_file)
+        .map_err(|e| format!("Cannot read MCP token {}: {e}", o.token_file.display()))?;
+    let token = token.trim();
+    if token.len() < 32 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("Invalid MCP token file".into());
+    }
+    let environment: serde_json::Map<String, Value> = ATTACH_ENV.iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| ((*key).into(), json!(value))))
+        .collect();
+    let body = json!({"environment":environment});
+    validate_attach_environment(&body)?;
+    let body = body.to_string();
+    write!(stream, "POST /attach HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        o.port, token, body.len(), body).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).map_err(|e| e.to_string())?;
+    let status = response.lines().next().unwrap_or("");
+    if (status.contains(" 202 ") && response.ends_with("GUI attachment accepted"))
+        || (status.contains(" 200 ") && response.ends_with("GUI focused"))
+    {
+        return Ok(true);
+    }
+    let detail = response.split_once("\r\n\r\n").map(|(_, body)| body.trim()).unwrap_or("");
+    Err(format!("GUI attachment refused by MCP service: {} {}", status.trim(), detail))
+}
+
 struct Active {
     id: Value,
     owner: String,
@@ -82,13 +150,26 @@ struct Active {
     cancel: Arc<AtomicBool>,
     started: Instant,
 }
+struct LiveProfile {
+    id: String,
+    child: Child,
+    folder: PathBuf,
+    program: String,
+    started: SystemTime,
+    trigger: PathBuf,
+    triggers: u32,
+}
 #[derive(Default)]
 pub struct Control {
     shutting_down: AtomicBool,
     active: Mutex<Option<Active>>,
+    live_profile: Mutex<Option<LiveProfile>>,
     workspace: Mutex<Value>,
     revision: AtomicU64,
     endpoint: Mutex<Value>,
+    app: Mutex<Option<tauri::AppHandle>>,
+    attach_request: Mutex<Option<BTreeMap<String, String>>>,
+    attaching: AtomicBool,
 }
 impl Control {
     fn check(flag: &AtomicBool) -> Result<(), String> {
@@ -130,7 +211,8 @@ impl Control {
     }
     fn status(&self) -> Value {
         let a = self.active.lock().unwrap();
-        json!({"active":a.as_ref().map(|a|json!({"requestId":a.id,"tool":a.name,"cancelling":a.cancel.load(Ordering::SeqCst),"elapsedSeconds":a.started.elapsed().as_secs()})),"revision":self.revision.load(Ordering::SeqCst),"workspace":*self.workspace.lock().unwrap(),"server":*self.endpoint.lock().unwrap()})
+        let live = self.live_profile.lock().unwrap();
+        json!({"active":a.as_ref().map(|a|json!({"requestId":a.id,"tool":a.name,"cancelling":a.cancel.load(Ordering::SeqCst),"elapsedSeconds":a.started.elapsed().as_secs()})),"liveProfile":live.as_ref().map(|p|json!({"id":p.id,"directory":p.folder,"triggerFile":p.trigger})),"revision":self.revision.load(Ordering::SeqCst),"workspace":*self.workspace.lock().unwrap(),"server":*self.endpoint.lock().unwrap()})
     }
 }
 pub fn ensure_local(app: &tauri::AppHandle) -> Result<(), String> {
@@ -211,7 +293,6 @@ struct Server {
     store: Arc<Store>,
     tuning: Arc<tuning::Tuning>,
     control: Arc<Control>,
-    app: Option<tauri::AppHandle>,
     token: String,
     port: u16,
     clients: Mutex<BTreeMap<String, Client>>,
@@ -222,7 +303,7 @@ pub fn headless(
     store: Arc<Store>,
     tuning: Arc<tuning::Tuning>,
     control: Arc<Control>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if let Ok(exe) = std::env::current_exe() {
         let parent = exe.parent().unwrap();
         let candidates = [
@@ -243,11 +324,31 @@ pub fn headless(
     }
     start(o, store, tuning.clone(), control.clone(), None)?;
     while !STOP.load(Ordering::SeqCst) {
+        if let Some(environment) = control.attach_request.lock().unwrap().take() {
+            for key in ATTACH_ENV {
+                std::env::remove_var(key);
+            }
+            for (key, value) in environment {
+                std::env::set_var(key, value);
+            }
+            #[cfg(unix)]
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            }
+            return Ok(true);
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     shutdown(&control, &tuning);
-    Ok(())
+    Ok(false)
 }
+pub fn attach_gui(control: &Control, app: tauri::AppHandle) {
+    *control.app.lock().unwrap() = Some(app);
+    control.endpoint.lock().unwrap()["headless"] = json!(false);
+    control.attaching.store(false, Ordering::SeqCst);
+}
+
 pub fn start(
     o: Options,
     store: Arc<Store>,
@@ -270,11 +371,11 @@ pub fn start(
         "MCP listening on http://127.0.0.1:{port}/mcp and /sse; bearer token file: {}",
         o.token_file.display()
     );
+    *control.app.lock().unwrap() = app;
     let server = Arc::new(Server {
         store,
         tuning,
         control,
-        app,
         token,
         port,
         clients: Mutex::new(BTreeMap::new()),
@@ -335,6 +436,46 @@ impl Server {
         }
         let url = r.url().to_owned();
         let method = r.method().as_str().to_owned();
+        if url == "/attach" {
+            if method != "POST" || !header(&r, "Content-Type").is_some_and(|v| v.starts_with("application/json")) {
+                reply(r, 405, "POST application/json required", None);
+                return;
+            }
+            let mut bytes = Vec::new();
+            if r.as_reader().take(8193).read_to_end(&mut bytes).is_err() || bytes.len() > 8192 {
+                reply(r, 413, "Invalid attachment request", None);
+                return;
+            }
+            let environment = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|value| validate_attach_environment(&value));
+            let environment = match environment {
+                Ok(value) => value,
+                Err(e) => { reply(r, 400, &e, None); return; }
+            };
+            if let Some(app) = self.control.app.lock().unwrap().clone() {
+                let _ = app.clone().run_on_main_thread(move || {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                });
+                reply(r, 200, "GUI focused", None);
+                return;
+            }
+            let active = self.control.active.lock().unwrap();
+            let rejected = self.control.endpoint.lock().unwrap()["headless"] != true
+                || active.is_some()
+                || self.control.attaching.swap(true, Ordering::SeqCst);
+            drop(active);
+            if rejected {
+                reply(r, 409, "MCP action active or GUI attachment in progress", None);
+                return;
+            }
+            *self.control.attach_request.lock().unwrap() = Some(environment);
+            reply(r, 202, "GUI attachment accepted", None);
+            return;
+        }
         if method == "GET" && url == "/sse" {
             let id = match random() {
                 Ok(v) => v,
@@ -622,6 +763,9 @@ impl Server {
                 let flag = Arc::new(AtomicBool::new(false));
                 {
                     let mut active = self.control.active.lock().unwrap();
+                    if self.control.attaching.load(Ordering::SeqCst) {
+                        return error(id, -32001, "GUI attachment in progress");
+                    }
                     if active.is_some() {
                         return error(id, -32001, "Another MCP action is running");
                     }
@@ -651,7 +795,11 @@ impl Server {
                     cancelled
                 };
                 if cancelled {
-                    return error(id,-32800,"MCP execution cancelled; worker stopped. Completed artifacts are retained.");
+                    let detail = match outcome {
+                        Err(message) if name == "profile_run" => format!("MCP execution cancelled; worker stopped. {message}"),
+                        _ => "MCP execution cancelled; worker stopped. Completed artifacts are retained.".into(),
+                    };
+                    return error(id,-32800,detail);
                 }
                 match outcome {
                     Ok(data) => {
@@ -1043,7 +1191,83 @@ impl Server {
                     Ok(data)
                 }
             }
+            "profile_start" => {
+                let argv: Vec<String> = serde_json::from_value(a["argv"].clone()).map_err(|e| e.to_string())?;
+                if argv.is_empty() {
+                    return Err("Application argv cannot be empty".into());
+                }
+                let env = profile_env(a)?;
+                if env.iter().any(|(key, _)| ["MESA_VK_TRACE", "MESA_VK_TRACE_PER_SUBMIT", "MESA_VK_TRACE_TRIGGER", "MESA_VK_TRACE_FRAME"].contains(&key.as_str())) {
+                    return Err("RADV trace control variables are managed by profile_start".into());
+                }
+                let cwd = Path::new(text(a, "cwd")?);
+                let mut live = self.control.live_profile.lock().unwrap();
+                if live.is_some() {
+                    return Err("A live profile is already running; use profile_stop first".into());
+                }
+                let folder = job_directory()?;
+                let id = folder.file_name().unwrap().to_string_lossy().into_owned();
+                let trigger = folder.join("radv-trigger");
+                let mut vars = env;
+                vars.extend([
+                    ("MESA_VK_TRACE".to_owned(), "rgp".to_owned()),
+                    ("MESA_VK_TRACE_PER_SUBMIT".to_owned(), "0".to_owned()),
+                    ("MESA_VK_TRACE_TRIGGER".to_owned(), trigger.to_string_lossy().into_owned()),
+                ]);
+                fs::write(folder.join("profile.json"), serde_json::to_vec_pretty(&json!({"tracer":"radv","captureMode":"file-trigger","argv":argv,"cwd":cwd,"env":a.get("env").cloned().unwrap_or(json!({}))})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                let started = SystemTime::now();
+                let child = spawn_process_env(&argv, cwd, &folder, &vars)?;
+                let pid = child.id();
+                *live = Some(LiveProfile { id: id.clone(), child, folder: folder.clone(), program: argv[0].clone(), started, trigger: trigger.clone(), triggers: 0 });
+                Ok(json!({"id":id,"pid":pid,"directory":folder,"triggerFile":trigger,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"driverRequirement":"Headless compute file triggers require a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only during swapchain presentation.","next":"Wait for the server to become ready, call profile_trigger, send one inference request, wait for savedMessages, then call profile_stop to collect captures"}))
+            }
+            "profile_trigger" => {
+                let mut live = self.control.live_profile.lock().unwrap();
+                let profile = live.as_mut().ok_or("No live profile; use profile_start first")?;
+                if profile.id != text(a, "id")? {
+                    return Err("Live profile ID does not match".into());
+                }
+                if profile.child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                    return Err("Profiled process has exited; use profile_stop to collect artifacts".into());
+                }
+                fs::OpenOptions::new().write(true).create_new(true).open(&profile.trigger)
+                    .map_err(|e| format!("Cannot create RADV trigger (a previous trigger may still be pending): {e}"))?;
+                profile.triggers += 1;
+                Ok(json!({"id":profile.id,"triggerFile":profile.trigger,"triggerCount":profile.triggers,"next":"Send the inference request now; RADV captures the next eligible frame or submit"}))
+            }
+            "profile_status" => {
+                let mut live = self.control.live_profile.lock().unwrap();
+                let profile = live.as_mut().ok_or("No live profile; use profile_stop to collect a finished run")?;
+                if profile.id != text(a, "id")? {
+                    return Err("Live profile ID does not match".into());
+                }
+                let status = profile.child.try_wait().map_err(|e| e.to_string())?;
+                let (saved, unique) = rgp_save_counts(&profile.folder);
+                Ok(json!({"id":profile.id,"running":status.is_none(),"exitCode":status.and_then(|s| s.code()),"triggerPending":profile.trigger.exists(),"triggerCount":profile.triggers,"savedMessages":saved,"uniqueSavePaths":unique,"directory":profile.folder,"stdout":profile.folder.join("stdout.log"),"stderr":profile.folder.join("stderr.log")}))
+            }
+            "profile_stop" => {
+                let mut live = self.control.live_profile.lock().unwrap();
+                let profile = live.as_ref().ok_or("No live profile")?;
+                if profile.id != text(a, "id")? {
+                    return Err("Live profile ID does not match".into());
+                }
+                let mut profile = live.take().unwrap();
+                let status = profile.child.try_wait().map_err(|e| e.to_string())?;
+                tuning::stop(&mut profile.child);
+                let _ = fs::remove_file(&profile.trigger);
+                let mut report = radv_artifacts(&profile.program, profile.started, &profile.folder, if status.is_some() { "exited" } else { "stopped" })
+                    .map_err(|e| format!("{e}. Artifacts remain in {}", profile.folder.display()))?;
+                report["triggerCount"] = json!(profile.triggers);
+                report["exitCode"] = json!(status.and_then(|code| code.code()));
+                if profile.triggers > 0 && report["files"].as_array().is_some_and(|files| files.is_empty()) {
+                    report["warnings"].as_array_mut().unwrap().push(json!("No RGP file was saved after the trigger. Check stderr.log; RADV may not have seen an eligible traceable submit before the process stopped."));
+                }
+                Ok(report)
+            }
             "profile_run" => {
+                if self.control.live_profile.lock().unwrap().is_some() {
+                    return Err("A live profile is already running; use profile_stop first".into());
+                }
                 let folder = job_directory()?;
                 let argv: Vec<String> =
                     serde_json::from_value(a["argv"].clone()).map_err(|e| e.to_string())?;
@@ -1074,9 +1298,9 @@ impl Server {
                     ];
                     vars.extend(env);
                     let run = run_process_env(argv.clone(), cwd, &folder, &flag, seconds, &vars);
-                    let paths = collect_rgp(&argv[0], started, &folder)?;
-                    run?;
-                    return Ok(json!({"directory":folder,"files":paths,"next":"Use capture_open with a returned .rgp path; each file holds one queue submit"}));
+                    let report = radv_artifacts(&argv[0], started, &folder, if run.is_ok() { "completed" } else { "failed" })
+                        .map_err(|e| format!("{e}. Artifacts remain in {}", folder.display()))?;
+                    return run.map(|_| report.clone()).map_err(|e| format!("{e}. Artifacts: {report}"));
                 }
                 let mut command = vec![
                     a["profiler"]
@@ -1106,12 +1330,11 @@ impl Server {
                 }
                 command.push("--".into());
                 command.extend(argv);
-                run_process_env(command, cwd, &folder, &flag, seconds, &env)?;
+                let run = run_process_env(command, cwd, &folder, &flag, seconds, &env);
                 let mut paths = Vec::new();
                 find_outputs(&folder, &mut paths)?;
-                Ok(
-                    json!({"directory":folder,"files":paths,"next":"Use capture_open with a returned trace or counter CSV path"}),
-                )
+                let report = json!({"directory":folder,"files":paths,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"next":"Use capture_open with a returned trace or counter CSV path"});
+                run.map(|_| report.clone()).map_err(|e| format!("{e}. Artifacts: {report}"))
             }
             "tuning_open" => {
                 let id = tuning::create(
@@ -1121,8 +1344,8 @@ impl Server {
                     text(a, "dispatchId")?.into(),
                 )?;
                 self.control.follow(json!({"captureId":a["captureId"],"view":"dispatch","dispatchId":a["dispatchId"],"tuningId":id}));
-                if let Some(app) = &self.app {
-                    tuning::show_window(app, &id)?;
+                if let Some(app) = self.control.app.lock().unwrap().clone() {
+                    tuning::show_window(&app, &id)?;
                 }
                 tuning::status(&self.tuning, &id)
             }
@@ -1130,7 +1353,7 @@ impl Server {
             "tuning_close" => {
                 let id = text(a, "id")?;
                 tuning::close(&self.tuning, id)?;
-                if let Some(app) = &self.app {
+                if let Some(app) = self.control.app.lock().unwrap().clone() {
                     if let Some(w) = app.get_webview_window(&format!("tuning-{id}")) {
                         let _ = w.close();
                     }
@@ -1140,8 +1363,8 @@ impl Server {
             "tuning_action" => {
                 let id = text(a, "id")?;
                 let request = a.get("request").ok_or("request required")?.clone();
-                if let Some(app) = &self.app {
-                    tuning::show_window(app, id)?;
+                if let Some(app) = self.control.app.lock().unwrap().clone() {
+                    tuning::show_window(&app, id)?;
                 }
                 self.control.follow(json!({"tuningId":id}));
                 tuning::start(&self.tuning, id, request)?;
@@ -1246,7 +1469,11 @@ fn tools() -> Vec<Value> {
  ("workspace","List open captures, tuning sessions, current view and MCP status.",json!({}),vec![]),
  ("capture_open","Import a trace, counters, ATT run, sampling data or portable capture from an explicit path.",json!({"path":str_,"samplingMethod":str_,"loadWaveStates":{"type":"boolean"}}),vec!["path"]),
  ("capture_analyze","Run the same analysis functions as the GUI: kernels, occupancy, activity, hardware, hotspots, source, markers, scalar, tensor. Scalar takes name/formula (C0 etc). Tensor takes definitions (NAME := expression) and raw named {shape:[XCC,SE,CU,Time],values:[...]}. Timeline renders dispatch or global residency HTML with the same paged exporter as the GUI. Diagnostics produces its diagnostic manifest. Optional output writes a new HTML, diagnostics JSON, or analysis JSON file. Returns paged rows otherwise. Requires Node.js.",json!({"captureId":str_,"analysis":{"enum":["kernels","occupancy","activity","hardware","hotspots","source","markers","scalar","tensor","timeline","diagnostics"]},"metric":{"enum":["latency","pcSamples","pcIssued","pcStalled"]},"se":num,"kernel":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"name":str_,"formula":str_,"definitions":str_,"raw":obj,"output":str_,"timeline":{"enum":["dispatch","global"]},"timePages":num,"lanesPerPage":num,"workspace":obj,"query":str_,"offset":num,"limit":num}),vec!["captureId","analysis"]),
- ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects a kernel trace, or the given counters. tracer radv sets MESA_VK_TRACE=rgp with per-submit capture and returns the .rgp files the application's RADV Vulkan driver wrote, one per queue submit (experimental; see docs/radv-profiling.md). env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
+ ("profile_start","Start a long-lived Vulkan server under RADV RGP file-trigger capture. Headless compute needs a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only on swapchain presentation. Returns an ID, logs and trigger path immediately. Call profile_trigger just before an inference request, wait for a save message, then profile_stop to collect .rgp artifacts. Unlike per-submit tracing, this does not instrument every startup submit. Only one live profile can run at a time; the process is stopped when rocprof-studio shuts down. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"env":obj}),vec!["argv","cwd"]),
+ ("profile_trigger","Create the file that arms one RADV RGP capture in a live profile. Send the workload request after this call. A pending trigger cannot be armed again until RADV consumes it.",json!({"id":str_}),vec!["id"]),
+ ("profile_status","Check whether a live profiled process is running, whether its trigger is pending, and how many RGP saves RADV has announced. Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
+ ("profile_stop","Stop a live profiled server and collect its RADV .rgp files. Reports log paths, saved-message and unique-filename counts, and a warning if files were overwritten.",json!({"id":str_}),vec!["id"]),
+ ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects a kernel trace, or the given counters. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
  ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources. Limit <=1000. Counter rows include recorded samples.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":num}),vec!["captureId","dataset"]),
  ("workspace_select","Follow a capture, view, range, wave, instruction or dispatch in the GUI. Views: reference, trace, hardware, summary, sampling, occupancy, dispatch, hotspots, flame, markers, counters, evidence.",json!({"captureId":str_,"view":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"waveId":str_,"dispatchId":str_,"instruction":num,"timeline":str_,"se":num}),vec!["captureId"]),
@@ -1337,14 +1564,12 @@ fn profile_env(a: &Value) -> Result<Vec<(String, String)>, String> {
         })
         .collect()
 }
-fn run_process_env(
-    argv: Vec<String>,
+fn spawn_process_env(
+    argv: &[String],
     cwd: &Path,
     folder: &Path,
-    flag: &AtomicBool,
-    seconds: u64,
     env: &[(String, String)],
-) -> Result<(), String> {
+) -> Result<Child, String> {
     use std::process::{Command, Stdio};
     let mut command = Command::new(&argv[0]);
     command
@@ -1367,8 +1592,18 @@ fn run_process_env(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    command.spawn().map_err(|e| e.to_string())
+}
+fn run_process_env(
+    argv: Vec<String>,
+    cwd: &Path,
+    folder: &Path,
+    flag: &AtomicBool,
+    seconds: u64,
+    env: &[(String, String)],
+) -> Result<(), String> {
     Control::check(flag)?;
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let mut child = spawn_process_env(&argv, cwd, folder, env)?;
     let start = Instant::now();
     loop {
         let status = child.try_wait().map_err(|e| e.to_string())?;
@@ -1444,6 +1679,26 @@ fn collect_rgp(program: &str, since: std::time::SystemTime, folder: &Path) -> Re
         out.push(to);
     }
     Ok(out)
+}
+fn rgp_save_counts(folder: &Path) -> (usize, usize) {
+    let log = fs::read_to_string(folder.join("stderr.log")).unwrap_or_default();
+    let paths: std::collections::BTreeSet<_> = log.lines()
+        .filter_map(|line| line.split("RGP capture saved to '").nth(1)?.split_once('\'').map(|(path, _)| path))
+        .collect();
+    let messages = log.lines().filter(|line| line.contains("RGP capture saved to '")).count();
+    (messages, paths.len())
+}
+fn radv_artifacts(program: &str, started: SystemTime, folder: &Path, status: &str) -> Result<Value, String> {
+    let paths = collect_rgp(program, started, folder)?;
+    let (saved, unique) = rgp_save_counts(folder);
+    let mut warnings = Vec::new();
+    if saved > unique {
+        warnings.push(format!("RADV reported {saved} saves to only {unique} unique filenames; repeated filenames overwrote earlier captures."));
+    }
+    if unique > paths.len() {
+        warnings.push(format!("RADV reported {unique} unique capture paths but only {} files were retained. Check stderr.log for missing or failed captures.", paths.len()));
+    }
+    Ok(json!({"status":status,"directory":folder,"files":paths,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"savedMessages":saved,"uniqueSavePaths":unique,"warnings":warnings,"next":"Use capture_open with a returned .rgp path"}))
 }
 fn free_bytes(path: &Path) -> Result<u64, String> {
     use std::os::unix::ffi::OsStrExt;
@@ -1546,6 +1801,10 @@ extern "C" fn stop_signal(_: i32) {
 pub fn shutdown(control: &Control, tuning: &tuning::Tuning) {
     control.shutting_down.store(true, Ordering::SeqCst);
     control.cancel(None, None);
+    if let Some(mut profile) = control.live_profile.lock().unwrap().take() {
+        tuning::stop(&mut profile.child);
+        let _ = radv_artifacts(&profile.program, profile.started, &profile.folder, "stopped");
+    }
     tuning::stop_all(tuning);
     let start = Instant::now();
     while control.active.lock().unwrap().is_some() && start.elapsed() < Duration::from_secs(5) {
@@ -1585,6 +1844,19 @@ mod tests {
             .find(|t| t["name"] == "tuning_action")
             .unwrap()["inputSchema"];
         assert!(validate(&json!({"id":"x","request":{"op":"shell"}}), run).is_err());
+    }
+    #[test]
+    fn attach_requires_a_display_and_only_expected_environment() {
+        assert!(validate_attach_environment(&json!({"environment":{"DISPLAY":":99","GDK_BACKEND":"x11"}})).is_ok());
+        for bad in [
+            json!({"environment":{}}),
+            json!({"environment":{"DISPLAY":""}}),
+            json!({"environment":{"DISPLAY":":99","LD_PRELOAD":"/tmp/x.so"}}),
+            json!({"environment":{"DISPLAY":":99\u{0000}"}}),
+            json!({"environment":{"DISPLAY":42}}),
+        ] {
+            assert!(validate_attach_environment(&bad).is_err(), "{bad}");
+        }
     }
     #[test]
     fn cancellation_is_owned_and_request_scoped() {
@@ -1668,6 +1940,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rpg-mcp-test-{}-{}", std::process::id(), random().unwrap()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+    #[test]
+    fn rgp_save_report_detects_reused_filenames() {
+        let job = tempfile_dir();
+        fs::write(job.join("stderr.log"), "RGP capture saved to '/tmp/a.rgp'\nRGP capture saved to '/tmp/a.rgp'\nRGP capture saved to '/tmp/b.rgp'\n").unwrap();
+        assert_eq!(rgp_save_counts(&job), (3, 2));
+        fs::remove_dir_all(job).unwrap();
     }
     #[test]
     fn following_another_capture_clears_stale_selections() {

@@ -57,9 +57,14 @@ def mask_cpp(text):
     return re.sub(pattern, lambda m: ''.join('\n' if c == '\n' else ' ' for c in m.group()), text)
 
 
-def kernel_base(name):
+def canonical_kernel(name):
     if name.startswith('_Z'):
         name = subprocess.check_output(['c++filt', name], text=True).strip()
+    return name.removesuffix(' [clone .kd]')
+
+
+def kernel_base(name):
+    name = canonical_kernel(name)
     depth, head = 0, []
     for char in name:
         if char == '(' and depth == 0: break
@@ -277,7 +282,7 @@ def metrics_for(replay, resources, isa, options):
 def finish_capture(state, capture, cfg):
     if not (capture / 'capture_complete').exists(): raise RuntimeError('Capture did not complete; partial inputs were not accepted')
     dispatch = json.loads((capture / 'dispatch.json').read_text())
-    if dispatch['demangled_name'].removesuffix(' [clone .kd]') != state['kernel'].removesuffix(' [clone .kd]'): raise ValueError('Captured symbol does not exactly match the selected kernel: ' + dispatch['demangled_name'])
+    if canonical_kernel(dispatch['demangled_name']) != canonical_kernel(state['kernel']): raise ValueError('Captured symbol does not exactly match the selected kernel: ' + dispatch['demangled_name'])
     if len((capture / 'kernarg.bin').read_bytes()) != dispatch['kernarg_size']: raise ValueError('Kernel argument snapshot size mismatch')
     for name in ['kernel.hsaco', 'memory_regions.json']:
         if not (capture / name).is_file(): raise ValueError('Missing capture artifact: ' + name)
@@ -369,7 +374,7 @@ def main(root, request):
         env = dict(os.environ)
         env['LLAMA_CACHE'] = cfg.get('modelCache') or str(root.parents[1] / 'llama-cache')
         env.pop('HSA_TOOLS_LIB', None); env.pop('HSA_TOOLS_REPORT_LOAD_FAILURE', None)
-        env.update(LD_PRELOAD=str(Path(cfg['captureLibrary']).resolve()), KERNCAP_KERNEL=state['kernel'], KERNCAP_OUTPUT=str(capture), KERNCAP_CAPTURE_CHILD='1', KERNCAP_DISPATCH=str(int(cfg.get('occurrence', 0))))
+        env.update(LD_PRELOAD=str(Path(cfg['captureLibrary']).resolve()), KERNCAP_KERNEL=canonical_kernel(state['kernel']), KERNCAP_OUTPUT=str(capture), KERNCAP_CAPTURE_CHILD='1', KERNCAP_DISPATCH=str(int(cfg.get('occurrence', 0))))
         command(cfg['argv'], cfg['cwd'], log, env)
         finish_capture(state, capture, cfg)
         original_text = (root / 'original-source').read_text()
@@ -467,12 +472,12 @@ def main(root, request):
             if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', counter): raise ValueError('Invalid profiler counter name')
             folder = run / ('counter-' + str(mapping_index)); folder.mkdir()
             try:
-                command([cfg['profiler'], '--pmc', counter, '--kernel-include-regex', '^' + re.escape(state['kernel'].removesuffix(' [clone .kd]')) + '$', '--output-format', 'csv', '--output-directory', str(folder), '--'] + [cfg['replay'], str(capture), '--hsaco', str(hsaco), '--iterations', '1', '--hip-launch'], str(root), log)
+                command([cfg['profiler'], '--pmc', counter, '--kernel-include-regex', '^' + re.escape(canonical_kernel(state['kernel'])) + '$', '--output-format', 'csv', '--output-directory', str(folder), '--'] + [cfg['replay'], str(capture), '--hsaco', str(hsaco), '--iterations', '1', '--hip-launch'], str(root), log)
                 values = []
                 for path in folder.rglob('*.csv'):
                     with path.open() as f:
                         for row in csv.DictReader(f):
-                            if row.get('Kernel_Name', '').removesuffix(' [clone .kd]') == state['kernel'].removesuffix(' [clone .kd]'):
+                            if canonical_kernel(row.get('Kernel_Name', '')) == canonical_kernel(state['kernel']):
                                 raw = row.get(counter) or (row.get('Counter_Value') if row.get('Counter_Name') == counter else None)
                                 if raw is not None and raw.strip(): values.append(float(raw))
                 if len(values) != 1 or not math.isfinite(values[0]): raise ValueError('Expected exactly one measured dispatch counter value')

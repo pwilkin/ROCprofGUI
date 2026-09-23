@@ -57,3 +57,9 @@ done
 ```
 
 Neither contains machine-specific paths.
+
+## `gfx1201-add-occupancy.rgp`
+
+Captured on 2026-09-23 from `test-backend-ops` in an isolated llama.cpp checkout at `7ab4ee7ba`, on Radeon AI PRO R9700 (GFX1201) with privately installed stock Mesa 26.2.0 and libdrm 2.4.133. The run selected one `ADD` case (`type=f32,ne=[10,5,4,3],nr=[1,1,2,2],nf=6`) with `GGML_VK_DEBUG_MARKERS=1`, `MESA_VK_TRACE=rgp`, `MESA_VK_TRACE_PER_SUBMIT=1`, and `RADV_THREAD_TRACE_INSTRUCTION_TIMING=false`. This is submit 22 of 24. It contains the compiled ADD shader, RGP markers, SQTT occupancy and derived SPM counters, with no model data. SHA-256: `ca6d83fec9d350864443318fd8bb86d2087d374ae96940fc8154cd71b79214c2`.
+
+The GFX12 stream decodes without the GFX11 execution-token sanitizer: 24 decoded dispatch records, six markers per shader engine, 120 occupancy intervals across four shader engines, and no instruction hits as expected for occupancy mode. Applying the GFX11 sanitizer to this stream spuriously reports unknown token headers and rejects it.

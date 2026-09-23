@@ -59,6 +59,7 @@ export function svgPlot(
   }
   const copy = svg.cloneNode(true) as SVGSVGElement;
   copy.removeAttribute("class");
+  copy.style.removeProperty("height");
   const originals = [svg, ...svg.querySelectorAll("*")];
   const clones = [copy, ...copy.querySelectorAll("*")];
   originals.forEach((element, index) => {

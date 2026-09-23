@@ -335,6 +335,20 @@ fn occupancy_capture_accounts_for_every_wave_in_the_dispatch() {
     }
 }
 
+#[test]
+#[ignore = "requires the ROCm trace decoder library and ROCPROF_GUI_DECODER_PACKAGE"]
+fn gfx1201_occupancy_capture_keeps_dispatches_and_markers() {
+    let c = decoded(&fixture("gfx1201-add-occupancy.rgp"));
+    assert_eq!(c.metadata["asic"], "GFX1201");
+    assert_eq!(c.metadata["radvTraceMode"], "occupancy");
+    assert_eq!(c.metadata["rgpDispatchMarkers"], "6");
+    assert_eq!(c.dispatches.len(), 24);
+    assert_eq!(c.intervals.len(), 120);
+    assert!(c.dispatches.iter().all(|d| d.kernel == "add_f32_f32_f32" && d.grid == "256 × 5 × 1"));
+    assert!(c.instructions.iter().all(|i| i.hits == 0));
+    assert!(c.warnings.iter().all(|w| !w.contains("Thread trace not imported")));
+}
+
 /// 64 workgroups of one wave64, each running a 64-iteration loop. With
 /// rocprof-trace-decoder's token set every issued instruction on the traced CU is
 /// attributed: each loop-body row exactly 64 times per wave, the loop test once more

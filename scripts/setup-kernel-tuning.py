@@ -38,7 +38,7 @@ def main():
         run(['git', 'apply', patch], source)
     headers = root / 'rocm-headers'
     shutil.copytree(Path(args.rocm) / 'include/hsa', headers / 'hsa', dirs_exist_ok=True)
-    run(['cmake', '-S', source / 'kerncap', '-B', build, '-DCMAKE_BUILD_TYPE=Release', f'-DROCM_PATH={args.rocm}', f'-DCMAKE_PREFIX_PATH={args.rocm}', f'-DCMAKE_HIP_ARCHITECTURES={args.arch}', f'-DCMAKE_HIP_FLAGS=-I{headers}', f'-DCMAKE_INSTALL_PREFIX={runtime}'])
+    run(['cmake', '-S', source / 'kerncap', '-B', build, '-DCMAKE_BUILD_TYPE=Release', f'-DROCM_PATH={args.rocm}', f'-DCMAKE_PREFIX_PATH={args.rocm}', f'-DCMAKE_HIP_ARCHITECTURES={args.arch}', f'-DCMAKE_HIP_FLAGS=-I{headers}', f'-DCMAKE_INSTALL_PREFIX={runtime}', f'-DCMAKE_INSTALL_RPATH={Path(args.rocm) / "lib"}'])
     run(['cmake', '--build', build, '-j4']); run(['cmake', '--install', build])
     shutil.copy2(source / 'LICENSE', runtime / 'LICENSE.intellikit')
     (runtime / 'provenance.json').write_text(json.dumps({'repository': 'https://github.com/AMDResearch/intellikit', 'revision': PIN, 'patch': str(patch), 'architecture': args.arch, 'rocm': args.rocm}, indent=2))

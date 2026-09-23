@@ -915,6 +915,7 @@ pub fn trace_mode(blanked: usize, decoded: &Capture) -> TraceMode {
 fn thread_trace(
     d: &[u8],
     table: &[Chunk],
+    gfx12: bool,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<(Capture, serde_json::Value, Sanitized)>, String> {
     let mut sections = sqtt_sections(d, table)?;
@@ -922,10 +923,12 @@ fn thread_trace(
         return Ok(None);
     }
     let mut total = Sanitized::default();
-    for (_, body) in &mut sections {
-        let s = sanitize_sqtt(body);
-        total.blanked += s.blanked;
-        total.unknown += s.unknown;
+    if !gfx12 {
+        for (_, body) in &mut sections {
+            let s = sanitize_sqtt(body);
+            total.blanked += s.blanked;
+            total.unknown += s.unknown;
+        }
     }
     if total.unknown > 0 {
         return Err(format!(
@@ -1088,7 +1091,16 @@ pub fn load_options(
         .map(|c| spm(&d, c))
         .transpose()?;
 
-    let decoded = if decode_thread_trace { thread_trace(&d, &table, cancelled) } else { Ok(None) };
+    let decoded = if decode_thread_trace {
+        thread_trace(
+            &d,
+            &table,
+            asic_name.as_deref().is_some_and(|n| n.starts_with("GFX12")),
+            cancelled,
+        )
+    } else {
+        Ok(None)
+    };
     match decoded {
         Ok(Some((mut capture, realtime, sanitized))) => {
             capture.name = name;

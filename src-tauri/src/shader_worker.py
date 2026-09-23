@@ -470,7 +470,9 @@ def main(root, request):
         capture = root / ('capture-' + str(time.time_ns()))
         capture.mkdir()
         env = application_env(cfg)
-        env.update(VK_ADD_LAYER_PATH=str(Path(cfg['layer']).parent), VK_INSTANCE_LAYERS='VK_LAYER_ROCPROF_capture',
+        layer_dir = str(Path(cfg['layer']).parent)
+        env['VK_LAYER_PATH'] = layer_dir + (os.pathsep + env['VK_LAYER_PATH'] if env.get('VK_LAYER_PATH') else '')
+        env.update(VK_ADD_LAYER_PATH=layer_dir, VK_INSTANCE_LAYERS='VK_LAYER_ROCPROF_capture',
                    ROCPROF_VKCAP_OUTPUT=str(capture), ROCPROF_VKCAP_NAME=name,
                    ROCPROF_VKCAP_OCCURRENCE=str(int(cfg.get('occurrence', 0))))
         groups = cfg.get('groups') or expected_groups(state.get('traceDispatch', {}))
