@@ -88,7 +88,20 @@ Four new fixtures and six new tests cover this, three of which need the decoder;
 - the captured shader replays bit-exactly, and a comment-only edit compiles back to identical SPIR-V;
 - shared-memory row padding 4 → 2 measured 36% (at `-ub 512`) and 28% (at `-ub 256`) faster in isolation, with bit-identical outputs.
 
-That is a measurement of the isolated dispatch, not an application speedup. Neither the whole-application effect nor other quant types and shapes have been measured, and nothing has been changed in llama.cpp.
+That is a measurement of the isolated dispatch, not an application speedup.
+
+**Whole-application check, same day.** A separate Vulkan-only clone of llama.cpp at `4ceb17191`, with a test-only environment override for the pad's specialization constant, so both pads ran from one binary. The user's llama.cpp tree was not touched.
+- **Benchmark.** `llama-bench` on Qwen3.5-9B IQ4_NL, three interleaved rounds of five repetitions: pp512 is about 8% faster (mean 1094 → 1180 t/s on Mesa 26.2.0, 1079 → 1169 on the system Mesa 26.0.8). tg128 is unchanged.
+- **Per operation** (`GGML_VK_PERF_LOGGER`, Mesa 26.2.0): m=8192 k=4096, the captured shape, −28.5%; m=4096 k=4096 −30.7%; FFN down (k=12288) −7.4%; FFN gate/up (m=12288), 35% of GPU time, −3.9%. The FFN gate/up dispatch, captured and replayed, shows −30% in isolation. For the shapes that dominate, replay overstated the in-application gain several-fold.
+- **Clocks.** Pad 2 starts 11% faster, then falls back as the clock drops from about 2.7 GHz to 2.4 GHz, at lower package power than pad 4. Replay alternates each dispatch with buffer restores; over 2,000 iterations its clock stayed at 2.9 GHz.
+- **Driver.** The tuning session had inherited the profile run's patched Mesa 26.2.0. The system Mesa 26.0.8 keeps 192 VGPRs and 8 waves at pad 2 (replay −16%, in-application −11 to −15%); 26.2.0 drops to 120 VGPRs and 12 waves because the shared-memory size falls from 23.5 to 21.5 KB.
+- **Correctness.** `test-backend-ops` MUL_MAT (1128/1128) and MUL_MAT_ID (937/937) pass with pad 2 on both drivers.
+- **Spec.** Pad 2 makes the cooperative-matrix load stride 72 bytes, which violates `VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986` (16-byte alignment). Pad 4 is 80 bytes, which is why it was chosen. RADV computes correctly because it does not rely on the alignment, so the change is not upstreamable as is. A compliant route to the same occupancy would keep pad 4 and free about 2 KB of shared memory elsewhere; that is untested.
+
+Tool follow-ups this exposed, none done:
+- **In-application A/B.** The capture layer could substitute a variant's SPIR-V into the running application, so a candidate is timed in context without rebuilding it.
+- **Cross-driver replay.** `vkreplay` refuses a capture made on another driver with a bare `vkCreateDevice failed (-8)`. It should name the unsupported feature, or drop it with a note.
+- **Driver in results.** Replay results and sessions should show the driver version they ran on.
 
 Found along the way:
 - **The first capture read 1 GB back from uncached write-combined memory and took 166 s.** Host-cached staging memory brought it to 2.5 s.

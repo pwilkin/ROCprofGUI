@@ -223,7 +223,7 @@ A session runs in four steps:
    - A run can also be traced with RADV, and the trace opened here.
 4. **Save** writes the edited files back, refusing if a file changed on disk since it was read, and keeps a backup.
 
-Qualified on gfx1151 with llama.cpp's IQ4_NL matrix multiply. The captured shader replays bit-exactly; a comment-only edit compiles back to the captured SPIR-V byte for byte; and a one-constant edit, shared-memory row padding 4 → 2, measured 36% and 28% faster on two captured shapes with bit-identical outputs.
+Qualified on gfx1151 with llama.cpp's IQ4_NL matrix multiply. The captured shader replays bit-exactly; a comment-only edit compiles back to the captured SPIR-V byte for byte; and a one-constant edit, shared-memory row padding 4 → 2, measured 36% and 28% faster on two captured shapes with bit-identical outputs. In the whole application the same change gave about 8% on `llama-bench` pp512: the largest matrix multiplies gained 4–7% there against 30% in replay (details in open-work's eighth pass). Pad 2 also breaks the 16-byte stride alignment Vulkan requires of cooperative-matrix loads; RADV happens to tolerate it.
 
 Limits:
 
@@ -231,7 +231,8 @@ Limits:
 - **Source recovery:** automatic only for ggml's Vulkan shader build. Other projects can replay and time the captured SPIR-V, but not edit it.
 - **Pipeline names:** the dispatch must have one, from the application's debug names or labels. A kernel identified only by pipeline hash cannot be selected.
 - **Capture size:** a capture holds every bound range, and ggml binds the rest of its compute buffer as the output range, so one matrix-multiply capture is about 250–530 MB. Sessions live under `~/.rocprofgui/shader-tuning/sessions`.
-- **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it.
+- **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it. Replay runs the dispatch between buffer restores, at clocks a sustained application may not hold; on llama.cpp a 30% isolated gain was 4% inside the application. Confirm a variant in the application before relying on it.
+- **Driver:** the replay compiles with whatever driver the session's environment selects. A session created from an MCP `profile_run` inherits that run's `VK_DRIVER_FILES`, so a session profiled on a patched Mesa tunes for that Mesa's compiler. Mesa 26.0.8 and 26.2.0 compile the same IQ4_NL shader to 192 and 120 VGPRs at pad 2.
 
 ## RADV Vulkan captures (experimental)
 
