@@ -14,7 +14,7 @@ npm ci
 npm run tauri dev
 ```
 
-Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture (experimental). The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches rocprofv3 against an argv, and the kernel-tuning worker compiles candidates and can write a replacement kernel source back to disk. Both are described under [MCP server](#mcp-server) and [Kernel tuning](#kernel-tuning); neither runs unless invoked.
+Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture (experimental). The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches an argv under rocprofv3 or under RADV Vulkan tracing, and the kernel- and shader-tuning workers compile candidates and can write replacement source back to disk. They are described under [MCP server](#mcp-server), [Kernel tuning](#kernel-tuning) and [Shader tuning](#shader-tuning-vulkan-experimental); none runs unless invoked.
 
 The browser preview uses an explicitly synthetic example capture:
 
@@ -75,6 +75,8 @@ cargo check -p rocprof-studio
 npx playwright install chromium
 npm run test:ui
 ```
+
+`python3 -m unittest tests/test_tuning_worker.py tests/test_shader_worker.py` covers the two tuning workers' source handling, SPIR-V matching and save guards without a GPU.
 
 All six `scripts/check-*-oracle.*` scripts compile the vendored upstream C++ in `third_party/rcv/` and compare its output against this application's own implementation, so they need a C++ toolchain. They compare algorithm behavior, not Qt widget rendering; there is deliberately no pixel diff.
 
@@ -178,7 +180,7 @@ The desktop app starts a Model Context Protocol server **by default** on every l
 
 It binds loopback `127.0.0.1:8765` only and never a routable interface. Requests without a matching `Authorization: Bearer <token>` header are rejected with 401. The token is 32 bytes read from `/dev/urandom`, written once with `create_new` and mode `0600`, and reused on later launches; a token shorter than 32 characters or outside `[A-Za-z0-9_-]` is refused. It exposes 27 tools over the same analysis core as the GUI, with caps of 32 connections and 16 sessions. One tool runs at a time; a concurrent call is rejected with `-32001` rather than queued. There is no event replay or resumption, and cancelling a tool does not roll back writes it already made.
 
-Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and kernel-tuning sessions under `kernel-tuning/sessions/`. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
+Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and kernel-tuning sessions under `kernel-tuning/sessions/`. An analysis job deletes its folder when it succeeds and keeps only its logs when it fails; `profile_run` output stays until you delete it, since it is the capture itself. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
 
 ```bash
 rocprof-studio --no-mcp                      # do not start the server
@@ -187,7 +189,7 @@ rocprof-studio --mcp-token-file PATH         # write the bearer token elsewhere
 rocprof-studio --headless                    # serve MCP without a window
 ```
 
-Two of the tools are not read-only. `profile_run` executes rocprofv3 against an argv you supply (no shell, 10-minute limit, cancellable) and returns output files to import. The tuning tools compile and run candidate kernels, and the tuning worker can write a kernel source file back to disk. Any local process that can read the token file can drive both, so on a shared or multi-user host either run with `--no-mcp` or keep the token file readable only by the account running the app.
+Two of the tools are not read-only. `profile_run` executes an argv you supply under rocprofv3, or with `tracer: "radv"` under RADV Vulkan tracing (experimental), and returns output files to import. It takes optional `env` variables (the runner's own `LD_PRELOAD`, `HSA_TOOLS_*` and `TMPDIR` handling cannot be overridden) and `timeoutSeconds` (default 600, at most 3600); it uses no shell and can be cancelled. RADV writes its captures to a fixed `/tmp` path, so a RADV run moves the files it wrote into the job folder, after checking there is room. The tuning tools compile and run candidate kernels, and the tuning worker can write a kernel source file back to disk. Any local process that can read the token file can drive both, so on a shared or multi-user host either run with `--no-mcp` or keep the token file readable only by the account running the app.
 
 `capture_analyze` shells out to Node.js at runtime, because it reuses the frontend's own analysis modules through an esbuild bundle. Set `ROCPROF_MCP_NODE` to select a specific interpreter. Node.js is also required at **build** time: `src-tauri/build.rs` runs `scripts/build-mcp-analysis.mjs` and fails the build if it is missing. That build script declares `cargo:rerun-if-changed=../src`, so editing the TypeScript frontend rebuilds the Rust crate.
 
@@ -204,6 +206,32 @@ Known rough edges, none of them hardware-dependent:
 Timing deltas reported by a session are **not a claimed speedup**: no counterbalanced A/B or clock-stability experiment is run. The qualification host was gfx1151, and the sampled kernel contains no WMMA or LDS instructions, so WMMA-heavy kernels and LDS bank-conflict behavior are unqualified.
 
 What this surface does **not** do: there is no replay-equivalence gate proving a replayed kernel behaves like the original, no experiment structure over an immutable baseline, and no staged qualification of a candidate before its timings are reported. Read a session's output as a measurement of what it actually ran, not as a validated speedup.
+
+## Shader tuning (Vulkan, experimental)
+
+"Tune shader" on a dispatch in a RADV capture opens the Vulkan counterpart of kernel tuning: capture one dispatch, replay it in isolation, and compare edited variants against it. It needs a GPU, and a runtime that `scripts/setup-shader-tuning.py` builds into `~/.rocprofgui/shader-tuning/runtime`: the `VK_LAYER_ROCPROF_capture` capture layer and the `vkreplay` harness, both from `tools/vkcap/`. The MCP tuning tools drive the same sessions.
+
+A session runs in four steps:
+
+1. **Capture.** The application runs again under the capture layer, which stops at the dispatch with the traced pipeline name and workgroup count. It records the SPIR-V, the specialization and push constants, the device's enabled extensions and features, and every bound buffer range, copied immediately **before and after** the dispatch. When the capture came from an MCP `profile_run`, the session reruns the same command and environment. llama.cpp names its pipelines only with `GGML_VK_DEBUG_MARKERS=1`, which sessions set by default.
+2. **Find source.** For ggml's Vulkan backend, the captured SPIR-V is matched against the build's generated shaders. The comparison ignores the capabilities, extensions and execution modes an application may add at run time; ggml adds fp16 float controls. The generator then reruns for that one source through a logging `glslc`, which recovers the exact compile command, confirmed by rebuilding to identical bytes. Every file that compile reads becomes editable.
+3. **Run.** The captured shader, or an edited variant compiled with the recovered command, is replayed in isolation:
+   - The application's run-time SPIR-V edits are reapplied to each variant.
+   - Every timed iteration restores all inputs from pristine copies, and GPU timestamps bracket the dispatch.
+   - Validation compares every bound buffer byte for byte with what **the application's own dispatch** produced, not with another replay.
+   - The driver's compiler statistics (VGPRs, SGPRs, LDS, spills, wave limit) and ISA are reported.
+   - A run can also be traced with RADV, and the trace opened here.
+4. **Save** writes the edited files back, refusing if a file changed on disk since it was read, and keeps a backup.
+
+Qualified on gfx1151 with llama.cpp's IQ4_NL matrix multiply. The captured shader replays bit-exactly; a comment-only edit compiles back to the captured SPIR-V byte for byte; and a one-constant edit, shared-memory row padding 4 → 2, measured 36% and 28% faster on two captured shapes with bit-identical outputs.
+
+Limits:
+
+- **Descriptors:** only buffer descriptors (storage and uniform) can be captured. A dispatch that binds images, or reaches memory through buffer device addresses, is refused or will not replay faithfully.
+- **Source recovery:** automatic only for ggml's Vulkan shader build. Other projects can replay and time the captured SPIR-V, but not edit it.
+- **Pipeline names:** the dispatch must have one, from the application's debug names or labels. A kernel identified only by pipeline hash cannot be selected.
+- **Capture size:** a capture holds every bound range, and ggml binds the rest of its compute buffer as the output range, so one matrix-multiply capture is about 250–530 MB. Sessions live under `~/.rocprofgui/shader-tuning/sessions`.
+- **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it.
 
 ## RADV Vulkan captures (experimental)
 

@@ -22,6 +22,17 @@ from rocprof_trace_decoder.att import AttTrace, generate_att_outputs
 from rocprof_trace_decoder.codegen import CodeObject
 from rocprof_trace_decoder.code_index import CodeIndex
 
+# The writer indents every value onto its own line, which makes a large
+# occupancy.json several times its data and trips the importer's size limit.
+def _write_compact_json(path, data):
+    Path(path).write_text(json.dumps(data, separators=(',', ':')))
+try:
+    import rocprof_trace_decoder.rcv as rcv
+    if hasattr(rcv, '_write_json'):
+        rcv._write_json = _write_compact_json
+except ImportError:
+    pass
+
 def warn(path, message):
     print(f'DECODER-WARNING: {Path(path).name}: {message}', flush=True)
 

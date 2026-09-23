@@ -83,6 +83,18 @@ Two vendored fixtures cover both capture modes, and 14 tests cover them, 2 of wh
 
 Four new fixtures and six new tests cover this, three of which need the decoder; there is one new browser test. The compat option exists only as this project's patch. Whether to propose it to Mesa is the user's decision, and nothing has been submitted anywhere.
 
+**Eighth pass — single-shader tuning for Vulkan, 2026-09-23.** The Vulkan counterpart of the HIP kernel-tuning session, described in README's "Shader tuning" section. A capture layer (`tools/vkcap/vkcap_layer.cpp`) records one dispatch, including its bound buffers before and after it. A replay harness (`vkreplay.cpp`) times the dispatch in isolation and validates it against the application's own output. `shader_worker.py` recovers the GLSL recipe of a ggml shader by SPIR-V identity: it ignores the fp16 float-control instructions ggml adds at run time and reapplies them to every variant. Qualified end to end through MCP on llama.cpp's IQ4_NL matrix multiply on gfx1151:
+- capture 2.7 s, source search 1.6 s, recipe recovery 4.4 s, runs about 1.4 s;
+- the captured shader replays bit-exactly, and a comment-only edit compiles back to identical SPIR-V;
+- shared-memory row padding 4 → 2 measured 36% (at `-ub 512`) and 28% (at `-ub 256`) faster in isolation, with bit-identical outputs.
+
+That is a measurement of the isolated dispatch, not an application speedup. Neither the whole-application effect nor other quant types and shapes have been measured, and nothing has been changed in llama.cpp.
+
+Found along the way:
+- **The first capture read 1 GB back from uncached write-combined memory and took 166 s.** Host-cached staging memory brought it to 2.5 s.
+- **`profile_run`'s RADV mode failed if another process removed a `/tmp` entry mid-scan.** It now examines only its own files.
+- **Not fixed:** `tests/test_tuning_worker.py` still creates its temporary directories under `.codex/kernel-tuning/tests`, the last `.codex` path in the tree.
+
 Still open and unchanged: everything in §3, §4, §7, §8, §9 and §11.
 
 ---

@@ -32,10 +32,25 @@ export function occupancy(
     .sort((a, b) => a[0] - b[0])
     .map(([t, d]) => [t, (active += d)]);
 }
+/**
+ * Per-kernel dispatch durations, plus what occupancy measured for the same kernel:
+ * `waves` resident, `waveTime` (summed wave lifetimes) and `activeTime` (the union
+ * of those lifetimes, the time the kernel had any wave resident). SQTT dispatch
+ * records are points, so for thread traces only the occupancy figures are nonzero.
+ */
 export function kernelStats(c: Capture) {
   const m = new Map<
     string,
-    { name: string; count: number; total: number; min: number; max: number }
+    {
+      name: string;
+      count: number;
+      total: number;
+      min: number;
+      max: number;
+      waves: number;
+      waveTime: number;
+      activeTime: number;
+    }
   >();
   for (const d of c.dispatches) {
     const v = m.get(d.kernel) || {
@@ -44,6 +59,9 @@ export function kernelStats(c: Capture) {
       total: 0,
       min: Infinity,
       max: 0,
+      waves: 0,
+      waveTime: 0,
+      activeTime: 0,
     };
     const duration = d.end - d.start;
     v.count++;
@@ -52,7 +70,20 @@ export function kernelStats(c: Capture) {
     v.max = Math.max(v.max, duration);
     m.set(d.kernel, v);
   }
-  return [...m.values()].sort((a, b) => b.total - a.total);
+  const lifetimes = new Map<string, Range[]>();
+  for (const i of c.intervals) {
+    const v = m.get(i.kernel);
+    if (!v) continue;
+    v.waves++;
+    v.waveTime += i.end - i.start;
+    const ranges = lifetimes.get(i.kernel) ?? [];
+    ranges.push([i.start, i.end]);
+    lifetimes.set(i.kernel, ranges);
+  }
+  for (const [kernel, ranges] of lifetimes) m.get(kernel)!.activeTime = union(ranges);
+  return [...m.values()].sort(
+    (a, b) => b.total - a.total || b.activeTime - a.activeTime,
+  );
 }
 export function instructionStats(
   code: Instruction[],

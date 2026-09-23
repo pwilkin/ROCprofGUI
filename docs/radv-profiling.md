@@ -71,6 +71,28 @@ Useful variables:
 
 Tracing slows the application down, and every submit writes a file: a llama.cpp model load alone writes one per upload chunk. Keep runs short, and watch free space in `/tmp`.
 
+### Through MCP
+
+The desktop app's MCP server (see the README's "MCP server" section) can run the capture itself: `profile_run` with `tracer: "radv"` sets `MESA_VK_TRACE=rgp` and `MESA_VK_TRACE_PER_SUBMIT=1`, adds the `env` you pass, runs the argv, and moves the `.rgp` files the application wrote into its job folder, one per submit, in submit order. `capture_open`, `capture_analyze` and `capture_query` then work on each file.
+
+```json
+{"tracer": "radv", "cwd": "/path/to/llama.cpp/build/bin", "timeoutSeconds": 1800,
+ "argv": ["/path/to/llama.cpp/build/bin/llama-bench", "-m", "model.gguf", "-dev", "Vulkan0"],
+ "env": {"VK_DRIVER_FILES": "/home/you/radv-compat/share/vulkan/icd.d/radeon_icd.x86_64.json",
+         "RADV_THREAD_TRACE_ROCPROF_COMPAT": "true", "GGML_VK_DEBUG_MARKERS": "1"}}
+```
+
+### Sizing a capture
+
+Every submit is traced, so volume grows with run length. On a 9B-parameter model in llama.cpp, one generated token wrote about 88 MB across 12 submits; a default `llama-bench` run (641 generated tokens) would need about 56 GB. Profile a few tokens instead: each generated token runs the same graph.
+
+- Large prompt-processing submits can overflow the trace buffer (RADV then skips the capture and says so). Raise `RADV_THREAD_TRACE_BUFFER_SIZE` and `RADV_CACHE_COUNTERS_BUFFER_SIZE`; 1 GiB and 256 MiB covered a 512-token prompt.
+- The importer refuses decoded output over 2 million records per shader engine, or files over 256 MiB. A 512-token micro-batch exceeded that; `-ub 256` stayed under it and selects the same matmul kernels.
+- For kernel rankings, occupancy mode (`RADV_THREAD_TRACE_INSTRUCTION_TIMING=false`) suffices and is about a third of the size. For instruction detail, `RADV_THREAD_TRACE_INSTRUCTION_TIMING_SE_MASK=0x1` limits the supplemental per-SIMD records to one shader engine.
+- A submit can still lose trace data under memory-bandwidth pressure, even with RADV's stall-on-high-water enabled. The importer rejects that submit's thread trace and keeps its counters; it happened on 1 of 25 prompt-processing submits.
+
+The **Kernel dispatches** view and the `kernels` analysis report, per kernel, the waves recorded in occupancy and their **wave-active** time: the union of the kernel's wave lifetimes. SQTT dispatch records have no end time, so this is the time measure to rank kernels by.
+
 ## Step 3: open
 
 Open a `.rgp` file with **Open capture** (or `capture_open` over MCP). Each file is one submit. The importer:
@@ -82,6 +104,10 @@ Open a `.rgp` file with **Open capture** (or `capture_open` over MCP). Each file
 5. matches each dispatch to RADV's marker for it and records its grid.
 
 Warnings in **Capture evidence** say what could not be trusted.
+
+## Tuning one shader
+
+From a dispatch in a RADV capture, **Tune shader** (or MCP `tuning_open`) captures that one dispatch from a fresh run of the application, recovers its GLSL source and compile command (ggml builds), and replays the captured shader or edited variants in isolation. It validates each against the application's own output and times it. See the README's "Shader tuning" section; it needs `scripts/setup-shader-tuning.py` to have built the capture layer and replay harness.
 
 ## Raw counters
 

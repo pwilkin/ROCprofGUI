@@ -13,3 +13,5 @@
 /.codex/
 /third_party/decoder-python/build/
 /.synagent/
+
+__pycache__/

@@ -1289,7 +1289,7 @@ export function DispatchView({
         title="Kernel dispatches"
         detail={
           capture.unit === "cycles"
-            ? "SQTT dispatch events have no dispatch end timestamp; duration is unavailable."
+            ? "SQTT dispatch events have no dispatch end timestamp; duration is unavailable. Wave-active is the union of the kernel's wave lifetimes from occupancy."
             : "Kernel shares use summed recorded durations; replay coverage is unknown."
         }
         tools={
@@ -1319,6 +1319,10 @@ export function DispatchView({
                 </th>
                 <th>Mean</th>
                 <th>Share</th>
+                <th title="Waves recorded in occupancy for this kernel">Waves</th>
+                <th title="Union of this kernel's wave lifetimes: the time it had any wave resident">
+                  Wave-active
+                </th>
                 <th></th>
               </tr>
             </thead>
@@ -1334,8 +1338,14 @@ export function DispatchView({
                   <td>
                     {total ? `${((k.total / total) * 100).toFixed(1)}%` : "—"}
                   </td>
+                  <td>{k.waves ? fmt(k.waves) : "—"}</td>
+                  <td>{k.activeTime ? fmt(k.activeTime) : "—"}</td>
                   <td>
-                    {onTune && <button onClick={() => onTune(capture.dispatches.find(d => d.kernel === k.name)!)}>Tune kernel</button>}
+                    {onTune && !k.name.endsWith("(RADV internal)") && (
+                      <button onClick={() => onTune(capture.dispatches.find((d) => d.kernel === k.name)!)}>
+                        {capture.format.startsWith("RADV RGP") ? "Tune shader" : "Tune kernel"}
+                      </button>
+                    )}
                     <button
                       title="Focus first dispatch"
                       onClick={() => {

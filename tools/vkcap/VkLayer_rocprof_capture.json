@@ -1,0 +1,12 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_ROCPROF_capture",
+    "type": "GLOBAL",
+    "library_path": "./libVkLayer_rocprof_capture.so",
+    "api_version": "1.4.341",
+    "implementation_version": "1",
+    "description": "rocprof studio single-dispatch capture for isolated shader replay",
+    "functions": {"vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"}
+  }
+}

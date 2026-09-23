@@ -6,6 +6,7 @@ import {
   boundedRange,
   occupancy,
   instructionStats,
+  kernelStats,
 } from "./analysis";
 import bundle from "../public/demo.json";
 import type { Capture, Wave } from "./types";
@@ -21,6 +22,23 @@ describe("profiling semantics", () => {
   it("maintains a valid bounded range", () => {
     expect(boundedRange([-5, 5], [0, 100])).toEqual([0, 10]);
     expect(boundedRange([95, 105], [0, 100])).toEqual([90, 100]);
+  });
+  it("kernel stats add measured occupancy to point dispatches", () => {
+    const capture = {
+      dispatches: [
+        { kernel: "a", start: 5, end: 5 },
+        { kernel: "b", start: 0, end: 0 },
+      ],
+      intervals: [
+        { kernel: "a", start: 10, end: 30 },
+        { kernel: "a", start: 20, end: 40 },
+        { kernel: "b", start: 0, end: 10 },
+        { kernel: "unrecorded", start: 0, end: 99 },
+      ],
+    } as unknown as Capture;
+    const [a, b] = kernelStats(capture);
+    expect(a).toMatchObject({ name: "a", count: 1, total: 0, waves: 2, waveTime: 40, activeTime: 30 });
+    expect(b).toMatchObject({ name: "b", waves: 1, activeTime: 10 });
   });
   it("occupancy returns to zero", () => {
     const series = occupancy(bundle.capture as unknown as Capture);

@@ -54,14 +54,15 @@ An earlier checkpoint recorded 221 ordinary Rust tests, eight enabled fixture te
 
 Host capability, unchanged: the installed profiler reports gfx1151 (Radeon 8060S, 40 CUs), SPM configuration intervals of 32–65,504 shader-clock cycles, and no PC-sampling-capable agent. A counter-level check found no eligible SPM counters under either installed SDK 1.3.5 or local SDK 1.4.0, because the local AQLprofile event filter excludes gfx1151 even though configuration enumeration succeeds. A bounded HIP workload passed all 65,536 CPU-oracle comparisons, but no SPM collection was forced or claimed. These are live capability queries, not a successful hardware collection, and not a claim about every driver/SDK combination. The full set of blocked inputs and their evidence is in [blocked-inputs.md](blocked-inputs.md).
 
-All-suite run, 2026-09-22, one tree state, no source change between suites, no environment overrides:
+All-suite run, 2026-09-23, one tree state, no source change between suites, no environment overrides:
 
 | Suite | Command | Result |
 |---|---|---|
 | Rust (core) | `cargo test -p profile-core --offline` | 269 passed, 0 failed, 17 ignored |
-| Rust (host) | `cargo test -p rocprof-studio --offline` | 5 passed, 0 failed |
-| Frontend | `npm test` | 197 passed (55 files) |
-| Browser | `npm run test:ui` | 132 passed, 0 failed, 3 skipped |
+| Rust (host) | `cargo test -p rocprof-studio --offline` | 8 passed, 0 failed |
+| Python workers | `python3 -m unittest tests/test_tuning_worker.py tests/test_shader_worker.py` | 26 passed |
+| Frontend | `npm test` | 198 passed (55 files) |
+| Browser | `npm run test:ui` | 133 passed, 0 failed, 3 skipped |
 | Build | `npm run build` | passed |
 | Native check | `cargo check -p rocprof-studio --offline` | passed, 0 warnings |
 

@@ -87,15 +87,28 @@ pub fn create(
         std::process::id(),
         tuning.next.fetch_add(1, Ordering::Relaxed)
     );
+    // RADV captures open a single-shader Vulkan session; everything else a HIP one.
+    let vulkan = capture.format.starts_with("RADV RGP");
     let root = match std::env::var_os("ROCPROF_TUNING_ROOT") {
         Some(explicit) => PathBuf::from(explicit),
-        None => crate::appdir::subdir("kernel-tuning/sessions")?,
+        None => crate::appdir::subdir(if vulkan { "shader-tuning/sessions" } else { "kernel-tuning/sessions" })?,
     };
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let directory = root.join(&id);
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
     let directory = directory.canonicalize().map_err(|e| e.to_string())?;
     let runtime = root.parent().unwrap_or(&root).join("runtime");
+    if vulkan {
+        let config = vulkan_config(capture.input_path.as_deref(), &runtime);
+        let state = json!({"mode":"vulkan","config":config,"version":1,"id":id,"kernel":dispatch.kernel,"traceDispatch":dispatch,"captureId":capture_id,"runs":[],"directory":directory});
+        fs::write(directory.join("session.json"), serde_json::to_vec_pretty(&state).unwrap()).map_err(|e| e.to_string())?;
+        fs::write(directory.join("worker.py"), include_str!("shader_worker.py")).map_err(|e| e.to_string())?;
+        tuning.sessions.lock().map_err(|e| e.to_string())?.insert(
+            id.clone(),
+            Session { directory, child: None, started: Instant::now(), error: None },
+        );
+        return Ok(id);
+    }
     let occurrence = capture
         .dispatches
         .iter()
@@ -134,6 +147,45 @@ pub fn create(
         },
     );
     Ok(id)
+}
+
+/// Defaults for a Vulkan session. When the capture came from an MCP `profile_run`,
+/// its job folder records the command, so the same application is rerun for the
+/// capture; the ggml source tree is found by walking up from the application.
+fn vulkan_config(input: Option<&std::path::Path>, runtime: &std::path::Path) -> Value {
+    let profile: Value = input
+        .and_then(|p| p.parent())
+        .filter(|dir| dir.file_name().is_some_and(|n| n == "rgp"))
+        .and_then(|dir| fs::read(dir.parent()?.join("profile.json")).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let mut env = serde_json::Map::new();
+    if let Some(recorded) = profile["env"].as_object() {
+        for (key, value) in recorded {
+            if !key.starts_with("MESA_VK_TRACE") {
+                env.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    // ggml names its pipelines only with debug markers on; the capture layer
+    // selects the dispatch by that name.
+    env.entry("GGML_VK_DEBUG_MARKERS").or_insert(json!("1"));
+    let argv = profile["argv"].clone();
+    let source_tree = argv[0]
+        .as_str()
+        .map(std::path::Path::new)
+        .and_then(|app| app.ancestors().find(|dir| dir.join("ggml/src/ggml-vulkan/vulkan-shaders").is_dir()))
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
+    json!({
+        "sourceTree": source_tree,
+        "cwd": profile["cwd"].as_str().unwrap_or(""),
+        "argv": if argv.is_array() { argv } else { json!([]) },
+        "env": env,
+        "occurrence": 0,
+        "layer": runtime.join("lib/VkLayer_rocprof_capture.json"),
+        "replay": runtime.join("bin/vkreplay"),
+    })
 }
 
 pub fn show_window(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
@@ -341,5 +393,45 @@ pub fn stop_all(tuning: &Tuning) {
                 session.error = Some("Application shutting down".into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vulkan_sessions_rerun_the_profiled_command_without_tracing() {
+        let root = std::env::temp_dir().join(format!("rpg-tuning-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let shaders = root.join("llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders");
+        fs::create_dir_all(&shaders).unwrap();
+        fs::create_dir_all(root.join("llama.cpp/build/bin")).unwrap();
+        let job = root.join("job");
+        fs::create_dir_all(job.join("rgp")).unwrap();
+        let app = root.join("llama.cpp/build/bin/llama-bench");
+        fs::write(
+            job.join("profile.json"),
+            serde_json::to_vec(&json!({"tracer":"radv","argv":[app,"-p","512"],"cwd":"/work",
+                "env":{"MESA_VK_TRACE":"rgp","MESA_VK_TRACE_PER_SUBMIT":"1","VK_DRIVER_FILES":"/icd.json"}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let runtime = root.join("runtime");
+        let config = vulkan_config(Some(&job.join("rgp/app_submit7.rgp")), &runtime);
+        assert_eq!(config["argv"][2], "512");
+        assert_eq!(config["cwd"], "/work");
+        assert_eq!(config["env"]["VK_DRIVER_FILES"], "/icd.json");
+        assert_eq!(config["env"]["GGML_VK_DEBUG_MARKERS"], "1");
+        assert!(config["env"].get("MESA_VK_TRACE").is_none() && config["env"].get("MESA_VK_TRACE_PER_SUBMIT").is_none());
+        assert_eq!(config["sourceTree"], root.join("llama.cpp").display().to_string());
+        assert_eq!(config["replay"], json!(runtime.join("bin/vkreplay")));
+
+        // A capture opened from anywhere else starts with an empty command.
+        let bare = vulkan_config(Some(&root.join("elsewhere.rgp")), &runtime);
+        assert_eq!(bare["argv"], json!([]));
+        assert_eq!(bare["sourceTree"], "");
+        assert_eq!(bare["env"]["GGML_VK_DEBUG_MARKERS"], "1");
+        let _ = fs::remove_dir_all(&root);
     }
 }

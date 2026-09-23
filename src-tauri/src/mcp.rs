@@ -993,7 +993,7 @@ impl Server {
                     other => other,
                 };
                 self.control.follow(json!({"captureId":c.id,"view":view}));
-                run_process(
+                let run = run_process(
                     vec![
                         std::env::var("ROCPROF_MCP_NODE").unwrap_or("node".into()),
                         "--max-old-space-size=1024".into(),
@@ -1003,11 +1003,14 @@ impl Server {
                     &folder,
                     &flag,
                     120,
-                )?;
-                let data: Value = serde_json::from_slice(
-                    &fs::read(folder.join("stdout.log")).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
+                );
+                // The input is a copy of the open capture, up to 256 MiB per call; keep it
+                // only as long as the worker needs it. A failed run keeps its logs.
+                let _ = fs::remove_file(folder.join("input.json"));
+                run?;
+                let stdout = fs::read(folder.join("stdout.log")).map_err(|e| e.to_string());
+                let _ = fs::remove_dir_all(&folder);
+                let data: Value = serde_json::from_slice(&stdout?).map_err(|e| e.to_string())?;
                 if let Some(output) = a["output"].as_str() {
                     Control::check(&flag)?;
                     let path = Path::new(output);
@@ -1047,6 +1050,34 @@ impl Server {
                 if argv.is_empty() {
                     return Err("Application argv cannot be empty".into());
                 }
+                let env = profile_env(a)?;
+                let seconds = a["timeoutSeconds"].as_u64().unwrap_or(600);
+                if !(1..=3600).contains(&seconds) {
+                    return Err("timeoutSeconds must be between 1 and 3600".into());
+                }
+                let cwd = Path::new(text(a, "cwd")?);
+                if a["tracer"] == "radv" {
+                    if a.get("counters").is_some() || a.get("profiler").is_some() {
+                        return Err("counters and profiler apply to rocprofv3 only".into());
+                    }
+                    // Recorded so a shader-tuning session can rerun the same application.
+                    fs::write(
+                        folder.join("profile.json"),
+                        serde_json::to_vec_pretty(&json!({"tracer":"radv","argv":argv,"cwd":cwd,"env":a.get("env").cloned().unwrap_or(json!({}))}))
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let started = std::time::SystemTime::now();
+                    let mut vars = vec![
+                        ("MESA_VK_TRACE".to_owned(), "rgp".to_owned()),
+                        ("MESA_VK_TRACE_PER_SUBMIT".to_owned(), "1".to_owned()),
+                    ];
+                    vars.extend(env);
+                    let run = run_process_env(argv.clone(), cwd, &folder, &flag, seconds, &vars);
+                    let paths = collect_rgp(&argv[0], started, &folder)?;
+                    run?;
+                    return Ok(json!({"directory":folder,"files":paths,"next":"Use capture_open with a returned .rgp path; each file holds one queue submit"}));
+                }
                 let mut command = vec![
                     a["profiler"]
                         .as_str()
@@ -1075,7 +1106,7 @@ impl Server {
                 }
                 command.push("--".into());
                 command.extend(argv);
-                run_process_at(command, Path::new(text(a, "cwd")?), &folder, &flag, 600)?;
+                run_process_env(command, cwd, &folder, &flag, seconds, &env)?;
                 let mut paths = Vec::new();
                 find_outputs(&folder, &mut paths)?;
                 Ok(
@@ -1215,7 +1246,7 @@ fn tools() -> Vec<Value> {
  ("workspace","List open captures, tuning sessions, current view and MCP status.",json!({}),vec![]),
  ("capture_open","Import a trace, counters, ATT run, sampling data or portable capture from an explicit path.",json!({"path":str_,"samplingMethod":str_,"loadWaveStates":{"type":"boolean"}}),vec!["path"]),
  ("capture_analyze","Run the same analysis functions as the GUI: kernels, occupancy, activity, hardware, hotspots, source, markers, scalar, tensor. Scalar takes name/formula (C0 etc). Tensor takes definitions (NAME := expression) and raw named {shape:[XCC,SE,CU,Time],values:[...]}. Timeline renders dispatch or global residency HTML with the same paged exporter as the GUI. Diagnostics produces its diagnostic manifest. Optional output writes a new HTML, diagnostics JSON, or analysis JSON file. Returns paged rows otherwise. Requires Node.js.",json!({"captureId":str_,"analysis":{"enum":["kernels","occupancy","activity","hardware","hotspots","source","markers","scalar","tensor","timeline","diagnostics"]},"metric":{"enum":["latency","pcSamples","pcIssued","pcStalled"]},"se":num,"kernel":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"name":str_,"formula":str_,"definitions":str_,"raw":obj,"output":str_,"timeline":{"enum":["dispatch","global"]},"timePages":num,"lanesPerPage":num,"workspace":obj,"query":str_,"offset":num,"limit":num}),vec!["captureId","analysis"]),
- ("profile_run","Run rocprofv3 against an application argv, collecting a kernel trace by default or specified counters. Returns output files to import with capture_open. Cancellable, 10-minute limit. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_}}),vec!["argv","cwd"]),
+ ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects a kernel trace, or the given counters. tracer radv sets MESA_VK_TRACE=rgp with per-submit capture and returns the .rgp files the application's RADV Vulkan driver wrote, one per queue submit (experimental; see docs/radv-profiling.md). env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
  ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources. Limit <=1000. Counter rows include recorded samples.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":num}),vec!["captureId","dataset"]),
  ("workspace_select","Follow a capture, view, range, wave, instruction or dispatch in the GUI. Views: reference, trace, hardware, summary, sampling, occupancy, dispatch, hotspots, flame, markers, counters, evidence.",json!({"captureId":str_,"view":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"waveId":str_,"dispatchId":str_,"instruction":num,"timeline":str_,"se":num}),vec!["captureId"]),
@@ -1235,9 +1266,9 @@ fn tools() -> Vec<Value> {
  ("project_open","Open an existing GUI project and restore its captures/workspace.",json!({"path":str_}),vec!["path"]),
  ("project_save","Write a GUI project document to a new path. Omit project to save the open captures with default view settings, or supply a project object from project_open to retain full workspace settings.",json!({"path":str_,"project":obj}),vec!["path"]),
  ("reference_query","Search/page the embedded ISA and matrix-type documentation. architecture: manifest, cdna1..4, rdna1..4, rdna3_5.",json!({"architecture":str_,"query":str_,"offset":num,"limit":num}),vec![]),
- ("tuning_open","Select one traced dispatch for kernel tuning; opens the native editor when a GUI is attached.",json!({"captureId":str_,"dispatchId":str_}),vec!["captureId","dispatchId"]),
- ("tuning_status","Read kernel source, ISA, captured arguments, calibration, run metrics/deltas, output validation and job log.",json!({"id":str_}),vec!["id"]),
- ("tuning_action","Execute and await a tuning operation. request.op: search (config.sourceTree), select (index), capture (config.cwd/argv), calibrate, run (variant, code, iterations, validate, autoCounters, autoCalibrate, optional work/counters), save (code). Config merges with session config. Capture preserves launch arguments and inputs; save replaces the selected source definition with original-file conflict checks. Long calls can be cancelled.",json!({"id":str_,"request":{"type":"object","properties":{"op":{"enum":["search","select","capture","calibrate","run","save"]},"config":obj,"index":num,"variant":{"type":"boolean"},"code":str_,"iterations":num,"validate":{"type":"boolean"},"autoCounters":{"type":"boolean"},"autoCalibrate":{"type":"boolean"},"work":obj,"counters":{"type":"array","items":obj}},"required":["op"]}}),vec!["id","request"]),
+ ("tuning_open","Select one traced dispatch for tuning; opens the native editor when a GUI is attached. A dispatch from a RADV capture opens a Vulkan single-shader session (experimental), anything else a HIP kernel session.",json!({"captureId":str_,"dispatchId":str_}),vec!["captureId","dispatchId"]),
+ ("tuning_status","Read a session: mode (vulkan or HIP), source files, ISA, captured arguments or dispatch, calibration, run metrics/deltas, output validation and job log.",json!({"id":str_}),vec!["id"]),
+ ("tuning_action","Execute and await a tuning operation. request.op: search (config.sourceTree), select (index), capture (config.cwd/argv), calibrate, run (variant, code, iterations, validate, autoCounters, autoCalibrate, optional work/counters), save (code). Config merges with session config. Capture preserves launch arguments and inputs; save replaces the selected source definition with original-file conflict checks. Long calls can be cancelled. Vulkan sessions: capture (config.cwd/argv/env, occurrence, optional name/groups) first, then search (matches the captured SPIR-V against the ggml shader build under config.sourceTree), select (index), run (variant, edits {path: full text}, iterations, validate, trace), save (edits); no calibrate.",json!({"id":str_,"request":{"type":"object","properties":{"op":{"enum":["search","select","capture","calibrate","run","save"]},"config":obj,"index":num,"variant":{"type":"boolean"},"code":str_,"iterations":num,"validate":{"type":"boolean"},"autoCounters":{"type":"boolean"},"autoCalibrate":{"type":"boolean"},"work":obj,"counters":{"type":"array","items":obj}},"required":["op"]}}),vec!["id","request"]),
  ("tuning_close","Stop and close a tuning session; completed artifacts remain on disk.",json!({"id":str_}),vec!["id"]),
  ];
     entries.into_iter().map(|(name,description,properties,required)|json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).collect()
@@ -1285,11 +1316,41 @@ fn run_process_at(
     flag: &AtomicBool,
     seconds: u64,
 ) -> Result<(), String> {
+    run_process_env(argv, cwd, folder, flag, seconds, &[])
+}
+/// Variables the runner removes from the inherited environment, or sets itself.
+const RESERVED_ENV: [&str; 4] = ["LD_PRELOAD", "HSA_TOOLS_LIB", "HSA_TOOLS_REPORT_LOAD_FAILURE", "TMPDIR"];
+fn profile_env(a: &Value) -> Result<Vec<(String, String)>, String> {
+    let Some(env) = a.get("env") else { return Ok(vec![]) };
+    let env = env.as_object().ok_or("env must be an object of strings")?;
+    if env.len() > 64 {
+        return Err("env has more than 64 variables".into());
+    }
+    env.iter()
+        .map(|(k, v)| {
+            let name = k.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()));
+            if k.is_empty() || !name || RESERVED_ENV.contains(&k.as_str()) {
+                return Err(format!("env variable {k} is not allowed"));
+            }
+            let value = v.as_str().filter(|s| !s.contains('\0')).ok_or(format!("env {k} must be a string"))?;
+            Ok((k.clone(), value.to_owned()))
+        })
+        .collect()
+}
+fn run_process_env(
+    argv: Vec<String>,
+    cwd: &Path,
+    folder: &Path,
+    flag: &AtomicBool,
+    seconds: u64,
+    env: &[(String, String)],
+) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
         .current_dir(cwd)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .env("TMPDIR", folder)
         .stdin(Stdio::null())
         .stdout(fs::File::create(folder.join("stdout.log")).map_err(|e| e.to_string())?)
@@ -1336,6 +1397,62 @@ fn run_process_at(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+/// Mesa writes RGP captures to `/tmp/<process>_<timestamp>[_submit<N>].rgp`, a
+/// directory it does not let callers change. The files this run wrote are moved
+/// into the job folder, ordered by submit.
+fn collect_rgp(program: &str, since: std::time::SystemTime, folder: &Path) -> Result<Vec<PathBuf>, String> {
+    let name = Path::new(program).file_name().ok_or("Application path has no file name")?.to_string_lossy();
+    let prefix = format!("{name}_");
+    let since = since - Duration::from_secs(1);
+    let mut found = vec![];
+    // /tmp is shared: entries can vanish while it is listed, so only this run's
+    // candidates are examined and one that disappears is skipped.
+    for item in fs::read_dir("/tmp").map_err(|e| e.to_string())?.flatten() {
+        let file = item.file_name().to_string_lossy().into_owned();
+        if !file.starts_with(&prefix) || !file.ends_with(".rgp") {
+            continue;
+        }
+        let Ok(meta) = item.metadata() else { continue };
+        if meta.is_file() && meta.modified().is_ok_and(|m| m >= since) {
+            found.push((item.path(), meta.len()));
+        }
+    }
+    let needed: u64 = found.iter().map(|(_, len)| len).sum();
+    let available = free_bytes(folder)?;
+    if needed > available {
+        return Err(format!(
+            "{} RGP captures ({needed} bytes) remain in /tmp: {} has only {available} bytes free",
+            found.len(),
+            folder.display()
+        ));
+    }
+    let target = folder.join("rgp");
+    fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    let submit = |p: &Path| -> u64 {
+        let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+        stem.rsplit_once("_submit").and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+    };
+    found.sort_by_key(|(p, _)| submit(p));
+    let mut out = Vec::with_capacity(found.len());
+    for (path, _) in found {
+        let to = target.join(path.file_name().unwrap());
+        if fs::rename(&path, &to).is_err() {
+            fs::copy(&path, &to).map_err(|e| format!("Cannot move {}: {e}", path.display()))?;
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        out.push(to);
+    }
+    Ok(out)
+}
+fn free_bytes(path: &Path) -> Result<u64, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 fn find_outputs(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     for item in fs::read_dir(root).map_err(|e| e.to_string())? {
@@ -1501,6 +1618,46 @@ mod tests {
         assert!(v["nextOffset"].is_null());
         flag.store(true, Ordering::SeqCst);
         assert!(page(json!([1]), &json!({}), &flag).is_err());
+    }
+    #[test]
+    fn profile_env_accepts_plain_variables_and_refuses_reserved_ones() {
+        let ok = profile_env(&json!({"env":{"VK_DRIVER_FILES":"/x.json","RADV_THREAD_TRACE_ROCPROF_COMPAT":"true"}})).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert!(profile_env(&json!({})).unwrap().is_empty());
+        for bad in [
+            json!({"env":{"LD_PRELOAD":"/evil.so"}}),
+            json!({"env":{"TMPDIR":"/tmp"}}),
+            json!({"env":{"HSA_TOOLS_LIB":"x"}}),
+            json!({"env":{"lower":"x"}}),
+            json!({"env":{"1ABC":"x"}}),
+            json!({"env":{"A":1}}),
+            json!({"env":"A=1"}),
+        ] {
+            assert!(profile_env(&bad).is_err(), "{bad}");
+        }
+    }
+    #[test]
+    fn rgp_captures_are_collected_by_process_name_and_submit_order() {
+        let job = tempfile_dir();
+        let tag = format!("rpgtest{}", std::process::id());
+        let started = std::time::SystemTime::now();
+        for n in [10, 2, 1] {
+            fs::write(format!("/tmp/{tag}_2026.01.01_00.00.00_submit{n}.rgp"), b"x").unwrap();
+        }
+        fs::write(format!("/tmp/other{tag}_submit0.rgp"), b"x").unwrap();
+        let files = collect_rgp(&format!("/usr/bin/{tag}"), started, &job).unwrap();
+        let names: Vec<String> = files.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names[0].ends_with("submit1.rgp") && names[2].ends_with("submit10.rgp"), "{names:?}");
+        assert!(files.iter().all(|p| p.starts_with(job.join("rgp"))));
+        assert!(!Path::new(&format!("/tmp/{tag}_2026.01.01_00.00.00_submit1.rgp")).exists());
+        let _ = fs::remove_file(format!("/tmp/other{tag}_submit0.rgp"));
+        let _ = fs::remove_dir_all(&job);
+    }
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rpg-mcp-test-{}-{}", std::process::id(), random().unwrap()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
     #[test]
     fn following_another_capture_clears_stale_selections() {
