@@ -58,14 +58,14 @@ All-suite run, 2026-09-22, one tree state, no source change between suites, no e
 
 | Suite | Command | Result |
 |---|---|---|
-| Rust (core) | `cargo test -p profile-core --offline` | 260 passed, 0 failed, 12 ignored |
+| Rust (core) | `cargo test -p profile-core --offline` | 269 passed, 0 failed, 17 ignored |
 | Rust (host) | `cargo test -p rocprof-studio --offline` | 5 passed, 0 failed |
 | Frontend | `npm test` | 197 passed (55 files) |
-| Browser | `npm run test:ui` | 130 passed, 0 failed, 3 skipped |
+| Browser | `npm run test:ui` | 132 passed, 0 failed, 3 skipped |
 | Build | `npm run build` | passed |
 | Native check | `cargo check -p rocprof-studio --offline` | passed, 0 warnings |
 
-The fixture-test count is **12**, not the eight recorded above: ten are the env-gated archived/decoder/large-CSV tests in `crates/profile-core/tests/`, and two more are in-source boundary qualifications (`wave_stream.rs` two-million-row streaming, `import.rs` two-million-token allocation) that take no environment variable. The three browser skips are the env-gated SPM/large-catalog specs.
+The fixture-test count is **17**, not the eight recorded above. Ten are the env-gated archived/decoder/large-CSV tests in `crates/profile-core/tests/`. Five are the RADV RGP decoder tests in `tests/rgp.rs`, which use vendored fixtures and need only `ROCPROF_GUI_DECODER_PACKAGE`; all five pass with it set. Two more are in-source boundary qualifications (`wave_stream.rs` two-million-row streaming, `import.rs` two-million-token allocation) that take no environment variable. The three browser skips are the env-gated SPM/large-catalog specs.
 
 The browser figure is reproducible from the repository. `@playwright/test` is pinned to an exact `1.63.0` rather than floating at `^1.58.0`, and the matching Chromium build 1243 is installed by the `npx playwright install chromium` step already in README's Verify block; this run used no `PLAYWRIGHT_CHROMIUM_EXECUTABLE` override. Before the pin, the declared range could resolve to a Playwright whose browser build was absent from the cache, and the entire suite then failed in `browserType.launch` with an error that does not name a version mismatch.
 

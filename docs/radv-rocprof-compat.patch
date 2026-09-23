@@ -1,0 +1,42 @@
+diff --git a/src/amd/common/ac_sqtt.c b/src/amd/common/ac_sqtt.c
+--- a/src/amd/common/ac_sqtt.c
++++ b/src/amd/common/ac_sqtt.c
+@@ -426,7 +426,14 @@
+             /* Performance counters with SQTT are considered deprecated. */
+             token_exclude |= V_0367B8_TOKEN_EXCLUDE_PERF;
+ 
+-            sqtt_token_mask |= S_0367B8_TOKEN_EXCLUDE_GFX11(token_exclude) | S_0367B8_BOP_EVENTS_TOKEN_INCLUDE_GFX11(1);
++            if (sqtt->rocprof_compat) {
++               token_exclude |= V_0367B8_TOKEN_EXCLUDE_VMEMEXEC | V_0367B8_TOKEN_EXCLUDE_ALUEXEC |
++                                V_0367B8_TOKEN_EXCLUDE_EVENT | V_0367B8_TOKEN_EXCLUDE_UTILCTR |
++                                V_0367B8_TOKEN_EXCLUDE_WAVEALLOC;
++               sqtt_token_mask |= S_0367B8_TOKEN_EXCLUDE_GFX11(token_exclude);
++            } else {
++               sqtt_token_mask |= S_0367B8_TOKEN_EXCLUDE_GFX11(token_exclude) | S_0367B8_BOP_EVENTS_TOKEN_INCLUDE_GFX11(1);
++            }
+          }
+ 
+          ac_pm4_set_reg(pm4, R_0367B8_SQ_THREAD_TRACE_TOKEN_MASK, sqtt_token_mask);
+diff --git a/src/amd/common/ac_sqtt.h b/src/amd/common/ac_sqtt.h
+--- a/src/amd/common/ac_sqtt.h
++++ b/src/amd/common/ac_sqtt.h
+@@ -46,6 +46,8 @@
+    char *trigger_file;
+    bool instruction_timing_enabled;
+    uint32_t instruction_timing_se_mask;
++   /* Use AMD aqlprofile's GFX11 token mask so rocprof-trace-decoder can parse the stream. */
++   bool rocprof_compat;
+ 
+    /* Shader/memory clock frequencies in Mhz sampled at trace time. */
+    uint32_t trace_shader_core_clock;
+diff --git a/src/amd/vulkan/tools/radv_sqtt.c b/src/amd/vulkan/tools/radv_sqtt.c
+--- a/src/amd/vulkan/tools/radv_sqtt.c
++++ b/src/amd/vulkan/tools/radv_sqtt.c
+@@ -407,6 +407,7 @@
+       return false;
+ 
+    device->sqtt.instruction_timing_enabled = radv_is_instruction_timing_enabled();
++   device->sqtt.rocprof_compat = debug_get_bool_option("RADV_THREAD_TRACE_ROCPROF_COMPAT", false);
+    device->sqtt.instruction_timing_se_mask =
+       device->sqtt.instruction_timing_enabled ? radv_get_instruction_timing_se_mask() : 0;
+ 

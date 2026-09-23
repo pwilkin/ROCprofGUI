@@ -14,7 +14,7 @@ npm ci
 npm run tauri dev
 ```
 
-Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture. The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches rocprofv3 against an argv, and the kernel-tuning worker compiles candidates and can write a replacement kernel source back to disk. Both are described under [MCP server](#mcp-server) and [Kernel tuning](#kernel-tuning); neither runs unless invoked.
+Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture (experimental). The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches rocprofv3 against an argv, and the kernel-tuning worker compiles candidates and can write a replacement kernel source back to disk. Both are described under [MCP server](#mcp-server) and [Kernel tuning](#kernel-tuning); neither runs unless invoked.
 
 The browser preview uses an explicitly synthetic example capture:
 
@@ -80,7 +80,7 @@ All six `scripts/check-*-oracle.*` scripts compile the vendored upstream C++ in 
 
 ### Tests that do not run by default
 
-`cargo test -p profile-core` skips twelve `#[ignore]` tests, and a green run does not cover them. Ten need a retained fixture named by an environment variable:
+`cargo test -p profile-core` skips seventeen `#[ignore]` tests, and a green run does not cover them. Fifteen need a retained fixture or the trace decoder, named by an environment variable:
 
 ```bash
 ROCPROF_WAVE_ARCHIVE=<archive> cargo test -p profile-core --offline -- --ignored
@@ -98,8 +98,9 @@ ROCPROF_WAVE_ARCHIVE=<archive> cargo test -p profile-core --offline -- --ignored
 | `decoder::real_att_decode_and_lazy_wave_read` | `ROCPROF_GUI_TEST_ATT` (+ `ROCPROF_GUI_DECODER_PACKAGE`, `ROCPROF_GUI_DECODER_LIB`) |
 | `token_index_archives::archived_native_window_oracles` | `ROCPROF_INDEX_CAPTURES` + `ROCPROF_INDEX_NATIVE_REPORT` |
 | `token_index_archives::mixed_archived_indexes_match_streaming_through_eviction_and_reuse` | `ROCPROF_INDEX_CAPTURES` (a JSON array of at least three paths) |
+| `rgp::default_mask_capture_decodes_to_consistent_waves`, `rgp::occupancy_capture_accounts_for_every_wave_in_the_dispatch`, `rgp::rocprof_compatible_capture_attributes_every_instruction_exactly`, `rgp::llama_capture_occupancy_matches_marker_grids`, `rgp::driver_internal_dispatches_are_named_after_their_command` | `ROCPROF_GUI_DECODER_PACKAGE` (+ `ROCPROF_GUI_DECODER_LIB` if the V2 library is not on the default path); fixtures are vendored |
 
-Run with `--ignored` but without the environment variable and these ten panic rather than skip. The remaining two take no environment variable and are opt-in boundary qualifications that allocate at the two-million limit: `wave_stream::tests::streaming_limit_counts_discarded_rows_and_rejects_extra_before_parsing` and `import::wave_read_cancellation_tests::streamed_token_limit_accepts_boundary_and_rejects_extra_before_parsing`.
+Run with `--ignored` but without the environment variable and these fifteen fail rather than skip. The remaining two take no environment variable and are opt-in boundary qualifications that allocate at the two-million limit: `wave_stream::tests::streaming_limit_counts_discarded_rows_and_rejects_extra_before_parsing` and `import::wave_read_cancellation_tests::streamed_token_limit_accepts_boundary_and_rejects_extra_before_parsing`.
 
 Three Playwright specs in `tests/workspace.spec.ts` also skip silently unless their bundle is supplied: `ROCPROF_SPM_BUNDLE`, `ROCPROF_SPM_PARTITIONS_BUNDLE` and `ROCPROF_LARGE_CATALOG_BUNDLE`.
 
@@ -126,7 +127,7 @@ cargo run -q -p profile-core -- fixtures/transpose-ui --bundle > public/demo.jso
 cargo run -q -p profile-core -- fixtures/transpose-ui --hidden > public/demo-hidden.json
 ```
 
-See [architecture](docs/architecture.md) for how the layers divide and where the query budgets live, [open work](docs/open-work.md) for the itemised outstanding work and what has been closed, [validation](docs/validation.md) for the checks actually performed, [blocked inputs](docs/blocked-inputs.md) for what the remaining work is waiting on, and [profiling caveats](docs/profiling-caveats.md) for lessons recovered from the existing ROCm sessions.
+See [architecture](docs/architecture.md) for how the layers divide and where the query budgets live, [open work](docs/open-work.md) for the itemised outstanding work and what has been closed, [validation](docs/validation.md) for the checks actually performed, [blocked inputs](docs/blocked-inputs.md) for what the remaining work is waiting on, [profiling caveats](docs/profiling-caveats.md) for lessons recovered from the existing ROCm sessions, and [RADV profiling](docs/radv-profiling.md) for the experimental Vulkan path.
 
 ## Current limits
 
@@ -204,22 +205,65 @@ Timing deltas reported by a session are **not a claimed speedup**: no counterbal
 
 What this surface does **not** do: there is no replay-equivalence gate proving a replayed kernel behaves like the original, no experiment structure over an immutable baseline, and no staged qualification of a candidate before its timings are reported. Read a session's output as a measurement of what it actually ran, not as a validated speedup.
 
-## RADV Vulkan captures
+## RADV Vulkan captures (experimental)
 
-A `.rgp` capture written by Mesa's RADV driver can be opened directly. This is the only route to real hardware counters on GPUs that ROCm's AQLprofile filter excludes, such as gfx1151.
+A `.rgp` capture written by Mesa's RADV driver can be opened directly, giving hardware counters, thread traces and kernel names from Vulkan compute. On gfx1151, which ROCm's AQLprofile filter excludes from SPM, this is the only route to hardware counters. The path is experimental: it is qualified on gfx1151 only, and full per-instruction data needs a patched RADV. **[docs/radv-profiling.md](docs/radv-profiling.md) gives the required steps**: building the patched driver, capturing, and opening.
 
 ```bash
-MESA_VK_TRACE=rgp MESA_VK_TRACE_PER_SUBMIT=1 ./your-vulkan-app
-# writes /tmp/<app>_<timestamp>.rgp
+# Occupancy for every wave at any scale, plus counters (stock RADV)
+MESA_VK_TRACE=rgp MESA_VK_TRACE_PER_SUBMIT=1 RADV_THREAD_TRACE_INSTRUCTION_TIMING=false ./your-vulkan-app
+# Full per-instruction data as well (RADV built with docs/radv-rocprof-compat.patch)
+MESA_VK_TRACE=rgp MESA_VK_TRACE_PER_SUBMIT=1 RADV_THREAD_TRACE_ROCPROF_COMPAT=true ./your-vulkan-app
+# writes /tmp/<app>_<timestamp>_submit<N>.rgp
 ```
 
-`MESA_VK_TRACE_PER_SUBMIT` matters for compute: the frame-based trigger never fires without a swapchain. Because the filename has one-second granularity, a program issuing many submits per second overwrites its own captures — put the work you care about in one submit, or space submits out.
+`MESA_VK_TRACE_PER_SUBMIT` matters for compute: the frame-based trigger never fires without a swapchain. Mesa 26.2 numbers each submit's file; Mesa 26.0 named them by the second only, so a program issuing many submits per second overwrote its own captures.
 
-What is imported: the `DERIVED_SPM` counter section, as device-wide counter series with their capture-reported names, units and groups, plus ASIC identity and topology. RADV writes only the derived SPM form on GFX10 and later; there is no raw `SPM_DB` section to read. Counters are sampled on a fixed 4,096-shader-clock interval that no environment variable changes, and they are **not** attributed to a dispatch or a wave.
+### Capture modes
 
-What is **not** imported: thread traces. A capture's SQTT sections are detected and reported in a warning, but RADV thread-trace timestamps are not usable without normalisation — measured captures span implausible clock ranges and contain negative state durations, while the SPM timestamps in the same file are sound. See [blocked inputs](docs/blocked-inputs.md) for the measurements.
+Thread traces are decoded with ROCm's `rocprof-trace-decoder`, the same decoder raw ATT uses, so it must be installed. What a trace holds depends on RADV's token mask:
 
-Counters require `RADV_THREAD_TRACE_CACHE_COUNTERS` (default on) — despite the name it is the SPM master switch, and a capture taken with it off has no counter section to import.
+| Capture | Result |
+|---|---|
+| `RADV_THREAD_TRACE_ROCPROF_COMPAT=true` (patched RADV) | **Full.** Occupancy for every wave of every dispatch, and exact per-instruction hits, latencies and stalls for the traced CU, at any scale. |
+| `RADV_THREAD_TRACE_INSTRUCTION_TIMING=false` | **Occupancy.** Exact wave lifetimes for every wave on every CU at any scale, with no per-instruction data. |
+| RADV's default, small dispatch | Wave lifetimes, states and timing, but per-instruction data is effectively absent (see below). |
+| RADV's default, anything busier | Thread trace rejected with the reason; counters still import. |
+
+RADV's default token mask includes ALU- and VMEM-execution tokens that `rocprof-trace-decoder` has no encoding for, because AMD's own profiler never enables them. Left in, they desynchronise the decoder. The importer overwrites them with NOP nibbles, which leaves stream length, alignment and timing unchanged. But RADV reports instruction execution through exactly those tokens, so on a 64-iteration loop kernel only 8 of the 1,052 instructions the traced waves executed are attributed. Busier default-mask streams also contain token types that are not publicly documented, and are rejected.
+
+[`docs/radv-rocprof-compat.patch`](docs/radv-rocprof-compat.patch) adds an opt-in `RADV_THREAD_TRACE_ROCPROF_COMPAT` option to Mesa 26.2.0. On GFX11 and GFX11.5 it programs the token mask AMD's aqlprofile uses, so the stream holds only tokens the decoder knows. Default behaviour is unchanged, and GFX10 and GFX12 are untouched. On gfx1151 every instruction is then attributed exactly: each row of a 64-iteration loop body is hit 64 times per wave, and a 4,096-workgroup × 4,096-iteration dispatch decodes with all 4,096 waves in occupancy and 4,096 hits per loop row on every traced wave. [docs/radv-profiling.md](docs/radv-profiling.md) gives the build and capture steps.
+
+The importer infers the mode from the stream, since the RGP file does not record the mask: a stream with execution tokens used RADV's default mask, one without them and with attributed instructions is full, and anything else is occupancy only.
+
+Every thread trace must pass four checks before its waves are shown, and failing any one rejects the whole trace rather than showing part of it:
+
+1. No token header remains that neither the decoder nor this importer can size.
+2. The decoder reports no lost trace data.
+3. The decoded shader clock stays consistent with the realtime clock the trace also carries. Realtime never goes backwards; the shader clock never runs far above its median rate; and across a gap, where realtime tokens pause while the GPU idles, the shader clock cannot nearly stop, because RADV inhibits clock gating while tracing. A misparsed token breaks one of these.
+4. Every decoded wave and occupancy timestamp lies inside its shader engine's own trace window. This catches a desync absorbed into one oversized wave state, which per-wave invariants miss.
+
+Code objects come from the capture's code-object database, and are placed at the load addresses its loader events record, matched by pipeline hash. When a trace is imported, SPM samples are placed on the trace's clock through the same realtime pairs.
+
+### Kernel names and dispatches
+
+RADV leaves the RGP pipeline-name field empty. It does record its own instrumentation markers inside the thread trace: one event per hardware dispatch, pipeline binds and the application's debug labels. The importer reads them, so each kernel is named:
+
+- after the innermost debug label open at its dispatches, minus a trailing workgroup count such as ggml's `name (x,y,z)`. For llama.cpp, run with `GGML_VK_DEBUG_MARKERS=1`;
+- for RADV's own copy and fill shaders, after the command they implement, such as `vkCmdCopyBuffer (RADV internal)`;
+- otherwise by the pipeline's API hash, `pipeline 834527b9cb9b4ffb`, which RGP also shows and which is stable across runs.
+
+The decoder recovers each dispatch from its register writes. Each is then matched to its marker, and a `vkCmdDispatch` gets its grid from the marker's workgroup counts. Matching needs equal counts, the same queue, and every application dispatch to have run the pipeline its marker says was bound. Otherwise nothing is attached, and a warning says so.
+
+### Counters
+
+The `DERIVED_SPM` section is imported with the capture's own names, units, groups and descriptions. RADV writes only this derived form on GFX10 and later. Samples are 4,096 clocks apart, timestamped with the GPU's 100 MHz timestamp, so a counters-only capture uses a nanosecond axis. `RADV_THREAD_TRACE_CACHE_COUNTERS` (default on) is the SPM master switch despite its name. Counters are not attributed to a dispatch or a wave. The byte and hit-rate counters measure memory-side traffic, which write-back caching and the profiler's own trace writes both affect: they are not the workload's requested traffic.
+
+Mesa 26.2 also takes raw hardware events through `RADV_SPM_COUNTERS_CONFIG=<file>`, with lines of the form `NAME=BLOCK,EVENT,INSTANCE|ALL,sum|max|avg` under `[Group]` headers; `fixtures/radv-rgp/compute-raw-counters.conf` is an example. These import as hardware counters with a warning, because on gfx1151 they need care:
+
+- RADV sums each line over the block instances it expands to, which need not include every CU. TA buffer-wavefront counts for a dispatch of known size read 61–63% of the true total. Treat them as activity within those instances, not GPU totals.
+- SQ events read zero in every sample, and the importer flags any raw counter that does. SQ event IDs above 35 are rejected, which excludes the instruction-count events, and GRBM has no free SPM slots.
+- Any line RADV rejects makes device creation fail, so the application does not start.
 
 ## Diagnostic reports
 

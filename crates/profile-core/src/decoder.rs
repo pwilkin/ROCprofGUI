@@ -49,12 +49,62 @@ pub fn decode(
 ) -> Result<Capture, String> {
     decode_with_wave_states(path, config, cancelled, true)
 }
+pub struct DecodedRun {
+    pub root: std::path::PathBuf,
+    pub log: String,
+    pub python_package: Option<std::path::PathBuf>,
+}
+
+/// Parses `DECODER-WARNING:` lines the worker prints for decoder INFO records.
+pub fn decoder_warnings(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| line.strip_prefix("DECODER-WARNING: "))
+        .map(str::to_owned)
+        .collect()
+}
+
 pub fn decode_with_wave_states(
     path: &Path,
     config: &DecoderConfig,
     cancelled: &AtomicBool,
     load_wave_states: bool,
 ) -> Result<Capture, String> {
+    let workspace = Arc::new(tempfile::tempdir().map_err(|e| e.to_string())?);
+    let run = run_decoder_in(&workspace, path, config, cancelled)?;
+    let mut capture = load_capture_with_wave_states(&run.root, load_wave_states)?;
+    capture.format = "raw ATT · decoder V2".into();
+    capture.name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into();
+    capture
+        .metadata
+        .insert("rawInput".into(), path.display().to_string());
+    capture.metadata.insert(
+        "decoderLog".into(),
+        run.log.chars().take(12000).collect(),
+    );
+    for warning in decoder_warnings(&run.log) {
+        capture.warnings.push(format!("Trace decoder: {warning}"));
+    }
+    if let Some(package) = run.python_package {
+        capture
+            .metadata
+            .insert("decoderPythonPackage".into(), package.display().to_string());
+    }
+    capture.workspace = Some(workspace);
+    Ok(capture)
+}
+
+/// Runs the decoder worker inside `workspace`, which the caller keeps alive for as
+/// long as the decoded files are read (waves load lazily from it).
+pub fn run_decoder_in(
+    workspace: &tempfile::TempDir,
+    path: &Path,
+    config: &DecoderConfig,
+    cancelled: &AtomicBool,
+) -> Result<DecodedRun, String> {
     let python_package = config
         .python_package
         .as_ref()
@@ -63,7 +113,6 @@ pub fn decode_with_wave_states(
                 .map_err(|e| format!("Cannot open decoder Python package {}: {e}", path.display()))
         })
         .transpose()?;
-    let workspace = Arc::new(tempfile::tempdir().map_err(|e| e.to_string())?);
     let script = workspace.path().join("decode.py");
     fs::write(&script, include_str!("decode.py")).map_err(|e| e.to_string())?;
     let manifest_input = workspace.path().join("input.rocprof-att");
@@ -151,25 +200,9 @@ pub fn decode_with_wave_states(
             roots.len()
         ));
     }
-    let mut capture = load_capture_with_wave_states(&roots[0], load_wave_states)?;
-    capture.format = "raw ATT · decoder V2".into();
-    capture.name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into();
-    capture
-        .metadata
-        .insert("rawInput".into(), path.display().to_string());
-    capture.metadata.insert(
-        "decoderLog".into(),
-        diagnostic.chars().take(12000).collect(),
-    );
-    if let Some(package) = python_package {
-        capture
-            .metadata
-            .insert("decoderPythonPackage".into(), package.display().to_string());
-    }
-    capture.workspace = Some(workspace);
-    Ok(capture)
+    Ok(DecodedRun {
+        root: roots.remove(0),
+        log: diagnostic,
+        python_package,
+    })
 }

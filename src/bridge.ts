@@ -99,7 +99,7 @@ export async function openCapture(
       : {
           filters: [
             {
-              name: "ROCm captures",
+              name: "ROCm and RADV captures",
               extensions: [
                 "json",
                 "csv",
@@ -110,6 +110,7 @@ export async function openCapture(
                 "rpd",
                 "db",
                 "sqlite",
+                "rgp",
               ],
             },
           ],

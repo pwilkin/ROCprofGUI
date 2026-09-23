@@ -626,15 +626,22 @@ fn occupancy(v: &Value, c: &mut Capture) -> Result<(), String> {
                     grid: "Not recorded".into(),
                     workgroup: format!(
                         "{} × {} × {}",
-                        text(&e["thread_dim_x"]),
-                        text(&e["thread_dim_y"]),
-                        text(&e["thread_dim_z"])
+                        thread_dim(&e["thread_dim_x"]),
+                        thread_dim(&e["thread_dim_y"]),
+                        thread_dim(&e["thread_dim_z"])
                     ),
                 });
             }
         }
     }
     Ok(())
+}
+
+/// The decoder reports the raw COMPUTE_NUM_THREAD_* register. Workgroup dimensions
+/// never exceed 1,024, so the low 13 bits hold NUM_THREAD_FULL on every generation;
+/// above them sit GFX12's interleave bits and the partial-group count RADV programs.
+fn thread_dim(v: &serde_json::Value) -> String {
+    v.as_u64().map_or_else(|| text(v), |raw| (raw & 0x1fff).to_string())
 }
 
 pub fn load_wave(c: &Capture, id: &str) -> Result<Wave, String> {
