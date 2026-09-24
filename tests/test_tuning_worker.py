@@ -26,6 +26,8 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(w.kernel_base('void mul_mat_q<(ggml_type)8, 32, false>(char const*)'), 'mul_mat_q')
         self.assertEqual(w.kernel_base('void k_bin_bcast<&(op_add(float, float)), float>(float*)'), 'k_bin_bcast')
         self.assertEqual(w.kernel_base('space::kernel<int>(float*)'), 'kernel')
+        self.assertEqual(w.kernel_base('void a::(anonymous namespace)::Gemm<64, true>(void const*)'), 'Gemm')
+        self.assertEqual(w.kernel_base('a::(anonymous namespace)::Row(float const*)'), 'Row')
 
     def test_mangled_att_kernel_matches_kerncap_name(self):
         self.assertEqual(w.canonical_kernel('_Z5saxpyPKfS0_Pfi'), 'saxpy(float const*, float const*, float*, int)')
@@ -106,6 +108,67 @@ class TuningTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             w.main(self.root, {'op': 'save', 'code': '__global__ void k(float* p) {}\nvoid other() {}'})
         self.assertEqual(path.read_text(), original)
+
+    def ready_to_capture(self, **config):
+        self.session()
+        state = json.loads((self.root / 'session.json').read_text())
+        state['config'] = {'argv': ['app'], 'cwd': str(self.root), 'captureLibrary': str(self.root / 'libkerncap.so'), 'occurrence': 0, **config}
+        (self.root / 'session.json').write_text(json.dumps(state))
+
+    def test_failed_capture_leaves_no_snapshot_behind(self):
+        self.ready_to_capture()
+        def partial_snapshot(argv, cwd, log, env=None):
+            memory = Path(env['KERNCAP_OUTPUT']) / 'memory'; memory.mkdir()
+            (memory / 'region_1000.bin').write_bytes(b'x' * 4096)
+            raise RuntimeError('Command exited 1')
+        with patch.object(w, 'command', side_effect=partial_snapshot):
+            with self.assertRaises(RuntimeError):
+                w.main(self.root, {'op': 'capture'})
+        self.assertEqual(list(self.root.glob('capture-*')), [])
+        self.assertNotIn('captured', json.loads((self.root / 'session.json').read_text()))
+
+    def test_capture_is_refused_without_room_for_a_snapshot(self):
+        self.ready_to_capture()
+        with patch.object(w.shutil, 'disk_usage', return_value=SimpleNamespace(total=0, used=0, free=1 << 30)), \
+             patch.object(w, 'command') as command:
+            with self.assertRaisesRegex(ValueError, 'at least 8 GiB free'):
+                w.main(self.root, {'op': 'capture'})
+        command.assert_not_called()
+        self.assertEqual(list(self.root.glob('capture-*')), [])
+
+    def test_capture_uses_the_recorded_environment_and_the_usual_model_cache(self):
+        self.ready_to_capture(env={'HIP_VISIBLE_DEVICES': '1'})
+        seen = {}
+        def record(argv, cwd, log, env=None):
+            seen.update(env); raise RuntimeError('stop')
+        with patch.dict(os.environ, {'LLAMA_CACHE': '/models'}), patch.object(w, 'command', side_effect=record):
+            with self.assertRaises(RuntimeError):
+                w.main(self.root, {'op': 'capture'})
+        # No second copy of the model under the session directory.
+        self.assertEqual(seen['LLAMA_CACHE'], '/models')
+        self.assertEqual(seen['HIP_VISIBLE_DEVICES'], '1')
+        self.assertTrue(seen['LD_PRELOAD'].endswith('libkerncap.so'))
+        for reserved in ('LD_PRELOAD', 'KERNCAP_OUTPUT', 'lower'):
+            self.ready_to_capture(env={reserved: 'x'})
+            with self.assertRaisesRegex(ValueError, 'not allowed'):
+                w.main(self.root, {'op': 'capture'})
+
+    def test_validation_dumps_are_removed_whether_or_not_the_replay_succeeds(self):
+        capture = self.root / 'capture'; (capture / 'memory').mkdir(parents=True)
+        (capture / 'memory' / 'region_1000.bin').write_bytes(b'a' * 64)
+        (capture / 'memory_regions.json').write_text(json.dumps({'regions': [{'base': 0x1000, 'size': 64}]}))
+        def dump(size):
+            def run(argv, cwd, log, env=None):
+                out = Path(argv[1]) / 'output'; out.mkdir(); (out / 'region_1000.bin').write_bytes(b'b' * size)
+            return run
+        with patch.object(w, 'command', side_effect=dump(5)):
+            with self.assertRaisesRegex(ValueError, 'complete output region'):
+                w.replay_output_hashes(capture, capture / 'kernel.hsaco', {'replay': 'r'}, self.root / 'failed', self.root / 'job.log')
+        with patch.object(w, 'command', side_effect=dump(64)):
+            hashes = w.replay_output_hashes(capture, capture / 'kernel.hsaco', {'replay': 'r'}, self.root / 'passed', self.root / 'job.log')
+        self.assertEqual(hashes, {'region_1000.bin': w.digest(b'b' * 64)})
+        self.assertFalse((self.root / 'failed').exists() or (self.root / 'passed').exists())
+        self.assertEqual((capture / 'memory' / 'region_1000.bin').read_bytes(), b'a' * 64)
 
     def test_stream_hash(self):
         p = self.root / 'data'; p.write_bytes(b'test' * 1024)

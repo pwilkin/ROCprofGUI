@@ -60,7 +60,7 @@ All-suite run, 2026-09-23, one tree state, no source change between suites, no e
 |---|---|---|
 | Rust (core) | `cargo test -p profile-core --offline` | 269 passed, 0 failed, 17 ignored |
 | Rust (host) | `cargo test -p rocprof-studio --offline` | 8 passed, 0 failed |
-| Python workers | `python3 -m unittest tests/test_tuning_worker.py tests/test_shader_worker.py` | 30 passed |
+| Python workers | `python3 -m unittest tests/test_tuning_worker.py tests/test_shader_worker.py` | 36 passed |
 | Frontend | `npm test` | 198 passed (55 files) |
 | Browser | `npm run test:ui` | 133 passed, 0 failed, 3 skipped |
 | Build | `npm run build` | passed |

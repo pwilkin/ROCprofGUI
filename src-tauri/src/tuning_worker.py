@@ -17,6 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tuning_calibration as calibration
 
 MAX_SOURCE = 8 * 1024 * 1024
+# A capture snapshots every allocation the kernel's arguments point into; for
+# llama.cpp that includes the whole model's weight pool.
+MIN_FREE_FOR_CAPTURE = 8 << 30
+VALIDATION_MARGIN = 2 << 30
+RESERVED_ENV = {'LD_PRELOAD', 'HSA_TOOLS_LIB', 'HSA_TOOLS_REPORT_LOAD_FAILURE', 'TMPDIR'}
 EXTENSIONS = {'.hip', '.cu', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.cuh'}
 
 
@@ -27,6 +32,27 @@ def digest(data):
 def file_digest(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def tree_bytes(path):
+    """Bytes held by the files under path, counting hard-linked files once."""
+    seen, total = set(), 0
+    for directory, _, files in os.walk(path):
+        for name in files:
+            st = os.lstat(os.path.join(directory, name))
+            if (st.st_dev, st.st_ino) not in seen:
+                seen.add((st.st_dev, st.st_ino)); total += st.st_size
+    return total
+
+
+def application_env(cfg):
+    """Extra environment for the application, as recorded by profile_run."""
+    env = {}
+    for key, value in (cfg.get('env') or {}).items():
+        if not re.fullmatch(r'[A-Z_][A-Z0-9_]*', key) or key in RESERVED_ENV or key.startswith('KERNCAP_'):
+            raise ValueError('Environment variable not allowed: ' + key)
+        env[key] = str(value)
+    return env
 
 
 def atomic(path, data):
@@ -64,7 +90,7 @@ def canonical_kernel(name):
 
 
 def kernel_base(name):
-    name = canonical_kernel(name)
+    name = canonical_kernel(name).replace('(anonymous namespace)', '')
     depth, head = 0, []
     for char in name:
         if char == '(' and depth == 0: break
@@ -318,24 +344,29 @@ def finish_capture(state, capture, cfg):
 
 
 def replay_output_hashes(capture, hsaco, cfg, folder, log):
+    """Hashes every region after one replay. The replay dumps all of them, as large
+    as the capture itself, so the folder is removed whether or not this succeeds."""
     folder.mkdir()
-    for source in capture.rglob('*'):
-        relative = source.relative_to(capture)
-        if relative.parts[0] == 'output': continue
-        target = folder / relative
-        if source.is_dir(): target.mkdir(exist_ok=True)
-        elif source.is_file(): os.link(source, target)
-    command([cfg['replay'], str(folder), '--hsaco', str(hsaco), '--iterations', '1', '--hip-launch', '--dump-output'], str(folder), log)
-    regions = json.loads((capture / 'memory_regions.json').read_text())['regions']
-    hashes = {}
-    for region in regions:
-        name = f"region_{region['base']:x}.bin"
-        path = folder / 'output' / name
-        if not path.is_file() or path.stat().st_size != region['size']:
-            raise ValueError('Replay did not dump a complete output region: ' + name)
-        hashes[name] = file_digest(path)
-        path.unlink()
-    return hashes
+    try:
+        for source in capture.rglob('*'):
+            relative = source.relative_to(capture)
+            if relative.parts[0] == 'output': continue
+            target = folder / relative
+            if source.is_dir(): target.mkdir(exist_ok=True)
+            elif source.is_file(): os.link(source, target)
+        command([cfg['replay'], str(folder), '--hsaco', str(hsaco), '--iterations', '1', '--hip-launch', '--dump-output'], str(folder), log)
+        regions = json.loads((capture / 'memory_regions.json').read_text())['regions']
+        hashes = {}
+        for region in regions:
+            name = f"region_{region['base']:x}.bin"
+            path = folder / 'output' / name
+            if not path.is_file() or path.stat().st_size != region['size']:
+                raise ValueError('Replay did not dump a complete output region: ' + name)
+            hashes[name] = file_digest(path)
+            path.unlink()
+        return hashes
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def main(root, request):
@@ -370,13 +401,26 @@ def main(root, request):
         if not state.get('source'): raise ValueError('Select the kernel source first')
         state['config'] = cfg
         if not cfg.get('argv'): raise ValueError('Provide the original application command as an argument array')
-        capture = root / ('capture-' + str(time.time_ns())); capture.mkdir()
+        free = shutil.disk_usage(root).free
+        if free < MIN_FREE_FOR_CAPTURE:
+            raise ValueError(f'Capture needs at least {MIN_FREE_FOR_CAPTURE >> 30} GiB free in {root} ({free >> 30} GiB free): it snapshots every allocation the kernel reads, which for llama.cpp includes the model')
         env = dict(os.environ)
-        env['LLAMA_CACHE'] = cfg.get('modelCache') or str(root.parents[1] / 'llama-cache')
+        env.update(application_env(cfg))
+        if cfg.get('modelCache'): env['LLAMA_CACHE'] = cfg['modelCache']
         env.pop('HSA_TOOLS_LIB', None); env.pop('HSA_TOOLS_REPORT_LOAD_FAILURE', None)
+        capture = root / ('capture-' + str(time.time_ns())); capture.mkdir()
         env.update(LD_PRELOAD=str(Path(cfg['captureLibrary']).resolve()), KERNCAP_KERNEL=canonical_kernel(state['kernel']), KERNCAP_OUTPUT=str(capture), KERNCAP_CAPTURE_CHILD='1', KERNCAP_DISPATCH=str(int(cfg.get('occurrence', 0))))
-        command(cfg['argv'], cfg['cwd'], log, env)
-        finish_capture(state, capture, cfg)
+        try:
+            command(cfg['argv'], cfg['cwd'], log, env)
+            finish_capture(state, capture, cfg)
+        except BaseException:
+            # A failed attempt must not leave its snapshot behind: the session stays
+            # uncaptured, so every retry would add another one.
+            shutil.rmtree(capture, ignore_errors=True)
+            for key in ('captured', 'dispatch', 'snapshotHashes', 'allocations'):
+                state.pop(key, None)
+            raise
+        state['captureBytes'] = tree_bytes(capture)
         original_text = (root / 'original-source').read_text()
         state['capturedSource'] = original_text[state['source']['start']:state['source']['end']]
     elif op == 'run':
@@ -487,7 +531,11 @@ def main(root, request):
                 metrics[label] = metric(None, mapping.get('unit', ''), str(error))
                 profiles.append({'counter': counter, 'directory': str(folder), 'error': str(error)})
         validation = {'status': 'not checked'}
-        if request.get('validate', True):
+        dump_bytes = sum(r['size'] for r in json.loads((capture / 'memory_regions.json').read_text())['regions'])
+        free = shutil.disk_usage(root).free
+        if request.get('validate', True) and free < dump_bytes + VALIDATION_MARGIN:
+            validation = {'status': 'not checked', 'reason': f'Output validation dumps every captured region ({dump_bytes / 2**30:.1f} GiB) and needs {(dump_bytes + VALIDATION_MARGIN) / 2**30:.1f} GiB free; {free / 2**30:.1f} GiB is free'}
+        elif request.get('validate', True):
             phase('Comparing outputs with captured baseline')
             reference = state.get('referenceOutputHashes')
             if reference is None:

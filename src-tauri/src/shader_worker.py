@@ -479,10 +479,16 @@ def main(root, request):
         if groups:
             env['ROCPROF_VKCAP_GROUPS'] = ','.join(str(int(g)) for g in groups)
         phase('Running the application to the selected dispatch')
-        command(cfg['argv'], cfg.get('cwd') or str(root), log, env)
-        info = read_capture(capture)
-        if groups and info['groups'] != [int(g) for g in groups]:
-            raise ValueError('Captured workgroup count does not match the selected trace dispatch')
+        try:
+            command(cfg['argv'], cfg.get('cwd') or str(root), log, env)
+            info = read_capture(capture)
+            if groups and info['groups'] != [int(g) for g in groups]:
+                raise ValueError('Captured workgroup count does not match the selected trace dispatch')
+        except BaseException:
+            # A capture holds every bound buffer (hundreds of MB for ggml); a failed
+            # attempt must not stay behind, since each retry would add another.
+            shutil.rmtree(capture, ignore_errors=True)
+            raise
         state['captured'] = str(capture)
         state['dispatch'] = info
         state['snapshotHashes'] = {p.name: file_digest(p) for p in capture.iterdir() if p.is_file()}

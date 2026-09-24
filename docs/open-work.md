@@ -159,6 +159,32 @@ RADV's instruction counters report VALU equal to SALU and VMEM equal to SMEM, so
 
 Four worker tests, and assertions in the browser test, cover the conditions, the counter metrics, delta pairing and the sustained check.
 
+**Eleventh pass — tuning sessions filling the disk, 2026-09-24.** Kernel-tuning sessions had grown to hundreds of GB, one of them about 100 GB. Reproduced on gfx1151 with llama-bench (Qwen3.5-9B IQ4_NL) and `mul_mat_q<IQ4_NL>`:
+
+**Causes:**
+- **Capture size.** A capture snapshots every allocation the kernel's arguments point into: 14 regions, 5.1 GiB, 4.5 GiB of it the model's weight pool. Each run's output validation briefly dumped as much again.
+- **Failed captures.** A failed capture (grid mismatch, application exit, timeout) left its snapshot behind, and the session stayed uncaptured, so every retry added 5 GiB. About 20 retries make 100 GB.
+- **Failed validation.** A failed or interrupted validation left its dump too.
+- **Retention.** Closed sessions kept everything, and sessions cannot be reopened.
+- **Defaults.** The default HIP command was a hardcoded `llama-bench -hf …Q8_0` with `LLAMA_CACHE` redirected into `~/.rocprofgui`. That meant a 9.5 GB model download, for a command that would not contain the traced kernel anyway.
+
+**Changes:**
+- **Failure cleanup.** A failed capture deletes its snapshot in both workers. Validation dumps are deleted in a `finally`.
+- **Preflight.** Capture needs 8 GiB free. Validation is skipped, with the reason shown, when it cannot dump every region.
+- **Retention.** `prune` deletes captured inputs and validation dumps on close, window close and shutdown. A startup `sweep` prunes sessions whose owning rocprof-studio process has exited, identified by the pid in the session name, and never those of another running instance.
+- **Defaults.** `profile_run` records `profile.json` for every tracer, so a HIP session defaults to the profiled command, environment and working directory, with the application's repository as the source tree. Otherwise the command starts empty. `LLAMA_CACHE` is redirected only when `config.modelCache` asks for it.
+
+**Checked end to end** on a dev server beside the running one:
+- the wrong-occurrence capture left 0.4 MiB;
+- the good capture reported 5.1 GiB;
+- a run left 34 KiB, with no dumps;
+- after `kill -9` and a restart, the sweep freed 5.1 GiB of the orphaned session and left the live server's sessions alone;
+- `tuning_close` took a captured session from 5.1 GiB to 0.5 MiB.
+
+Tests: three Rust tests (profiled defaults, pruning, sweep against a live and a dead owner) and six Python tests (failed capture in both workers, low disk, environment and model cache, validation-dump cleanup).
+
+Not changed: a successful capture still holds the whole weight pool while its session is open. Snapshotting only the byte ranges a kernel touches needs support in kerncap.
+
 Found along the way:
 - **The first capture read 1 GB back from uncached write-combined memory and took 166 s.** Host-cached staging memory brought it to 2.5 s.
 - **`profile_run`'s RADV mode failed if another process removed a `/tmp` entry mid-scan.** It now examines only its own files.

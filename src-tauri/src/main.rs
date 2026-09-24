@@ -1538,6 +1538,8 @@ fn main() {
         .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) }) {
         eprintln!("Opened the GUI in the running rocprof-studio service");
         return;
+    } else {
+        tuning::sweep_in_background();
     }
     let shutdown_control=control.clone();
     let shutdown_tuning=tuning.clone();

@@ -182,7 +182,15 @@ The desktop app starts a Model Context Protocol server **by default** on every l
 
 It binds loopback `127.0.0.1:8765` only and never a routable interface. Requests without a matching `Authorization: Bearer <token>` header are rejected with 401. The token is 32 bytes read from `/dev/urandom`, written once with `create_new` and mode `0600`, and reused on later launches; a token shorter than 32 characters or outside `[A-Za-z0-9_-]` is refused. It exposes 31 tools over the same analysis core as the GUI, with caps of 32 connections and 16 sessions. One tool runs at a time; a concurrent call is rejected with `-32001` rather than queued. There is no event replay or resumption, and cancelling a tool does not roll back writes it already made.
 
-Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and kernel-tuning sessions under `kernel-tuning/sessions/`. An analysis job deletes its folder when it succeeds and keeps only its logs when it fails; `profile_run` and `profile_start` output stays until you delete it, since it is the capture itself. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
+Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and tuning sessions under `kernel-tuning/sessions/` and `shader-tuning/sessions/`. An analysis job deletes its folder when it succeeds and keeps only its logs when it fails; `profile_run` and `profile_start` output stays until you delete it, since it is the capture itself.
+
+A tuning session's captured inputs are large. A HIP capture snapshots every allocation the kernel's arguments point into, which for llama.cpp includes the whole model's weight pool (5 GB for a 9B IQ4_NL model), and each run's output validation briefly dumps as much again. Disk use is bounded:
+
+- **Capture** refuses to start with less than 8 GiB free. A failed attempt deletes its partial snapshot, so retries do not pile up.
+- **Validation** is skipped, with the reason shown, when there isn't room to dump every region. Its dumps are deleted whether or not it succeeds.
+- **Closing** a session deletes its captured inputs and validation dumps, keeping results, logs and source backups. Sessions cannot be reopened, so nothing still usable is lost.
+- **At startup** the app does the same for sessions left by rocprof-studio processes that have exited, never touching another running instance's. Each pruned session records what it freed in `pruned.json`.
+- **Model downloads** stay in the application's normal cache: a capture no longer redirects `LLAMA_CACHE` into `~/.rocprofgui` unless `config.modelCache` asks for it. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
 
 ```bash
 rocprof-studio --no-mcp                      # do not start the server
@@ -203,9 +211,9 @@ Profiling and tuning tools can launch programs and write files. `profile_run` ex
 
 Known rough edges, none of them hardware-dependent:
 
-- The default session config is **hardcoded to a developer machine path** (`/devel/tools/llama.cpp` with a `llama-bench` argv) and must be edited for any other workload.
-- Captured input snapshots can reach several GiB per session.
-- A persisted session cannot be reopened from the GUI once its window is closed.
+- A session opened from an MCP `profile_run` trace reruns that run's command, environment and working directory, with the repository holding the application as the source tree. A trace opened any other way starts with an empty command to fill in.
+- Captured input snapshots can reach several GiB per session; the data-directory notes above describe how that is bounded and cleaned up.
+- A session cannot be reopened once its window or MCP session is closed, which is why closing deletes its captured inputs.
 
 Timing deltas reported by a session are **not a claimed speedup**: no counterbalanced A/B or clock-stability experiment is run. The qualification host was gfx1151, and the sampled kernel contains no WMMA or LDS instructions, so WMMA-heavy kernels and LDS bank-conflict behavior are unqualified.
 
@@ -238,7 +246,7 @@ Limits:
 - **Descriptors:** only buffer descriptors (storage and uniform) can be captured. A dispatch that binds images, or reaches memory through buffer device addresses, is refused or will not replay faithfully.
 - **Source recovery:** automatic only for ggml's Vulkan shader build. Other projects can replay and time the captured SPIR-V, but not edit it.
 - **Pipeline names:** the dispatch must have one, from the application's debug names or labels. A kernel identified only by pipeline hash cannot be selected.
-- **Capture size:** a capture holds every bound range, and ggml binds the rest of its compute buffer as the output range, so one matrix-multiply capture is about 250–530 MB. Sessions live under `~/.rocprofgui/shader-tuning/sessions`.
+- **Capture size:** a capture holds every bound range, and ggml binds the rest of its compute buffer as the output range, so one matrix-multiply capture is about 250–530 MB. Sessions live under `~/.rocprofgui/shader-tuning/sessions`. A failed capture attempt is deleted, and closing a session deletes its capture (see the data-directory notes above).
 - **Timing claims:** timing deltas are measurements of the isolated dispatch, not a claimed application speedup: no counterbalanced A/B run or clock-stability control is made, and a real application also pays for the kernels around it. A default replay is a best case. Inputs are restored between dispatches, so the GPU never runs under sustained load. On an APU the replay's buffers usually land in the VRAM carve-out, where the application's data may not. On llama.cpp both mattered, but only for higher-occupancy variants: a 30% isolated gain was 4% inside the application (open-work's ninth pass). Application-like conditions predicted that (+1.7% against −24% in the best case), and the drop in L2 hit rate showed why. Confirm a variant in the application before relying on it.
 - **Driver:** the replay compiles with whatever driver the session's environment selects. A session created from an MCP `profile_run` inherits that run's `VK_DRIVER_FILES`, so a session profiled on a patched Mesa tunes for that Mesa's compiler. Mesa 26.0.8 and 26.2.0 compile the same IQ4_NL shader to 192 and 120 VGPRs at pad 2.
 

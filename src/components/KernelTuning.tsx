@@ -62,7 +62,7 @@ type Run = {
   codeHash: string;
   metrics: Record<string, Metric>;
   directory: string;
-  validation?: { status: string; mismatchedRegions?: string[] };
+  validation?: { status: string; mismatchedRegions?: string[]; reason?: string };
 };
 type Session = {
   phase?: string;
@@ -77,6 +77,7 @@ type Session = {
   code?: string;
   isa?: string;
   captured?: string;
+  captureBytes?: number;
   argumentsHex?: string;
   parameters?: {
     declaration: string;
@@ -96,13 +97,9 @@ type Status = {
   log: string;
 };
 const defaults: Config = {
-  sourceTree: "/devel/tools/llama.cpp",
-  cwd: "/devel/tools/llama.cpp",
-  argv: [
-    "/devel/tools/llama.cpp/build/bin/llama-bench",
-    "-hf",
-    "unsloth/Qwen3.5-9B-GGUF:Q8_0",
-  ],
+  sourceTree: "",
+  cwd: "",
+  argv: [],
   occurrence: 0,
   captureLibrary: "libkerncap.so",
   replay: "kerncap-replay",
@@ -683,6 +680,7 @@ export function KernelTuning({ id }: { id: string }) {
               {selected.validation?.mismatchedRegions?.length
                 ? ` · ${selected.validation.mismatchedRegions.length} memory regions differ`
                 : "."}
+              {selected.validation?.reason && ` ${selected.validation.reason}.`}
             </p>
             {selected.characterization?.families && (
               <p>
@@ -743,6 +741,12 @@ export function KernelTuning({ id }: { id: string }) {
           </>
         ) : (
           <p>No completed runs yet. Capture inputs, then run the baseline.</p>
+        )}
+        {session?.captureBytes !== undefined && (
+          <p>
+            Captured inputs: {number(session.captureBytes / 2 ** 30)} GiB on disk, a snapshot of every allocation the
+            kernel reads. They are deleted when this session closes; results, logs and source backups stay.
+          </p>
         )}
         <details>
           <summary>Captured launch, arguments and allocations</summary>

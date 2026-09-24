@@ -176,6 +176,18 @@ class SessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'GGML_VK_DEBUG_MARKERS'):
             w.main(self.root, {'op': 'capture'})
 
+    def test_failed_capture_leaves_no_buffers_behind(self):
+        (self.root / 'layer.json').write_text('{}')
+        (self.root / 'vkreplay').write_text('')
+        self.state()
+        state = json.loads((self.root / 'session.json').read_text())
+        # The application writes part of a capture but never reaches the dispatch.
+        state['config']['argv'] = ['python3', '-c', 'import os, pathlib; pathlib.Path(os.environ["ROCPROF_VKCAP_OUTPUT"], "in_0.bin").write_bytes(b"x" * 4096)']
+        (self.root / 'session.json').write_text(json.dumps(state))
+        with self.assertRaisesRegex(RuntimeError, 'never reached the selected dispatch'):
+            w.main(self.root, {'op': 'capture'})
+        self.assertEqual(list(self.root.glob('capture-*')), [])
+
     def test_missing_runtime_points_at_the_setup_script(self):
         self.state()
         with self.assertRaisesRegex(ValueError, 'setup-shader-tuning'):

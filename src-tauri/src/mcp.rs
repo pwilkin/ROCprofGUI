@@ -323,6 +323,7 @@ pub fn headless(
         );
     }
     start(o, store, tuning.clone(), control.clone(), None)?;
+    tuning::sweep_in_background();
     while !STOP.load(Ordering::SeqCst) {
         if let Some(environment) = control.attach_request.lock().unwrap().take() {
             for key in ATTACH_ENV {
@@ -1280,17 +1281,17 @@ impl Server {
                     return Err("timeoutSeconds must be between 1 and 3600".into());
                 }
                 let cwd = Path::new(text(a, "cwd")?);
+                // Recorded so a tuning session opened from this trace reruns the same application.
+                fs::write(
+                    folder.join("profile.json"),
+                    serde_json::to_vec_pretty(&json!({"tracer":a["tracer"].as_str().unwrap_or("rocprofv3"),"argv":argv,"cwd":cwd,"env":a.get("env").cloned().unwrap_or(json!({}))}))
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
                 if a["tracer"] == "radv" {
                     if a.get("counters").is_some() || a.get("profiler").is_some() {
                         return Err("counters and profiler apply to rocprofv3 only".into());
                     }
-                    // Recorded so a shader-tuning session can rerun the same application.
-                    fs::write(
-                        folder.join("profile.json"),
-                        serde_json::to_vec_pretty(&json!({"tracer":"radv","argv":argv,"cwd":cwd,"env":a.get("env").cloned().unwrap_or(json!({}))}))
-                            .map_err(|e| e.to_string())?,
-                    )
-                    .map_err(|e| e.to_string())?;
                     let started = std::time::SystemTime::now();
                     let mut vars = vec![
                         ("MESA_VK_TRACE".to_owned(), "rgp".to_owned()),
@@ -1496,7 +1497,7 @@ fn tools() -> Vec<Value> {
  ("tuning_open","Select one traced dispatch for tuning; opens the native editor when a GUI is attached. A dispatch from a RADV capture opens a Vulkan single-shader session (experimental), anything else a HIP kernel session.",json!({"captureId":str_,"dispatchId":str_}),vec!["captureId","dispatchId"]),
  ("tuning_status","Read a session: mode (vulkan or HIP), source files, ISA, captured arguments or dispatch, calibration, run metrics/deltas, output validation and job log.",json!({"id":str_}),vec!["id"]),
  ("tuning_action","Execute and await a tuning operation. request.op: search (config.sourceTree), select (index), capture (config.cwd/argv), calibrate, run (variant, code, iterations, validate, autoCounters, autoCalibrate, optional work/counters), save (code). Config merges with session config. Capture preserves launch arguments and inputs; save replaces the selected source definition with original-file conflict checks. Long calls can be cancelled. Vulkan sessions: capture (config.cwd/argv/env, occurrence, optional name/groups) first, then search (matches the captured SPIR-V against the ggml shader build under config.sourceTree), select (index), run (variant, edits {path: full text}, iterations, validate, trace, autoCounters, conditions), save (edits); no calibrate. A Vulkan run replays under conditions {mode: stateless (default) or sustained (back to back, after one restore), memory: device (default), app, gtt or auto (system memory on integrated GPUs), flushMb (evict caches first), repeats 1-10 (replays with fresh allocations; reports their spread)}; the default is the isolated best case. autoCounters (default true) adds GPU cycles, the clock the dispatch ran at, and L0/L1/L2 hit rates. Deltas compare with the latest run under the same conditions and work.",json!({"id":str_,"request":{"type":"object","properties":{"op":{"enum":["search","select","capture","calibrate","run","save"]},"config":obj,"index":num,"variant":{"type":"boolean"},"code":str_,"iterations":num,"validate":{"type":"boolean"},"autoCounters":{"type":"boolean"},"autoCalibrate":{"type":"boolean"},"work":obj,"counters":{"type":"array","items":obj},"edits":obj,"trace":{"type":"boolean"},"conditions":{"type":"object","properties":{"mode":{"enum":["stateless","sustained"]},"memory":{"enum":["device","app","gtt","auto"]},"flushMb":num,"repeats":num}}},"required":["op"]}}),vec!["id","request"]),
- ("tuning_close","Stop and close a tuning session; completed artifacts remain on disk.",json!({"id":str_}),vec!["id"]),
+ ("tuning_close","Stop and close a tuning session. Its captured inputs (a snapshot of every allocation the kernel reads, often the whole model) and validation dumps are deleted; results, logs and source backups remain on disk.",json!({"id":str_}),vec!["id"]),
  ];
     entries.into_iter().map(|(name,description,properties,required)|json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).collect()
 }
