@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -50,13 +51,57 @@ def atomic(path, data):
             os.unlink(tmp)
 
 
+def descendants(pid):
+    """Every process below pid, from /proc."""
+    children = {}
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try: text = stat.read_text()
+        except OSError: continue
+        fields = text[text.rindex(')') + 2:].split()
+        children.setdefault(int(fields[1]), []).append(int(stat.parent.name))
+    found, stack = [], [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append(child); stack.append(child)
+    return found
+
+
+def kill_tree(pid):
+    """Kills a process and everything below it, stopping them first so none can
+    start another process between the listing and the kill."""
+    tree = [pid]
+    try: os.kill(pid, signal.SIGSTOP)
+    except OSError: pass
+    tree += descendants(pid)
+    for p in tree[1:]:
+        try: os.kill(p, signal.SIGSTOP)
+        except OSError: pass
+    for p in tree:
+        try: os.kill(p, signal.SIGKILL)
+        except OSError: pass
+
+
+def run_tree(argv, timeout, capture_output=False, **kwargs):
+    """subprocess.run whose timeout kills the whole process tree. An application
+    or a profiler can start children that killing it alone leaves running."""
+    if capture_output: kwargs['stdout'] = kwargs['stderr'] = subprocess.PIPE
+    with subprocess.Popen(argv, **kwargs) as process:
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(process.pid)
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+
+
 def command(argv, cwd, log, env=None, timeout=540):
     if not argv or not all(isinstance(a, str) and '\0' not in a for a in argv):
         raise ValueError('Command must be a nonempty argument array')
     with Path(log).open('ab') as output:
         output.write(('\n$ ' + shlex.join(argv) + '\n').encode())
         output.flush()
-        result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
+        result = run_tree(argv, timeout, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
     if result.returncode:
         raise RuntimeError(f'Command exited {result.returncode}; see {log}')
 
@@ -342,7 +387,7 @@ def replay(cfg, argv, output, log):
     with output.open('wb') as stdout, Path(log).open('ab') as stderr:
         stderr.write(('\n$ ' + shlex.join(argv) + '\n').encode())
         stderr.flush()
-        p = subprocess.run(argv, stdout=stdout, stderr=stderr, env=application_env(cfg), timeout=540)
+        p = run_tree(argv, 540, stdout=stdout, stderr=stderr, env=application_env(cfg))
     if p.returncode:
         raise RuntimeError('Isolated replay failed; see job.log')
     return json.loads(output.read_text())
@@ -357,7 +402,7 @@ def trace_replay(cfg, capture, spirv, run, log):
     with Path(log).open('ab') as output:
         output.write(('\n$ ' + shlex.join(argv) + '\n').encode())
         output.flush()
-        p = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=output, env=env, timeout=540)
+        p = run_tree(argv, 540, stdout=subprocess.DEVNULL, stderr=output, env=env)
     files = sorted((f for f in glob.glob('/tmp/vkreplay_*.rgp') if os.path.getmtime(f) >= started), key=os.path.getsize)
     if p.returncode or not files:
         for f in files:

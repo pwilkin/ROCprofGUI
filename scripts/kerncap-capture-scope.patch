@@ -1,0 +1,156 @@
+diff --git a/kerncap/src/kerncap.hip b/kerncap/src/kerncap.hip
+index 5a336e1..86ed284 100755
+--- a/kerncap/src/kerncap.hip
++++ b/kerncap/src/kerncap.hip
+@@ -845,7 +845,7 @@ bool CaptureState::should_trace_dispatch(
+ // Full device memory snapshot for VA-faithful replay
+ // ---------------------------------------------------------------------------
+ void CaptureState::snapshot_all_tracked_memory(
+-        const hsa_kernel_dispatch_packet_t* disp) {
++        const hsa_kernel_dispatch_packet_t* disp, uint32_t kernarg_size) {
+     std::string memdir = output_dir_ + "/memory";
+     mkdir(memdir.c_str(), 0755);
+ 
+@@ -863,12 +863,81 @@ void CaptureState::snapshot_all_tracked_memory(
+         }
+     }
+ 
++    // Scope. "all" (the default) keeps every tracked allocation, so any pointer
++    // the kernel follows stays valid at replay. "reachable" keeps only what the
++    // dispatch can reach: allocations its kernarg segment (hidden arguments
++    // included) points into and, transitively, allocations that pointer-sized
++    // words in reached allocations point into. Allocations larger than
++    // KERNCAP_SNAPSHOT_SCAN_BYTES (default 64 MiB) are kept but not scanned:
++    // they hold data, not pointer tables. An application that allocates
++    // tensors individually then captures a GEMM in megabytes, not the model.
++    const char* scope_env = std::getenv("KERNCAP_SNAPSHOT_SCOPE");
++    const bool reachable_only = scope_env && std::string(scope_env) == "reachable";
++    std::vector<bool> keep(allocs.size(), !reachable_only);
++    uint64_t tracked_bytes = 0;
++    for (const auto& a : allocs) tracked_bytes += a.size;
++    if (reachable_only) {
++        size_t scan_limit = 64ULL << 20;
++        if (const char* env = std::getenv("KERNCAP_SNAPSHOT_SCAN_BYTES")) {
++            try { scan_limit = static_cast<size_t>(std::stoull(env)); }
++            catch (const std::exception&) {
++                KERNCAP_WARN("KERNCAP_SNAPSHOT_SCAN_BYTES=%s not parseable; using %zu", env, scan_limit);
++            }
++        }
++        std::vector<size_t> order(allocs.size());
++        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
++        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return allocs[a].ptr < allocs[b].ptr; });
++        std::vector<size_t> pending;
++        auto mark = [&](uint64_t value) {
++            // The allocation containing this address, if any: the last one
++            // starting at or below it.
++            auto it = std::upper_bound(order.begin(), order.end(), value, [&](uint64_t v, size_t i) {
++                return v < reinterpret_cast<uint64_t>(allocs[i].ptr);
++            });
++            if (it == order.begin()) return;
++            size_t i = *(it - 1);
++            uint64_t base = reinterpret_cast<uint64_t>(allocs[i].ptr);
++            if (value - base < allocs[i].size && !keep[i]) {
++                keep[i] = true;
++                pending.push_back(i);
++            }
++        };
++        // The kernarg segment sits in the runtime's kernarg ring, which still
++        // holds earlier dispatches' arguments: scan this dispatch's bytes only,
++        // and never the ring itself. Replay builds its own kernarg segment.
++        const auto* kernarg = static_cast<const uint8_t*>(disp->kernarg_address);
++        size_t ring = allocs.size();
++        {
++            uint64_t address = reinterpret_cast<uint64_t>(kernarg);
++            for (size_t i = 0; i < allocs.size(); ++i) {
++                uint64_t base = reinterpret_cast<uint64_t>(allocs[i].ptr);
++                if (address - base < allocs[i].size) { ring = i; break; }
++            }
++        }
++        for (size_t off = 0; off + sizeof(uint64_t) <= kernarg_size; off += sizeof(uint64_t)) {
++            uint64_t word;
++            std::memcpy(&word, kernarg + off, sizeof(word));
++            mark(word);
++        }
++        std::vector<uint64_t> words;
++        while (!pending.empty()) {
++            size_t i = pending.back();
++            pending.pop_back();
++            const auto& a = allocs[i];
++            if (a.size > scan_limit || i == ring) continue;
++            words.assign((a.size + sizeof(uint64_t) - 1) / sizeof(uint64_t), 0);
++            if (hsa_memory_copy(words.data(), a.ptr, a.size) != HSA_STATUS_SUCCESS) continue;
++            for (uint64_t word : words) mark(word);
++        }
++    }
++
+     // Build the regions list and write memory_regions.json FIRST
+     // (before any hsa_memory_copy that might crash on freed regions).
+     nlohmann::json regions_json = nlohmann::json::array();
+ 
+-    for (const auto& a : allocs) {
+-        if (a.size == 0 || a.size > (1ULL << 40)) continue;
++    for (size_t ai = 0; ai < allocs.size(); ++ai) {
++        const auto& a = allocs[ai];
++        if (!keep[ai] || a.size == 0 || a.size > (1ULL << 40)) continue;
+ 
+         uint64_t base = reinterpret_cast<uint64_t>(a.ptr);
+ 
+@@ -892,6 +961,9 @@ void CaptureState::snapshot_all_tracked_memory(
+     {
+         nlohmann::json regions_doc;
+         regions_doc["regions"] = regions_json;
++        regions_doc["scope"] = reachable_only ? "reachable" : "all";
++        regions_doc["tracked_regions"] = allocs.size();
++        regions_doc["tracked_bytes"] = tracked_bytes;
+ 
+         std::string regions_path = output_dir_ + "/memory_regions.json";
+         std::ofstream rout(regions_path);
+@@ -935,8 +1007,9 @@ void CaptureState::snapshot_all_tracked_memory(
+                  allocs.size(), chunk_bytes);
+ 
+     int ok_count = 0;
+-    for (const auto& a : allocs) {
+-        if (a.size == 0 || a.size > (1ULL << 40)) continue;
++    for (size_t ai = 0; ai < allocs.size(); ++ai) {
++        const auto& a = allocs[ai];
++        if (!keep[ai] || a.size == 0 || a.size > (1ULL << 40)) continue;
+ 
+         uint64_t base = reinterpret_cast<uint64_t>(a.ptr);
+ 
+@@ -980,8 +1053,8 @@ void CaptureState::snapshot_all_tracked_memory(
+         }
+     }
+ 
+-    KERNCAP_INFO("Memory snapshot: %d/%zu regions captured",
+-                 ok_count, allocs.size());
++    KERNCAP_INFO("Memory snapshot: %d/%zu regions captured (scope %s)",
++                 ok_count, allocs.size(), reachable_only ? "reachable" : "all");
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -1522,7 +1595,7 @@ void CaptureState::capture_kernel(
+     if (std::getenv("KERNCAP_DISABLE_SNAPSHOT") != nullptr) {
+         KERNCAP_INFO("Skipping memory snapshot (KERNCAP_DISABLE_SNAPSHOT=1)");
+     } else {
+-        snapshot_all_tracked_memory(disp);
++        snapshot_all_tracked_memory(disp, *kernarg_segment_size);
+     }
+ 
+     // Module-variable snapshot (HSA_SYMBOL_KIND_VARIABLE) for kernels that
+diff --git a/kerncap/src/kerncap.hpp b/kerncap/src/kerncap.hpp
+index 2c9a295..39140de 100755
+--- a/kerncap/src/kerncap.hpp
++++ b/kerncap/src/kerncap.hpp
+@@ -197,8 +197,10 @@ private:
+     std::string get_kernel_name(uint64_t kernel_object);
+     std::string get_kernel_symbol(uint64_t kernel_object);
+ 
+-    // Snapshot all tracked device memory for VA-faithful replay
+-    void snapshot_all_tracked_memory(const hsa_kernel_dispatch_packet_t* disp);
++    // Snapshot tracked device memory for VA-faithful replay: every allocation,
++    // or with KERNCAP_SNAPSHOT_SCOPE=reachable only those the dispatch can reach
++    void snapshot_all_tracked_memory(const hsa_kernel_dispatch_packet_t* disp,
++                                     uint32_t kernarg_size);
+ 
+     // Snapshot module-scope variables (HSA_SYMBOL_KIND_VARIABLE) from every
+     // observed executable. Required for kernels that read state populated via

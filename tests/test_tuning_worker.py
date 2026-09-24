@@ -2,7 +2,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -10,6 +13,20 @@ from types import SimpleNamespace
 spec = importlib.util.spec_from_file_location('worker', Path(__file__).resolve().parents[1] / 'src-tauri/src/tuning_worker.py')
 w = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(w)
+
+
+def assert_tree_killed(test, run_tree, root):
+    """A timed-out command's own children die with it, as rocprofv3's profiled
+    program must when a counter pass times out."""
+    pidfile = root / 'grandchild.pid'
+    script = 'import subprocess, sys, time; p = subprocess.Popen(["sleep", "30"]); open(sys.argv[1], "w").write(str(p.pid)); time.sleep(30)'
+    with test.assertRaises(subprocess.TimeoutExpired):
+        run_tree([sys.executable, '-c', script, str(pidfile)], 1)
+    grandchild = Path(f'/proc/{int(pidfile.read_text())}/stat')
+    deadline = time.time() + 5
+    while grandchild.exists() and grandchild.read_text().split(') ')[-1][0] != 'Z' and time.time() < deadline:
+        time.sleep(0.05)
+    test.assertFalse(grandchild.exists() and grandchild.read_text().split(') ')[-1][0] != 'Z', 'grandchild survived')
 
 
 class TuningTests(unittest.TestCase):
@@ -153,6 +170,38 @@ class TuningTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'not allowed'):
                 w.main(self.root, {'op': 'capture'})
 
+    def capture_with(self, regions, **config):
+        self.ready_to_capture(**config)
+        (self.root / 'original-source').write_text((self.root / 'kernel.cu').read_text())
+        seen = {}
+        def capture(argv, cwd, log, env=None):
+            seen.update(env)
+            (Path(env['KERNCAP_OUTPUT']) / 'memory_regions.json').write_text(json.dumps(regions))
+        with patch.object(w, 'command', side_effect=capture), patch.object(w, 'finish_capture'):
+            return w.main(self.root, {'op': 'capture'}), seen
+
+    def test_capture_keeps_only_reachable_allocations_by_default(self):
+        regions = {'scope': 'reachable', 'tracked_regions': 1266, 'tracked_bytes': 78 << 30,
+                   'regions': [{'base': 4096, 'size': 100 << 20}, {'base': 1 << 40, 'size': 10 << 20}]}
+        state, env = self.capture_with(regions)
+        self.assertEqual(env['KERNCAP_SNAPSHOT_SCOPE'], 'reachable')
+        self.assertEqual(state['captureScope'], 'reachable')
+        self.assertEqual(state['captureRegions'], {'kept': 2, 'keptBytes': 110 << 20, 'tracked': 1266, 'trackedBytes': 78 << 30})
+        self.assertNotIn('captureScopeNote', state)
+
+    def test_capture_scope_all_and_old_runtimes(self):
+        _, env = self.capture_with({'scope': 'all', 'regions': []}, captureScope='all')
+        self.assertEqual(env['KERNCAP_SNAPSHOT_SCOPE'], 'all')
+        # A runtime built before capture scopes ignores the variable and says nothing.
+        self.temp.cleanup(); self.setUp()
+        state, _ = self.capture_with({'regions': [{'base': 4096, 'size': 64}]})
+        self.assertEqual(state['captureScope'], 'all')
+        self.assertIn('setup-kernel-tuning', state['captureScopeNote'])
+        self.temp.cleanup(); self.setUp()
+        self.ready_to_capture(captureScope='some')
+        with self.assertRaisesRegex(ValueError, 'reachable or all'):
+            w.main(self.root, {'op': 'capture'})
+
     def test_validation_dumps_are_removed_whether_or_not_the_replay_succeeds(self):
         capture = self.root / 'capture'; (capture / 'memory').mkdir(parents=True)
         (capture / 'memory' / 'region_1000.bin').write_bytes(b'a' * 64)
@@ -169,6 +218,15 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(hashes, {'region_1000.bin': w.digest(b'b' * 64)})
         self.assertFalse((self.root / 'failed').exists() or (self.root / 'passed').exists())
         self.assertEqual((capture / 'memory' / 'region_1000.bin').read_bytes(), b'a' * 64)
+
+    def test_parameters_split_only_at_top_level_commas(self):
+        code = ('template <bool kHcDown>\n__launch_bounds__(256, 2)\n__global__ void gemm(const void* a, /* packed, */ int b,\n'
+                '    std::conditional_t<kHcDown, __half, float>* out, unsigned long batch, void (*hook)(int, float)) { }')
+        self.assertEqual(w.parameter_list(code, 'gemm'), ['const void* a', 'int b', 'std::conditional_t<kHcDown, __half, float>* out',
+                                                          'unsigned long batch', 'void (*hook)(int, float)'])
+
+    def test_timeout_kills_the_whole_process_tree(self):
+        assert_tree_killed(self, w.calibration.run_tree, self.root)
 
     def test_stream_hash(self):
         p = self.root / 'data'; p.write_bytes(b'test' * 1024)

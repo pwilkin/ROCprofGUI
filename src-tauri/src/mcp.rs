@@ -10,7 +10,7 @@ use std::{
     process::Child,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -147,9 +147,41 @@ struct Active {
     id: Value,
     owner: String,
     name: String,
+    /// The tool name and its arguments: an identical call joins this one.
+    key: String,
     cancel: Arc<AtomicBool>,
     started: Instant,
+    outcome: Arc<Outcome>,
 }
+/// The response of a running tool call, handed to identical calls that join it.
+#[derive(Default)]
+struct Outcome {
+    response: Mutex<Option<Value>>,
+    ready: Condvar,
+}
+impl Outcome {
+    fn set(&self, response: Value) {
+        *self.response.lock().unwrap() = Some(response);
+        self.ready.notify_all();
+    }
+    fn wait(&self) -> Value {
+        let mut response = self.response.lock().unwrap();
+        while response.is_none() {
+            response = self.ready.wait(response).unwrap();
+        }
+        response.clone().unwrap()
+    }
+}
+/// A finished call's response that has not been confirmed delivered.
+struct Undelivered {
+    owner: String,
+    id: Value,
+    key: String,
+    response: Value,
+    at: Instant,
+}
+/// Tools that only read state, and so may run while an action is active.
+const READ_ONLY_TOOLS: [&str; 2] = ["tuning_status", "profile_status"];
 struct LiveProfile {
     id: String,
     child: Child,
@@ -170,8 +202,31 @@ pub struct Control {
     app: Mutex<Option<tauri::AppHandle>>,
     attach_request: Mutex<Option<BTreeMap<String, String>>>,
     attaching: AtomicBool,
+    undelivered: Mutex<Vec<Undelivered>>,
 }
 impl Control {
+    /// Keeps a finished call's response until its delivery is confirmed. A client
+    /// whose connection dropped during a long call typically reconnects and
+    /// retries it; the retry then receives this instead of running it again.
+    fn remember(&self, owner: &str, id: &Value, key: String, response: Value) {
+        let mut kept = self.undelivered.lock().unwrap();
+        kept.retain(|e| e.at.elapsed() < Duration::from_secs(1800));
+        if kept.len() >= 16 {
+            kept.remove(0);
+        }
+        kept.push(Undelivered { owner: owner.into(), id: id.clone(), key, response, at: Instant::now() });
+    }
+    fn delivered(&self, owner: &str, id: &Value) {
+        self.undelivered.lock().unwrap().retain(|e| !(e.owner == owner && e.id == *id));
+    }
+    /// The undelivered response of an identical earlier call, answered to this one.
+    fn reclaim(&self, key: &str, id: &Value) -> Option<Value> {
+        let mut kept = self.undelivered.lock().unwrap();
+        let index = kept.iter().position(|e| e.key == key)?;
+        let mut response = kept.remove(index).response;
+        response["id"] = id.clone();
+        Some(response)
+    }
     fn check(flag: &AtomicBool) -> Result<(), String> {
         if flag.load(Ordering::SeqCst) {
             Err("MCP execution cancelled".into())
@@ -677,21 +732,38 @@ impl Server {
             reply(r, 202, "", None);
             let result = self.rpc(&id, &v);
             if let Some(tx) = tx {
-                let _ = tx.try_send(format!("event: message\ndata: {result}\n\n"));
+                if tx.try_send(format!("event: message\ndata: {result}\n\n")).is_ok() {
+                    self.control.delivered(&id, &v["id"]);
+                }
             }
         } else {
             let mut writer = r.into_writer();
             let _=write!(writer,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nMcp-Session-Id: {id}\r\nConnection: close\r\n\r\n").and_then(|_|writer.flush());
             let (tx, rx) = mpsc::sync_channel(1);
             let server = self.clone();
+            let (owner, request, started) = (id.clone(), v["id"].clone(), Instant::now());
             std::thread::spawn(move || {
                 let _ = tx.send(server.rpc(&id, &v));
             });
             loop {
                 match rx.recv_timeout(Duration::from_secs(2)) {
                     Ok(result) => {
-                        let _ = write!(writer, "event: message\ndata: {result}\n\n")
-                            .and_then(|_| writer.flush());
+                        // A response that cannot be written stays kept for a retry.
+                        // The first write to a connection the client has closed still
+                        // succeeds, so a long call probes it first: if the client left
+                        // since the last keep-alive, the response write then fails.
+                        let probed = started.elapsed() < Duration::from_secs(2)
+                            || writer.write_all(b": done\n\n").and_then(|_| writer.flush()).is_ok() && {
+                                std::thread::sleep(Duration::from_millis(50));
+                                true
+                            };
+                        if probed
+                            && write!(writer, "event: message\ndata: {result}\n\n")
+                                .and_then(|_| writer.flush())
+                                .is_ok()
+                        {
+                            self.control.delivered(&owner, &request);
+                        }
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -731,7 +803,7 @@ impl Server {
                 }
                 c.initialized = true;
                 c.version = version.into();
-                json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"rocprof-studio","version":env!("CARGO_PKG_VERSION")},"instructions":"Local profiling and kernel tuning. Tool calls are serialized. Cancel with notifications/cancelled or the desktop Cancel MCP execution button. Read tool schemas before mutation; artifacts default to ~/.rocprofgui (override with ROCPROFGUI_HOME)."})
+                json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"rocprof-studio","version":env!("CARGO_PKG_VERSION")},"instructions":"Local profiling and kernel tuning. Tool calls are serialized, except tuning_status and profile_status, which answer while another call runs. After a dropped connection, repeat the same call with the same arguments: it joins the running call, or receives its result if it already finished. Cancel with notifications/cancelled or the desktop Cancel MCP execution button. Read tool schemas before mutation; artifacts default to ~/.rocprofgui (override with ROCPROFGUI_HOME)."})
             }
             "ping" => json!({}),
             _ if !self
@@ -762,13 +834,34 @@ impl Server {
                     return error(id, -32602, e);
                 }
                 let flag = Arc::new(AtomicBool::new(false));
+                if READ_ONLY_TOOLS.contains(&name) {
+                    return match self.tool(name, &args, flag) {
+                        Ok(data) => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":data.to_string()}],"isError":false}}),
+                        Err(e) => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":e}],"isError":true}}),
+                    };
+                }
+                let key = format!("{name}\n{args}");
+                let outcome_slot = Arc::new(Outcome::default());
                 {
                     let mut active = self.control.active.lock().unwrap();
+                    if let Some(response) = self.control.reclaim(&key, &id) {
+                        return response;
+                    }
+                    if let Some(running) = active.as_ref() {
+                        // A retry of the running call, typically after the client's
+                        // connection dropped: wait for it and answer this request.
+                        if running.key == key && !running.cancel.load(Ordering::SeqCst) {
+                            let (slot, first_owner, first_id) = (running.outcome.clone(), running.owner.clone(), running.id.clone());
+                            drop(active);
+                            let mut response = slot.wait();
+                            self.control.delivered(&first_owner, &first_id);
+                            response["id"] = id.clone();
+                            return response;
+                        }
+                        return error(id, -32001, "Another MCP action is running");
+                    }
                     if self.control.attaching.load(Ordering::SeqCst) {
                         return error(id, -32001, "GUI attachment in progress");
-                    }
-                    if active.is_some() {
-                        return error(id, -32001, "Another MCP action is running");
                     }
                     if self.store.import.lock().unwrap().is_some() || tuning::busy(&self.tuning) {
                         return error(
@@ -781,33 +874,36 @@ impl Server {
                         id: id.clone(),
                         owner: owner.into(),
                         name: name.into(),
+                        key: key.clone(),
                         cancel: flag.clone(),
                         started: Instant::now(),
+                        outcome: outcome_slot.clone(),
                     });
                 }
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.tool(name, &args, flag.clone())
                 }))
                 .unwrap_or_else(|_| Err("Internal MCP execution failure".into()));
-                let cancelled = {
-                    let mut active = self.control.active.lock().unwrap();
-                    let cancelled = flag.load(Ordering::SeqCst);
-                    active.take();
-                    cancelled
-                };
-                if cancelled {
+                let mut active = self.control.active.lock().unwrap();
+                let response = if flag.load(Ordering::SeqCst) {
                     let detail = match outcome {
                         Err(message) if name == "profile_run" => format!("MCP execution cancelled; worker stopped. {message}"),
                         _ => "MCP execution cancelled; worker stopped. Completed artifacts are retained.".into(),
                     };
-                    return error(id,-32800,detail);
-                }
-                match outcome {
-                    Ok(data) => {
-                        json!({"content":[{"type":"text","text":data.to_string()}],"isError":false})
-                    }
-                    Err(e) => json!({"content":[{"type":"text","text":e}],"isError":true}),
-                }
+                    error(id.clone(), -32800, detail)
+                } else {
+                    let result = match outcome {
+                        Ok(data) => json!({"content":[{"type":"text","text":data.to_string()}],"isError":false}),
+                        Err(e) => json!({"content":[{"type":"text","text":e}],"isError":true}),
+                    };
+                    json!({"jsonrpc":"2.0","id":id,"result":result})
+                };
+                // Published before the action ends, so a retry either joins it or
+                // finds the response kept for it; it is never run twice.
+                self.control.remember(owner, &id, key, response.clone());
+                outcome_slot.set(response.clone());
+                active.take();
+                return response;
             }
             _ => return error(id, -32601, "Method not found"),
         };
@@ -1496,7 +1592,7 @@ fn tools() -> Vec<Value> {
  ("reference_query","Search/page the embedded ISA and matrix-type documentation. architecture: manifest, cdna1..4, rdna1..4, rdna3_5.",json!({"architecture":str_,"query":str_,"offset":num,"limit":num}),vec![]),
  ("tuning_open","Select one traced dispatch for tuning; opens the native editor when a GUI is attached. A dispatch from a RADV capture opens a Vulkan single-shader session (experimental), anything else a HIP kernel session.",json!({"captureId":str_,"dispatchId":str_}),vec!["captureId","dispatchId"]),
  ("tuning_status","Read a session: mode (vulkan or HIP), source files, ISA, captured arguments or dispatch, calibration, run metrics/deltas, output validation and job log.",json!({"id":str_}),vec!["id"]),
- ("tuning_action","Execute and await a tuning operation. request.op: search (config.sourceTree), select (index), capture (config.cwd/argv), calibrate, run (variant, code, iterations, validate, autoCounters, autoCalibrate, optional work/counters), save (code). Config merges with session config. Capture preserves launch arguments and inputs; save replaces the selected source definition with original-file conflict checks. Long calls can be cancelled. Vulkan sessions: capture (config.cwd/argv/env, occurrence, optional name/groups) first, then search (matches the captured SPIR-V against the ggml shader build under config.sourceTree), select (index), run (variant, edits {path: full text}, iterations, validate, trace, autoCounters, conditions), save (edits); no calibrate. A Vulkan run replays under conditions {mode: stateless (default) or sustained (back to back, after one restore), memory: device (default), app, gtt or auto (system memory on integrated GPUs), flushMb (evict caches first), repeats 1-10 (replays with fresh allocations; reports their spread)}; the default is the isolated best case. autoCounters (default true) adds GPU cycles, the clock the dispatch ran at, and L0/L1/L2 hit rates. Deltas compare with the latest run under the same conditions and work.",json!({"id":str_,"request":{"type":"object","properties":{"op":{"enum":["search","select","capture","calibrate","run","save"]},"config":obj,"index":num,"variant":{"type":"boolean"},"code":str_,"iterations":num,"validate":{"type":"boolean"},"autoCounters":{"type":"boolean"},"autoCalibrate":{"type":"boolean"},"work":obj,"counters":{"type":"array","items":obj},"edits":obj,"trace":{"type":"boolean"},"conditions":{"type":"object","properties":{"mode":{"enum":["stateless","sustained"]},"memory":{"enum":["device","app","gtt","auto"]},"flushMb":num,"repeats":num}}},"required":["op"]}}),vec!["id","request"]),
+ ("tuning_action","Execute and await a tuning operation. request.op: search (config.sourceTree), select (index), capture (config.cwd/argv; config.captureScope 'reachable', the default, snapshots only the allocations the kernel's arguments reach, following pointer tables, while 'all' snapshots every allocation in the process for kernels that reach memory another way), calibrate, run (variant, code, iterations, validate, autoCounters, autoCalibrate, optional work/counters), save (code). Config merges with session config. Capture preserves launch arguments and inputs; save replaces the selected source definition with original-file conflict checks. Long calls can be cancelled. Vulkan sessions: capture (config.cwd/argv/env, occurrence, optional name/groups) first, then search (matches the captured SPIR-V against the ggml shader build under config.sourceTree), select (index), run (variant, edits {path: full text}, iterations, validate, trace, autoCounters, conditions), save (edits); no calibrate. A Vulkan run replays under conditions {mode: stateless (default) or sustained (back to back, after one restore), memory: device (default), app, gtt or auto (system memory on integrated GPUs), flushMb (evict caches first), repeats 1-10 (replays with fresh allocations; reports their spread)}; the default is the isolated best case. autoCounters (default true) adds GPU cycles, the clock the dispatch ran at, and L0/L1/L2 hit rates. Deltas compare with the latest run under the same conditions and work.",json!({"id":str_,"request":{"type":"object","properties":{"op":{"enum":["search","select","capture","calibrate","run","save"]},"config":obj,"index":num,"variant":{"type":"boolean"},"code":str_,"iterations":num,"validate":{"type":"boolean"},"autoCounters":{"type":"boolean"},"autoCalibrate":{"type":"boolean"},"work":obj,"counters":{"type":"array","items":obj},"edits":obj,"trace":{"type":"boolean"},"conditions":{"type":"object","properties":{"mode":{"enum":["stateless","sustained"]},"memory":{"enum":["device","app","gtt","auto"]},"flushMb":num,"repeats":num}}},"required":["op"]}}),vec!["id","request"]),
  ("tuning_close","Stop and close a tuning session. Its captured inputs (a snapshot of every allocation the kernel reads, often the whole model) and validation dumps are deleted; results, logs and source backups remain on disk.",json!({"id":str_}),vec!["id"]),
  ];
     entries.into_iter().map(|(name,description,properties,required)|json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}})).collect()
@@ -1867,8 +1963,10 @@ mod tests {
             id: json!(7),
             owner: "one".into(),
             name: "run".into(),
+            key: "run\n{}".into(),
             cancel: flag.clone(),
             started: Instant::now(),
+            outcome: Arc::new(Outcome::default()),
         });
         c.cancel(Some("two"), Some(&json!(7)));
         assert!(!flag.load(Ordering::SeqCst));
@@ -1876,6 +1974,32 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
         c.cancel(Some("one"), Some(&json!(7)));
         assert!(flag.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn undelivered_results_go_once_to_an_identical_retry() {
+        let c = Control::default();
+        let response = json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"done"}],"isError":false}});
+        c.remember("dropped", &json!(1), "tuning_action\n{}".into(), response.clone());
+        assert!(c.reclaim("tuning_action\n{\"id\":\"x\"}", &json!(5)).is_none());
+        let retry = c.reclaim("tuning_action\n{}", &json!(5)).unwrap();
+        assert_eq!(retry["id"], 5);
+        assert_eq!(retry["result"], response["result"]);
+        assert!(c.reclaim("tuning_action\n{}", &json!(6)).is_none());
+        // A response that reached its client is not kept.
+        c.remember("connected", &json!(2), "profile_run\n{}".into(), response);
+        c.delivered("connected", &json!(2));
+        assert!(c.reclaim("profile_run\n{}", &json!(3)).is_none());
+    }
+    #[test]
+    fn a_joining_call_receives_the_running_calls_response() {
+        let outcome = Arc::new(Outcome::default());
+        let joiner = {
+            let outcome = outcome.clone();
+            std::thread::spawn(move || outcome.wait())
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        outcome.set(json!({"jsonrpc":"2.0","id":1,"result":42}));
+        assert_eq!(joiner.join().unwrap()["result"], 42);
     }
     #[test]
     fn pagination_filter_and_cancel() {

@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import tempfile
@@ -44,12 +45,57 @@ def gpu_lock(root):
         yield
 
 
+def descendants(pid):
+    """Every process below pid, from /proc."""
+    children = {}
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try: text = stat.read_text()
+        except OSError: continue
+        fields = text[text.rindex(')') + 2:].split()
+        children.setdefault(int(fields[1]), []).append(int(stat.parent.name))
+    found, stack = [], [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append(child); stack.append(child)
+    return found
+
+
+def kill_tree(pid):
+    """Kills a process and everything below it, stopping them first so none can
+    start another process between the listing and the kill."""
+    tree = [pid]
+    try: os.kill(pid, signal.SIGSTOP)
+    except OSError: pass
+    tree += descendants(pid)
+    for p in tree[1:]:
+        try: os.kill(p, signal.SIGSTOP)
+        except OSError: pass
+    for p in tree:
+        try: os.kill(p, signal.SIGKILL)
+        except OSError: pass
+
+
+def run_tree(argv, timeout, capture_output=False, **kwargs):
+    """subprocess.run whose timeout kills the whole process tree. rocprofv3 runs
+    the profiled program as its own child, which killing rocprofv3 alone leaves
+    running."""
+    if capture_output: kwargs['stdout'] = kwargs['stderr'] = subprocess.PIPE
+    with subprocess.Popen(argv, **kwargs) as process:
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(process.pid)
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+
+
 def execute(argv, cwd, log, timeout=120, output=None):
     env = dict(os.environ, TMPDIR=str(cwd))
     for key in ['LD_PRELOAD', 'HSA_TOOLS_LIB', 'HSA_TOOLS_REPORT_LOAD_FAILURE']: env.pop(key, None)
     with Path(log).open('ab') as err:
         err.write(('\n' + json.dumps([str(x) for x in argv]) + '\n').encode()); err.flush()
-        p = subprocess.run([str(x) for x in argv], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=err, timeout=timeout)
+        p = run_tree([str(x) for x in argv], timeout, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=err)
     if output: Path(output).write_bytes(p.stdout)
     if p.returncode: raise ValueError(f'{Path(argv[0]).name} exited {p.returncode}; see {log}')
     return p.stdout.decode()

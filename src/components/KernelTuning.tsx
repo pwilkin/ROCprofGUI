@@ -9,6 +9,7 @@ type Config = {
   cwd: string;
   argv: string[];
   occurrence: number;
+  captureScope?: "reachable" | "all";
   captureLibrary: string;
   replay: string;
   profiler: string;
@@ -78,6 +79,9 @@ type Session = {
   isa?: string;
   captured?: string;
   captureBytes?: number;
+  captureScope?: string;
+  captureRegions?: { kept: number; keptBytes: number; tracked: number; trackedBytes: number };
+  captureScopeNote?: string;
   argumentsHex?: string;
   parameters?: {
     declaration: string;
@@ -397,6 +401,17 @@ export function KernelTuning({ id }: { id: string }) {
               "occurrence",
               "Matching kernel occurrence · zero-based (not trace dispatch ID)",
             )}
+            <label>
+              Memory to capture
+              <select
+                aria-label="Capture scope"
+                value={config.captureScope || "reachable"}
+                onChange={(e) => setConfig({ ...config, captureScope: e.target.value as Config["captureScope"] })}
+              >
+                <option value="reachable">Allocations the kernel's arguments reach (follows pointer tables)</option>
+                <option value="all">Every allocation in the process (kernels that reach memory another way)</option>
+              </select>
+            </label>
             <p>
               Selected trace dispatch: {session?.traceDispatch.id} · Grid{" "}
               {session?.traceDispatch.grid} · Workgroup{" "}
@@ -744,10 +759,15 @@ export function KernelTuning({ id }: { id: string }) {
         )}
         {session?.captureBytes !== undefined && (
           <p>
-            Captured inputs: {number(session.captureBytes / 2 ** 30)} GiB on disk, a snapshot of every allocation the
-            kernel reads. They are deleted when this session closes; results, logs and source backups stay.
+            Captured inputs: {number(session.captureBytes / 2 ** 30)} GiB on disk
+            {session.captureRegions &&
+              (session.captureScope === "reachable"
+                ? `, the ${session.captureRegions.kept} of ${session.captureRegions.tracked} allocations (${number(session.captureRegions.trackedBytes / 2 ** 30)} GiB in all) that the kernel's arguments reach`
+                : `, all ${session.captureRegions.kept} allocations in the process`)}
+            . They are deleted when this session closes; results, logs and source backups stay.
           </p>
         )}
+        {session?.captureScopeNote && <p role="note">{session.captureScopeNote}.</p>}
         <details>
           <summary>Captured launch, arguments and allocations</summary>
           {session?.parameters && (

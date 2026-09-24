@@ -56,6 +56,9 @@ test("kernel editor preserves edits, sends isolated runs, validates JSON, and sh
               code: "__global__ void scale_f32(float* p) { p[0] *= 2; }",
               isa: "v_mul_f32 v0, v0, 2",
               captured: "/snapshot",
+              captureBytes: 115343360,
+              captureScope: "reachable",
+              captureRegions: { kept: 4, keptBytes: 115343360, tracked: 1266, trackedBytes: 84288733184 },
               runs: [
                 {
                   number: 2,
@@ -115,6 +118,8 @@ test("kernel editor preserves edits, sends isolated runs, validates JSON, and sh
   );
   await expect(page.getByRole("status")).toContainText("bitwise match");
   await expect(page.locator(".tuning-metrics")).toContainText("Δ -1 µs (-20%)");
+  // A reachable-scope capture says how little of the process it kept.
+  await expect(page.getByText(/the 4 of 1266 allocations \(78\.5 GiB in all\) that the kernel's arguments reach/)).toBeVisible();
   await page
     .getByText("Build context, manual overrides & counter mappings")
     .click();

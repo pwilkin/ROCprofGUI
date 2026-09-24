@@ -185,6 +185,47 @@ Tests: three Rust tests (profiled defaults, pruning, sweep against a live and a 
 
 Not changed: a successful capture still holds the whole weight pool while its session is open. Snapshotting only the byte ranges a kernel touches needs support in kerncap.
 
+**Twelfth pass — capturing what a dispatch can reach, 2026-09-24.** In the "Gufo benchmark vs Flash Next" session (Qwen3.8 Flash Next, 93 GiB of weights), one `W8A8BlockedWmmaGEMMKernel` capture wrote 78.5 GiB. Kerncap's `snapshot_all_tracked_memory` copies every allocation in the process, 1266 of them, although the dispatch's arguments point into 4 (109.8 MiB). That session's own workaround, replaying from a pruned view, timed the kernel at 1461 µs, so those 4 were enough.
+
+**Change.** `scripts/kerncap-capture-scope.patch` adds `KERNCAP_SNAPSHOT_SCOPE=reachable`:
+- **What is kept:** allocations the dispatch's kernarg segment points into, hidden arguments included, and transitively those that pointer-sized words in reached allocations of at most 64 MiB point into (`KERNCAP_SNAPSHOT_SCAN_BYTES`).
+- **What is not scanned:** larger allocations are kept but not scanned. The kernarg ring itself is never scanned, because it still holds earlier dispatches' arguments; a first version that scanned it kept 107 of 109 allocations.
+- **Recorded:** `memory_regions.json` records the scope and the tracked totals.
+- **Worker default:** the worker now captures with `reachable` unless `config.captureScope` is `all`. It records kept and tracked allocations, flags a runtime built before the patch, and on a failed replay suggests recapturing with `all`.
+- **Setup:** `setup-kernel-tuning.py` applies both patches, each only once, so an existing checkout picks up the new one.
+
+**Checked:**
+- A HIP test program whose kernel reaches its three inputs only through a device pointer table, beside 100 unrelated 16 MiB allocations, captured 5 of 109 allocations (16 MiB of 1.6 GiB). Its replay output matched the full capture's bit for bit, and the application's checksum.
+- On llama.cpp, the reachable scope keeps 3 of 14 allocations, 4.49 of 5.10 GiB, because the model is one allocation. Validation is a bitwise match.
+- Two worker tests cover the default, the `all` override, old runtimes and invalid scopes. The browser test checks the capture breakdown.
+
+**Limits:**
+- A pointer stored at a 4-byte-aligned offset, or computed rather than stored, is not followed. Such a kernel faults at replay, and the error suggests `captureScope: "all"`.
+- Allocation granularity remains: a kernel that reads a slice of a single large pool captures the whole pool.
+
+**Thirteenth pass — three bugs reported from the Gufo session, 2026-09-24.**
+- **Argument names shifted.** The capture's argument table took `name(…)` up to the first `)` and split it at every comma, so a parameter such as `std::conditional_t<kHcDown, __half, float>*` became three, and `batch` showed as `__half`. `parameter_list` now:
+  - splits at top-level commas only, tracking `()`, `<>`, `[]` and `{}`;
+  - ignores comments;
+  - keeps function-pointer parameters whole.
+- **Timed-out counter passes left processes behind.** `subprocess.run(timeout=…)` kills only its direct child, and rocprofv3 runs the replay as its own child. Every worker command now goes through `run_tree`, which on timeout stops the command and its descendants, found through `/proc`, then kills them all. This covers the capture, counter passes, replay, counter discovery and calibration, in both workers.
+- **Reconnects lost results.** When an MCP client's connection dropped during a long call, the call kept running, its response went nowhere, and the reconnected client's calls were refused with "Another MCP action is running". Now:
+  - an identical call joins the running one and receives its response;
+  - a response that could not be written is kept for 30 minutes for an identical retry;
+  - `tuning_status` and `profile_status` answer while another call runs.
+
+  The first write to a connection the peer has closed still succeeds, so a call longer than 2 s writes a probe and waits 50 ms before its response; without it, a client that left just after a keep-alive would be counted as having received the response.
+
+**Checked on a dev server:**
+- A retry after dropping a running 8 s `profile_run` joined it and got its result at 8.1 s.
+- `tuning_status` answered in 0.00 s during that run.
+- A retry after a dropped call had finished was answered in 0.00 s with the kept result, whether the client left right after a keep-alive or at once.
+- The same call from a connected client ran again.
+
+**Tests:** two Rust (joining, retry store), four Python (parameter parsing, the process tree killed in both workers).
+
+**Known failure, not from this work:** the browser test "plot exports produce standalone PNG and styled SVG files" fails on the committed code too. Its SVG decode check returns false.
+
 Found along the way:
 - **The first capture read 1 GB back from uncached write-combined memory and took 166 s.** Host-cached staging memory brought it to 2.5 s.
 - **`profile_run`'s RADV mode failed if another process removed a `/tmp` entry mid-scan.** It now examines only its own files.

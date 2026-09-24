@@ -22,6 +22,10 @@ MAX_SOURCE = 8 * 1024 * 1024
 MIN_FREE_FOR_CAPTURE = 8 << 30
 VALIDATION_MARGIN = 2 << 30
 RESERVED_ENV = {'LD_PRELOAD', 'HSA_TOOLS_LIB', 'HSA_TOOLS_REPORT_LOAD_FAILURE', 'TMPDIR'}
+# "reachable" snapshots only the allocations the dispatch's arguments lead to
+# (following pointer tables); "all" snapshots every allocation in the process,
+# for kernels that reach memory some other way.
+CAPTURE_SCOPES = ('reachable', 'all')
 EXTENSIONS = {'.hip', '.cu', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.cuh'}
 
 
@@ -100,6 +104,27 @@ def kernel_base(name):
     return ''.join(head).split('::')[-1].split()[-1]
 
 
+def parameter_list(code, name):
+    """The parameter declarations of name's definition in code, without comments,
+    split at top-level commas only, so std::conditional_t<A, __half, float>* stays
+    one parameter."""
+    masked = mask_cpp(code)
+    match = re.search(r'\b' + re.escape(name) + r'\s*\(', masked)
+    if not match: return []
+    parts, depth, start = [], 0, match.end()
+    for i in range(match.end(), len(masked)):
+        char = masked[i]
+        if char in '(<[{':
+            depth += 1
+        elif char in ')>]}':
+            if depth == 0:
+                parts.append(masked[start:i]); break
+            depth -= 1
+        elif char == ',' and depth == 0:
+            parts.append(masked[start:i]); start = i + 1
+    return [' '.join(part.split()) for part in parts if part.strip()]
+
+
 def source_regions(text, name):
     masked = mask_cpp(text)
     result = []
@@ -157,7 +182,7 @@ def command(argv, cwd, log, env=None):
         raise ValueError('Command must be a nonempty argument array')
     with Path(log).open('ab') as output:
         output.write(('\n$ ' + shlex.join(argv) + '\n').encode()); output.flush()
-        result = subprocess.run(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=540)
+        result = calibration.run_tree(argv, 540, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT)
     if result.returncode:
         raise RuntimeError(f'Command exited {result.returncode}; see {log}')
 
@@ -318,9 +343,7 @@ def finish_capture(state, capture, cfg):
     state['capturedResources'] = resource
     state['capturedSource'] = state.get('capturedSource', state.get('code', ''))
     blob = bytes.fromhex(state['argumentsHex'])
-    signature = state.get('code', '')
-    match = re.search(r'\b' + re.escape(kernel_base(state['kernel'])) + r'\s*\((.*?)\)', signature, re.S)
-    declarations = match[1].split(',') if match else []
+    declarations = parameter_list(state.get('code', ''), kernel_base(state['kernel']))
     parameters = []
     for index, arg in enumerate(a for a in resource.get('arguments', []) if not a.get('value_kind', '').startswith('hidden_')):
         raw = blob[arg['offset']:arg['offset'] + arg['size']]
@@ -401,6 +424,8 @@ def main(root, request):
         if not state.get('source'): raise ValueError('Select the kernel source first')
         state['config'] = cfg
         if not cfg.get('argv'): raise ValueError('Provide the original application command as an argument array')
+        scope = cfg.get('captureScope') or 'reachable'
+        if scope not in CAPTURE_SCOPES: raise ValueError('config.captureScope must be reachable or all')
         free = shutil.disk_usage(root).free
         if free < MIN_FREE_FOR_CAPTURE:
             raise ValueError(f'Capture needs at least {MIN_FREE_FOR_CAPTURE >> 30} GiB free in {root} ({free >> 30} GiB free): it snapshots every allocation the kernel reads, which for llama.cpp includes the model')
@@ -409,7 +434,7 @@ def main(root, request):
         if cfg.get('modelCache'): env['LLAMA_CACHE'] = cfg['modelCache']
         env.pop('HSA_TOOLS_LIB', None); env.pop('HSA_TOOLS_REPORT_LOAD_FAILURE', None)
         capture = root / ('capture-' + str(time.time_ns())); capture.mkdir()
-        env.update(LD_PRELOAD=str(Path(cfg['captureLibrary']).resolve()), KERNCAP_KERNEL=canonical_kernel(state['kernel']), KERNCAP_OUTPUT=str(capture), KERNCAP_CAPTURE_CHILD='1', KERNCAP_DISPATCH=str(int(cfg.get('occurrence', 0))))
+        env.update(LD_PRELOAD=str(Path(cfg['captureLibrary']).resolve()), KERNCAP_KERNEL=canonical_kernel(state['kernel']), KERNCAP_OUTPUT=str(capture), KERNCAP_CAPTURE_CHILD='1', KERNCAP_DISPATCH=str(int(cfg.get('occurrence', 0))), KERNCAP_SNAPSHOT_SCOPE=scope)
         try:
             command(cfg['argv'], cfg['cwd'], log, env)
             finish_capture(state, capture, cfg)
@@ -421,6 +446,13 @@ def main(root, request):
                 state.pop(key, None)
             raise
         state['captureBytes'] = tree_bytes(capture)
+        regions = json.loads((capture / 'memory_regions.json').read_text())
+        kept = regions['regions']
+        state['captureScope'] = regions.get('scope', 'all')
+        state['captureRegions'] = {'kept': len(kept), 'keptBytes': sum(r['size'] for r in kept),
+                                   'tracked': regions.get('tracked_regions', len(kept)), 'trackedBytes': regions.get('tracked_bytes', sum(r['size'] for r in kept))}
+        if scope == 'reachable' and 'scope' not in regions:
+            state['captureScopeNote'] = 'This Kerncap runtime predates capture scopes and snapshotted every allocation; rerun scripts/setup-kernel-tuning.py to capture only what the kernel can reach'
         original_text = (root / 'original-source').read_text()
         state['capturedSource'] = original_text[state['source']['start']:state['source']['end']]
     elif op == 'run':
@@ -470,8 +502,12 @@ def main(root, request):
         argv = [cfg['replay'], str(capture), '--hsaco', str(hsaco), '--iterations', str(iterations), '--json', '--hip-launch']
         output = run / 'replay.json'
         with output.open('wb') as stdout, log.open('ab') as stderr:
-            p = subprocess.run(argv, stdout=stdout, stderr=stderr, timeout=540)
-        if p.returncode: raise RuntimeError('Isolated replay failed; see job.log')
+            p = calibration.run_tree(argv, 540, stdout=stdout, stderr=stderr)
+        if p.returncode:
+            hint = ''
+            if state.get('captureScope') == 'reachable':
+                hint = '. The capture kept only the allocations reachable from the kernel\'s arguments; if the kernel reaches memory another way, open a new session and capture with config.captureScope "all"'
+            raise RuntimeError('Isolated replay failed; see job.log' + hint)
         replay = json.loads(output.read_text())
         if replay['execution']['mode'] != 'stateless': raise ValueError('Replay must restore captured inputs on each iteration')
         metrics = metrics_for(replay, resources, isa, request.get('work', {}))
@@ -503,7 +539,7 @@ def main(root, request):
         if len(mappings) > 16: raise ValueError('At most 16 counter mappings per run')
         if request.get('autoCounters', True):
             try:
-                available = subprocess.run([cfg['profiler'], '--list-avail'], capture_output=True, text=True, timeout=30)
+                available = calibration.run_tree([cfg['profiler'], '--list-avail'], 30, capture_output=True, text=True)
                 if available.returncode: raise ValueError('Counter discovery failed')
                 names = set(re.findall(r'Counter_Name\s*:\s*(\w+)', available.stdout))
                 defaults = [('MeanOccupancyPerCU', 'Occupancy', 'waves/CU'), ('LDSBankConflict', 'LDS bank conflicts', '%'), ('SQ_INSTS_VEC32_VALU_WMMA', 'WMMA issued', 'instructions')]

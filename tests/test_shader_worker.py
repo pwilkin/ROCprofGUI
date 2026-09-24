@@ -188,6 +188,11 @@ class SessionTests(unittest.TestCase):
             w.main(self.root, {'op': 'capture'})
         self.assertEqual(list(self.root.glob('capture-*')), [])
 
+    def test_timeout_kills_the_whole_process_tree(self):
+        spec = importlib.util.spec_from_file_location('tuning_tests', Path(__file__).with_name('test_tuning_worker.py'))
+        helpers = importlib.util.module_from_spec(spec); spec.loader.exec_module(helpers)
+        helpers.assert_tree_killed(self, w.run_tree, self.root)
+
     def test_missing_runtime_points_at_the_setup_script(self):
         self.state()
         with self.assertRaisesRegex(ValueError, 'setup-shader-tuning'):

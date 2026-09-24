@@ -182,15 +182,20 @@ The desktop app starts a Model Context Protocol server **by default** on every l
 
 It binds loopback `127.0.0.1:8765` only and never a routable interface. Requests without a matching `Authorization: Bearer <token>` header are rejected with 401. The token is 32 bytes read from `/dev/urandom`, written once with `create_new` and mode `0600`, and reused on later launches; a token shorter than 32 characters or outside `[A-Za-z0-9_-]` is refused. It exposes 31 tools over the same analysis core as the GUI, with caps of 32 connections and 16 sessions. One tool runs at a time; a concurrent call is rejected with `-32001` rather than queued. There is no event replay or resumption, and cancelling a tool does not roll back writes it already made.
 
-Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and tuning sessions under `kernel-tuning/sessions/` and `shader-tuning/sessions/`. An analysis job deletes its folder when it succeeds and keeps only its logs when it fails; `profile_run` and `profile_start` output stays until you delete it, since it is the capture itself.
+Tool calls are serialized: while one runs, others are refused with "Another MCP action is running". There are two exceptions:
 
-A tuning session's captured inputs are large. A HIP capture snapshots every allocation the kernel's arguments point into, which for llama.cpp includes the whole model's weight pool (5 GB for a 9B IQ4_NL model), and each run's output validation briefly dumps as much again. Disk use is bounded:
+- **Status reads:** `tuning_status` and `profile_status` only read state, so they answer at once. A client can watch a long capture or run while it is still in progress.
+- **Retries:** a call identical to the running one (same tool, same arguments) joins it and receives its response. This is what a client does after its connection drops mid-call and it reconnects. A response the server could not deliver is kept for 30 minutes, and an identical retry receives it instead of running the call again. A call whose response was delivered runs anew when repeated.
+
+Everything the application writes for itself lives under `~/.rocprofgui`: the bearer token at `mcp/token`, MCP job output under `mcp/jobs/`, and tuning sessions under `kernel-tuning/sessions/` and `shader-tuning/sessions/`. An analysis job deletes its folder when it succeeds and keeps only its logs when it fails; `profile_run` and `profile_start` output stays until you delete it, since it is the capture itself. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
+
+A tuning session's captured inputs can be large. By default a HIP capture keeps only the allocations the kernel's arguments reach: the scan follows pointers inside allocations of up to 64 MiB, which covers pointer tables, and keeps larger allocations whole. An application that allocates tensors separately then captures a GEMM in megabytes: 110 MB of Gufo's 78.5 GiB of allocations. One that puts all its weights in a single allocation, like llama.cpp, still captures that allocation (4.5 GB for a 9B IQ4_NL model). Each run's output validation briefly dumps as much again. `config.captureScope: "all"` snapshots every allocation in the process instead, for kernels that reach memory some other way. Disk use is bounded:
 
 - **Capture** refuses to start with less than 8 GiB free. A failed attempt deletes its partial snapshot, so retries do not pile up.
 - **Validation** is skipped, with the reason shown, when there isn't room to dump every region. Its dumps are deleted whether or not it succeeds.
 - **Closing** a session deletes its captured inputs and validation dumps, keeping results, logs and source backups. Sessions cannot be reopened, so nothing still usable is lost.
 - **At startup** the app does the same for sessions left by rocprof-studio processes that have exited, never touching another running instance's. Each pruned session records what it freed in `pruned.json`.
-- **Model downloads** stay in the application's normal cache: a capture no longer redirects `LLAMA_CACHE` into `~/.rocprofgui` unless `config.modelCache` asks for it. Set `ROCPROFGUI_HOME` to relocate that directory, or `--mcp-token-file` to move just the token. Nothing is written into the working directory, so the location does not depend on where you launch from. If you relocate the token, keep the new path out of version control and off shared storage — the token is the only thing standing between a local process and the tools below.
+- **Model downloads** stay in the application's normal cache: a capture no longer redirects `LLAMA_CACHE` into `~/.rocprofgui` unless `config.modelCache` asks for it.
 
 ```bash
 rocprof-studio --no-mcp                      # do not start the server
@@ -207,7 +212,7 @@ Profiling and tuning tools can launch programs and write files. `profile_run` ex
 
 ## Kernel tuning
 
-"Tune this kernel" on a selected dispatch opens a tuning session that captures a kernel's inputs, replays it, compiles candidate variants and can write a replacement source definition back to disk. It requires a GPU, `hipcc`, and a Kerncap runtime built by `scripts/setup-kernel-tuning.py` (which clones `AMDResearch/intellikit` pinned at `c5b2098` and applies `scripts/kerncap-replay.patch`). That script installs into `~/.rocprofgui/kernel-tuning/runtime`, which is where the app looks for it; both honour `ROCPROFGUI_HOME`.
+"Tune this kernel" on a selected dispatch opens a tuning session that captures a kernel's inputs, replays it, compiles candidate variants and can write a replacement source definition back to disk. It requires a GPU, `hipcc`, and a Kerncap runtime built by `scripts/setup-kernel-tuning.py`. The script clones `AMDResearch/intellikit` pinned at `c5b2098` and applies two patches: `scripts/kerncap-replay.patch` for replay timing, and `scripts/kerncap-capture-scope.patch`, which adds the reachable capture scope. Rerunning it on an existing checkout applies whichever patch is missing. That script installs into `~/.rocprofgui/kernel-tuning/runtime`, which is where the app looks for it; both honour `ROCPROFGUI_HOME`.
 
 Known rough edges, none of them hardware-dependent:
 

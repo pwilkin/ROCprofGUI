@@ -31,17 +31,21 @@ def main():
         run(['git', 'checkout', '--detach', PIN], source)
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
     if head != PIN: raise RuntimeError('Dependency checkout does not match pinned revision')
-    patch = REPO / 'scripts/kerncap-replay.patch'
-    applied = subprocess.run(['git', 'apply', '--reverse', '--check', str(patch)], cwd=source, capture_output=True)
-    if applied.returncode:
-        run(['git', 'apply', '--check', patch], source)
-        run(['git', 'apply', patch], source)
+    # Replay timing, and a capture scope that snapshots only the allocations a
+    # dispatch can reach. Each applies once, so an existing checkout picks up
+    # patches added later.
+    patches = [REPO / 'scripts/kerncap-replay.patch', REPO / 'scripts/kerncap-capture-scope.patch']
+    for patch in patches:
+        applied = subprocess.run(['git', 'apply', '--reverse', '--check', str(patch)], cwd=source, capture_output=True)
+        if applied.returncode:
+            run(['git', 'apply', '--check', patch], source)
+            run(['git', 'apply', patch], source)
     headers = root / 'rocm-headers'
     shutil.copytree(Path(args.rocm) / 'include/hsa', headers / 'hsa', dirs_exist_ok=True)
     run(['cmake', '-S', source / 'kerncap', '-B', build, '-DCMAKE_BUILD_TYPE=Release', f'-DROCM_PATH={args.rocm}', f'-DCMAKE_PREFIX_PATH={args.rocm}', f'-DCMAKE_HIP_ARCHITECTURES={args.arch}', f'-DCMAKE_HIP_FLAGS=-I{headers}', f'-DCMAKE_INSTALL_PREFIX={runtime}', f'-DCMAKE_INSTALL_RPATH={Path(args.rocm) / "lib"}'])
     run(['cmake', '--build', build, '-j4']); run(['cmake', '--install', build])
     shutil.copy2(source / 'LICENSE', runtime / 'LICENSE.intellikit')
-    (runtime / 'provenance.json').write_text(json.dumps({'repository': 'https://github.com/AMDResearch/intellikit', 'revision': PIN, 'patch': str(patch), 'architecture': args.arch, 'rocm': args.rocm}, indent=2))
+    (runtime / 'provenance.json').write_text(json.dumps({'repository': 'https://github.com/AMDResearch/intellikit', 'revision': PIN, 'patches': [str(p) for p in patches], 'architecture': args.arch, 'rocm': args.rocm}, indent=2))
     print(runtime)
 
 
