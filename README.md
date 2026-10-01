@@ -2,6 +2,8 @@
   <img src="website/docs/public/wordmark.svg" alt="rocprof studio" width="400">
 </p>
 
+<p align="center"><em>A GUI profiler for ROCm/RADV with a modern look and feel + agentic integration via MCP</em></p>
+
 rocprof studio opens the artifacts a GPU profiler already produced — decoded rocprofv3 output, kernel-trace and counter CSVs, SPM and PC-sampling JSON, ROCPD/legacy databases, raw ATT and RADV `.rgp` captures — and reconstructs the timeline, per-wave execution, ISA, source linkage, occupancy and counters, with evidence exports for what you saw. One Rust analysis core backs the Tauri 2 desktop app, a headless importer CLI and an MCP server; kernel- and shader-tuning sessions can capture, replay and compare variants of a single dispatch when you ask for them.
 
 **Documentation:** the full site is at <https://pwilkin.github.io/ROCprofGUI/> (built from [`website/`](website/)), covering installation, input formats, every view, the MCP tool reference and the tuning workflows. The sections below are the in-repo reference.
