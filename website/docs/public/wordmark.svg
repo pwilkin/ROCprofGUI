@@ -1,0 +1,21 @@
+<svg width="420" height="84" viewBox="0 0 420 84" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="rocprof studio">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f2545b"/>
+      <stop offset="1" stop-color="#f5a623"/>
+    </linearGradient>
+  </defs>
+  <style>
+    .word { fill: #1f2328; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 40px; font-weight: 600; letter-spacing: -0.5px; }
+    .word .accent { fill: url(#g); font-weight: 700; }
+    @media (prefers-color-scheme: dark) { .word { fill: #e6edf3; } }
+  </style>
+  <rect x="5" y="9" width="66" height="66" rx="16" fill="none" stroke="url(#g)" stroke-width="4"/>
+  <g fill="url(#g)">
+    <rect x="17.5" y="48" width="8.5" height="16" rx="2"/>
+    <rect x="29.5" y="34" width="8.5" height="30" rx="2"/>
+    <rect x="41.5" y="21" width="8.5" height="43" rx="2"/>
+    <rect x="53.5" y="40" width="8.5" height="24" rx="2"/>
+  </g>
+  <text x="88" y="56" class="word">rocprof <tspan class="accent">studio</tspan></text>
+</svg>

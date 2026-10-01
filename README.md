@@ -1,6 +1,16 @@
+<p align="center">
+  <img src="website/docs/public/wordmark.svg" alt="rocprof studio" width="400">
+</p>
+
+rocprof studio opens the artifacts a GPU profiler already produced — decoded rocprofv3 output, kernel-trace and counter CSVs, SPM and PC-sampling JSON, ROCPD/legacy databases, raw ATT and RADV `.rgp` captures — and reconstructs the timeline, per-wave execution, ISA, source linkage, occupancy and counters, with evidence exports for what you saw. One Rust analysis core backs the Tauri 2 desktop app, a headless importer CLI and an MCP server; kernel- and shader-tuning sessions can capture, replay and compare variants of a single dispatch when you ask for them.
+
+**Documentation:** the full site is at <https://pwilkin.github.io/ROCprofGUI/> (built from [`website/`](website/)), covering installation, input formats, every view, the MCP tool reference and the tuning workflows. The sections below are the in-repo reference.
+
+---
+
 # rocprof studio
 
-A local Rust + Tauri 2 workspace for inspecting ROCm profiling captures, with a React/TypeScript analysis interface. This is the first implemented foundation of a broader kernel engineering tool; **full rocprof-compute-viewer parity is not complete**.
+A local Rust + Tauri 2 workspace for inspecting ROCm profiling captures, with a React/TypeScript analysis interface. This is the first implemented foundation of a broader kernel engineering tool; full rocprof-compute-viewer parity is not complete.
 
 ![Trace workspace](docs/workspace.png)
 
@@ -121,7 +131,7 @@ cargo run -p profile-core -- /path/to/spm_results.json
 cargo run -p profile-core -- /path/to/ui_output_capture se0_simd0_slot0_wave0.json
 ```
 
-The headless CLI and the desktop use **different import dispatchers** and do not accept the same inputs. The CLI goes through `import::load_capture_options`, which has no `.rocprof-att` manifest arm, computes no input fingerprint and passes no cancellation flag. The desktop goes through `project::load_input_options`, which handles `.rocprof-att`, fingerprints the input before and after import, and is cancellable. A `.rocprof-att` manifest that the desktop opens is therefore rejected by `cargo run -p profile-core`.
+The headless CLI and the desktop use different import dispatchers and do not accept the same inputs. The CLI goes through `import::load_capture_options`, which has no `.rocprof-att` manifest arm, computes no input fingerprint and passes no cancellation flag. The desktop goes through `project::load_input_options`, which handles `.rocprof-att`, fingerprints the input before and after import, and is cancellable. A `.rocprof-att` manifest that the desktop opens is therefore rejected by `cargo run -p profile-core`.
 
 Regenerate the synthetic example through the same Rust importer used by the desktop:
 
@@ -178,7 +188,7 @@ ROCPROF_GUI_TEST_ATT=/path/to/raw/trace cargo test -p profile-core --test decode
 
 ## MCP server
 
-The desktop app starts a Model Context Protocol server **by default** on every launch. This is a deliberate choice, not an oversight: the server is the supported way to drive the analysis core from an agent or script, and it is on unless you pass `--no-mcp`.
+The desktop app starts a Model Context Protocol server by default on every launch. This is a deliberate choice, not an oversight: the server is the supported way to drive the analysis core from an agent or script, and it is on unless you pass `--no-mcp`.
 
 It binds loopback `127.0.0.1:8765` only and never a routable interface. Requests without a matching `Authorization: Bearer <token>` header are rejected with 401. The token is 32 bytes read from `/dev/urandom`, written once with `create_new` and mode `0600`, and reused on later launches; a token shorter than 32 characters or outside `[A-Za-z0-9_-]` is refused. It exposes 31 tools over the same analysis core as the GUI, with caps of 32 connections and 16 sessions. One tool runs at a time; a concurrent call is rejected with `-32001` rather than queued. There is no event replay or resumption, and cancelling a tool does not roll back writes it already made.
 
@@ -220,9 +230,9 @@ Known rough edges, none of them hardware-dependent:
 - Captured input snapshots can reach several GiB per session; the data-directory notes above describe how that is bounded and cleaned up.
 - A session cannot be reopened once its window or MCP session is closed, which is why closing deletes its captured inputs.
 
-Timing deltas reported by a session are **not a claimed speedup**: no counterbalanced A/B or clock-stability experiment is run. The qualification host was gfx1151, and the sampled kernel contains no WMMA or LDS instructions, so WMMA-heavy kernels and LDS bank-conflict behavior are unqualified.
+Timing deltas reported by a session are not a claimed speedup: no counterbalanced A/B or clock-stability experiment is run. The qualification host was gfx1151, and the sampled kernel contains no WMMA or LDS instructions, so WMMA-heavy kernels and LDS bank-conflict behavior are unqualified.
 
-What this surface does **not** do: there is no replay-equivalence gate proving a replayed kernel behaves like the original, no experiment structure over an immutable baseline, and no staged qualification of a candidate before its timings are reported. Read a session's output as a measurement of what it actually ran, not as a validated speedup.
+What this surface does not do: there is no replay-equivalence gate proving a replayed kernel behaves like the original, no experiment structure over an immutable baseline, and no staged qualification of a candidate before its timings are reported. Read a session's output as a measurement of what it actually ran, not as a validated speedup.
 
 ## Shader tuning (Vulkan, experimental)
 
@@ -264,7 +274,7 @@ The replay conditions and counters are `vkreplay` options, which can also be run
 
 ## RADV Vulkan captures (experimental)
 
-A `.rgp` capture written by Mesa's RADV driver can be opened directly, giving hardware counters, thread traces and kernel names from Vulkan compute. On gfx1151, which ROCm's AQLprofile filter excludes from SPM, this is the only route to hardware counters. The path is experimental: it is qualified on gfx1151 only, and full per-instruction data needs a patched RADV. **[docs/radv-profiling.md](docs/radv-profiling.md) gives the required steps**: building the patched driver, capturing, and opening.
+A `.rgp` capture written by Mesa's RADV driver can be opened directly, giving hardware counters, thread traces and kernel names from Vulkan compute. On gfx1151, which ROCm's AQLprofile filter excludes from SPM, this is the only route to hardware counters. The path is experimental: it is qualified on gfx1151 only, and full per-instruction data needs a patched RADV. [docs/radv-profiling.md](docs/radv-profiling.md) gives the required steps: building the patched driver, capturing, and opening.
 
 ```bash
 # Occupancy for every wave at any scale, plus counters (stock RADV)

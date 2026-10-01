@@ -9,7 +9,7 @@ npm run tauri dev           # development
 ./rocprof-studio            # an installed/built binary
 ```
 
-The full interface: capture tabs, the sidebar, the dockable workspace and every analysis view ([UI tour](/ui-tour), [Views reference](/views)). A desktop launch also starts the [MCP server](/mcp) by default and **reuses a service already running on the selected MCP port** if there is one.
+The full interface: capture tabs, the sidebar, the dockable workspace and every analysis view ([UI tour](/ui-tour), [Views reference](/views)). A desktop launch also starts the [MCP server](/mcp) by default and reuses a service already running on the selected MCP port if there is one.
 
 ## 2. Browser preview
 
@@ -17,7 +17,7 @@ The full interface: capture tabs, the sidebar, the dockable workspace and every 
 npm run dev                 # vite --host 127.0.0.1, port 1420 (strictPort)
 ```
 
-A pure-browser build that loads the **synthetic example** (`public/demo.json`) and has **no filesystem access**. Directory import and raw-trace import need the Rust desktop app; the browser preview says so when you try. It is intended for exploring the interface — and it is what the view screenshots on this site were captured from.
+A pure-browser build that loads the synthetic example (`public/demo.json`) and has no filesystem access. Directory import and raw-trace import need the Rust desktop app; the browser preview says so when you try. It is intended for exploring the interface, and it is what the view screenshots on this site were captured from.
 
 ## 3. Headless importer CLI
 
@@ -32,7 +32,7 @@ cargo run -q -p profile-core -- fixtures/transpose-ui --bundle                  
 cargo run -q -p profile-core -- fixtures/transpose-ui --hidden                        # hidden-latency analysis
 ```
 
-The CLI banner documents `CAPTURE_PATH [WAVE_ID | --bundle]`; `--hidden` is also accepted. Note the CLI uses a **different import dispatcher** from the GUI and **cannot open a `.rocprof-att` manifest** (use the desktop app for those); it also computes no project fingerprint and passes no cancellation flag.
+The CLI banner documents `CAPTURE_PATH [WAVE_ID | --bundle]`; `--hidden` is also accepted. Note the CLI uses a different import dispatcher from the GUI and cannot open a `.rocprof-att` manifest (use the desktop app for those); it also computes no project fingerprint and passes no cancellation flag.
 
 ## 4. Headless MCP server
 
@@ -68,7 +68,7 @@ The repository source defaults the token file to `.codex/mcp/token`, but the ins
 
 ### Application data directory
 
-Everything the app writes for itself lives under **`~/.rocprofgui`**: the bearer token (`mcp/token`), MCP job output (`mcp/jobs/`), and tuning sessions (`kernel-tuning/sessions/`, `shader-tuning/sessions/`). An analysis job deletes its folder on success and keeps only logs on failure; `profile_run`/`profile_start` output stays until you delete it (it *is* the capture). Nothing is written into the working directory.
+Everything the app writes for itself lives under `~/.rocprofgui`: the bearer token (`mcp/token`), MCP job output (`mcp/jobs/`), and tuning sessions (`kernel-tuning/sessions/`, `shader-tuning/sessions/`). An analysis job deletes its folder on success and keeps only logs on failure; `profile_run`/`profile_start` output stays until you delete it (it is the capture itself). Nothing is written into the working directory.
 
 | Variable | Effect |
 | --- | --- |

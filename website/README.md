@@ -23,7 +23,7 @@ website/
 ```bash
 cd website
 npm install
-npm run dev          # http://localhost:5173/rocprofgui/
+npm run dev          # http://localhost:5173/ROCprofGUI/
 ```
 
 ## Build
@@ -36,14 +36,14 @@ npm run preview      # serve the built site locally
 
 ## The base path (the one setting to get right)
 
-The site is served from `https://<owner>.github.io/<repo>/`, so the base must be `/<repo>/`. It is set in `docs/.vitepress/config.mts` and **defaults to `/rocprofgui/`** (the repository name). Override it at build time with `DOCS_BASE`:
+The site is served from `https://<owner>.github.io/<repo>/`, so the base must be `/<repo>/` — and GitHub Pages project URLs are case-sensitive. It is set in `docs/.vitepress/config.mts` and defaults to `/ROCprofGUI/` (the repository name, exact case). Override it at build time with `DOCS_BASE`:
 
 ```bash
 DOCS_BASE=/my-repo/ npm run build   # a differently-named repo
 DOCS_BASE=/        npm run build    # user/org root (owner.github.io) or a custom domain
 ```
 
-**If your repository is not named `rocprofgui`, set `DOCS_BASE` (or edit the default in `config.mts`) — this is the only change a human must make.** The Pages workflow passes `DOCS_BASE` through from a single env value.
+If your repository is not named `ROCprofGUI` (exact case), set `DOCS_BASE` or edit the default in `config.mts`; this is the only change a human must make. The Pages workflow derives `DOCS_BASE` from the repository name automatically.
 
 ## Deploy to GitHub Pages
 

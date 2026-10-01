@@ -1,14 +1,14 @@
 # Views reference
 
-One section per sidebar view. Unless a caption says otherwise, each screenshot is the **bundled synthetic example** in browser preview — the values are illustrative, not GPU measurements.
+One section per sidebar view. Unless a caption says otherwise, each screenshot is the bundled synthetic example in browser preview; the values are illustrative, not GPU measurements.
 
-A banner is worth repeating here: **no metric or diagram below is evidence that unobserved CUs, spills, bank conflicts or graph replays are zero.** "Not collected" is always shown distinctly from an observed numeric zero. See [Limits & caveats](/limits).
+One rule applies to every view: no metric or diagram below is evidence that unobserved CUs, spills, bank conflicts or graph replays are zero. "Not collected" is always shown distinctly from an observed numeric zero. See [Limits & caveats](/limits).
 
 ## ISA reference
 
 ![ISA reference view](/img/view-reference.png)
 
-An offline catalogue of AMD instruction definitions for **CDNA 1–4 and RDNA 1/2/3/3.5/4** (≈10,628 entries): encodings, operand formats, and WMMA/MFMA/SWMMAC/SMFMAC matrix-type compatibility. It is searchable and is reachable from a selected trace instruction via **Instruction reference**. The data is regenerated with `scripts/build-isa-reference.py`.
+An offline catalogue of AMD instruction definitions for CDNA 1–4 and RDNA 1/2/3/3.5/4 (≈10,628 entries): encodings, operand formats, and WMMA/MFMA/SWMMAC/SMFMAC matrix-type compatibility. It is searchable and is reachable from a selected trace instruction via **Instruction reference**. The data is regenerated with `scripts/build-isa-reference.py`.
 
 ![Matrix-type compatibility (desktop application)](/img/isa-matrix-types.png)
 *The matrix-type compatibility matrix.*
@@ -29,7 +29,7 @@ What the numbers mean:
 
 ![Compute fabric view](/img/view-hardware.png)
 
-A CU/SIMD residency diagram plus static register/LDS metadata, with **explicit unknown states** where a value was not recorded. Use it to see which compute units a dispatch actually occupied.
+A CU/SIMD residency diagram plus static register/LDS metadata, with explicit unknown states where a value was not recorded. Use it to see which compute units a dispatch actually occupied.
 
 ![Compute fabric (desktop application, alternate capture)](/img/compute-fabric.png)
 
@@ -37,7 +37,7 @@ A CU/SIMD residency diagram plus static register/LDS metadata, with **explicit u
 
 ![Activity summary view](/img/view-summary.png)
 
-Activity cost plus a hardware-activity model (MI200/MI300 ATT activity bars, peak ratios) and a per-CU table. The hardware-activity model runs in a Web Worker; on an unsupported architecture, a missing ATT counter, or an input above the sample cap it falls back to a synchronous path and reports the limitation rather than guessing. Input is capped at **2,000,000 samples**.
+Activity cost plus a hardware-activity model (MI200/MI300 ATT activity bars, peak ratios) and a per-CU table. The hardware-activity model runs in a Web Worker; on an unsupported architecture, a missing ATT counter, or an input above the sample cap it falls back to a synchronous path and reports the limitation rather than guessing. Input is capped at 2,000,000 samples.
 
 ![Activity summary (desktop application)](/img/native-activity-summary.png)
 
@@ -53,25 +53,25 @@ Totals, stall-reason breakdown and a flamegraph for host-trap or stochastic PC-s
 
 ![Occupancy view](/img/view-occupancy.png)
 
-Per-SE and per-kernel occupancy plots — how many waves were resident over time. Export is available as SVG.
+Per-SE and per-kernel occupancy plots: how many waves were resident over time. Export is available as SVG.
 
 ## Kernel dispatches
 
 ![Kernel dispatches view](/img/view-dispatch.png)
 
-The dispatch list/timeline with host-API call association. This view reports **summed durations and interval union separately**, because kernel intervals overlap and those two numbers answer different questions (total work vs wall-clock span). See [Export & evidence](/export). A selected dispatch is also where **"Tune this kernel"** ([Kernel tuning](/kernel-tuning)) is offered.
+The dispatch list/timeline with host-API call association. This view reports summed durations and interval union separately, because kernel intervals overlap and those two numbers answer different questions (total work vs wall-clock span). See [Export & evidence](/export). A selected dispatch is also where **"Tune this kernel"** ([Kernel tuning](/kernel-tuning)) is offered.
 
 ## Instruction hotspots
 
 ![Instruction hotspots view](/img/view-hotspots.png)
 
-Instruction-cost histograms with an independent mean-latency axis — which instructions dominated, by hits and by cost.
+Instruction-cost histograms with an independent mean-latency axis: which instructions dominated, by hits and by cost.
 
 ## Source flamegraph
 
 ![Source flamegraph view](/img/view-flame.png)
 
-A source-to-ISA latency flamegraph: cost rolled up through the source hierarchy. The viewport is sampled for responsiveness, and above its budget it **refuses rather than silently downsamples**.
+A source-to-ISA latency flamegraph: cost rolled up through the source hierarchy. The viewport is sampled for responsiveness, and above its budget it refuses rather than silently downsampling.
 
 ## Marker scopes
 
@@ -88,10 +88,10 @@ An instrumentation-marker timeline and flamegraph with an integrated marker → 
 
 Two kinds of counter work:
 
-- **Scalar expressions** (*Add counter*) — safe arithmetic over recorded counters (`C0`, …). Up to 64 definitions per capture; synchronous evaluation over up to 500,000 samples.
-- **Named-axis tensor definitions** — reductions, broadcasting, slices/deltas, comparisons, temporary variables, and a multi-file definition library. These run in a Web Worker with hard caps (1,000,000 input samples, 4,000,000 raw cells, …; see [Limits](/limits)) and a 30-second timeout; exceeding a cap **throws**.
+- **Scalar expressions** (*Add counter*): safe arithmetic over recorded counters (`C0`, …). Up to 64 definitions per capture; synchronous evaluation over up to 500,000 samples.
+- **Named-axis tensor definitions**: reductions, broadcasting, slices/deltas, comparisons, temporary variables, and a multi-file definition library. These run in a Web Worker with hard caps (1,000,000 input samples, 4,000,000 raw cells, …; see [Limits](/limits)) and a 30-second timeout; exceeding a cap throws.
 
-Raw counter series keep their names and scopes; **no architecture-derived normalization is guessed**.
+Raw counter series keep their names and scopes; no architecture-derived normalization is guessed.
 
 ![Counter expressions (desktop application)](/img/counter-expressions.png)
 *Scalar counter expressions in the desktop app.*
