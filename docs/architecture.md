@@ -32,7 +32,7 @@ flowchart LR
 | Views | `src/components` | Canvas timelines, SVG plots, paged ISA table, source mapping, CU/LDS representation |
 | App | `src/App.tsx` | Capture tabs, selected wave/token, history, clock range, navigation and selection export |
 | Shader tuning (Vulkan) | `tools/vkcap/`, `src-tauri/src/shader_worker.py`, `src/components/ShaderTuning.tsx` | Capture layer recording one dispatch with its buffers before and after; isolated replay harness; SPIR-V matching and recipe recovery against ggml shader builds; sessions share `tuning.rs` with HIP kernel tuning |
-| MCP server | `src-tauri/src/mcp.rs` | Default-on loopback MCP endpoint, bearer token, 27 tools including `profile_run`; second IPC surface beside the Tauri commands |
+| MCP server | `src-tauri/src/mcp.rs` | Default-on loopback MCP endpoint, bearer token, 31 tools including `profile_run` (combinable rocprofv3 counters/traces/ATT) and the gated `profile_start`/`profile_trigger`/`profile_status`/`profile_stop` live profiling (RADV file triggers or rocprofv3 attach windows); second IPC surface beside the Tauri commands |
 | Kernel tuning | `src-tauri/src/tuning.rs`, `tuning_worker.py`, `tuning_calibration.py` | Input capture, Kerncap replay, candidate compilation and source write-back |
 | Application data | `src-tauri/src/appdir.rs` | Single owner of the writable data directory: `$ROCPROFGUI_HOME`, else `~/.rocprofgui`. Nothing the app writes goes to the working directory |
 
