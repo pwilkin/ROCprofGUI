@@ -683,39 +683,11 @@ fn load_input_checked(
     if expected.is_some_and(|expected| expected != &fingerprint) {
         return Err("Project capture input changed since import; open the capture separately to inspect the new data".into());
     }
-    let mut capture = if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("rocprof-capture"))
-    {
-        crate::capture_archive::read(&path, &cancelled)
-    } else if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("rgp"))
-    {
-        crate::rgp::load_cancellable(&path, &cancelled)
-    } else if (path.is_dir() && !path.join("filenames.json").exists())
-        || path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("att") || e.eq_ignore_ascii_case("rocprof-att"))
-    {
-        crate::decoder::decode_with_wave_states(
-            &path,
-            &Default::default(),
-            &cancelled,
-            load_wave_states,
-        )
-    } else if path
-        .extension()
-        .is_some_and(|e| e == "rpd" || e == "rocpd" || e == "db" || e == "sqlite")
-    {
-        crate::rocpd::load_cancellable(&path, cancelled.clone())
-    } else if path.extension().is_some_and(|e| e == "csv") {
-        crate::import::load_csv_cancellable(&path, &cancelled)
-    } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("irpf")) {
-        crate::irpf::load_cancellable(&path, &cancelled)
-    } else {
-        crate::load_capture_options(&path, load_wave_states, sampling_method)
-    }?;
+    // One cancellable router handles every format (it used to be duplicated here
+    // only to reach the `_cancellable` variants); this wraps it with the input
+    // fingerprint that guards capture-archive overwrites.
+    let mut capture =
+        crate::load_capture_options(&path, &cancelled, load_wave_states, sampling_method)?;
     if fingerprint != crate::input_fingerprint::compute(&path, &cancelled)? {
         return Err("Capture inputs changed during import".into());
     }

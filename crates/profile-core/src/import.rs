@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
 };
 
 /// Default record cap; the effective cap is [`crate::caps::max_records`], which
@@ -90,17 +91,29 @@ pub fn load_capture_with_wave_states(
     path: &Path,
     load_wave_states: bool,
 ) -> Result<Capture, String> {
-    load_capture_options(path, load_wave_states, None)
+    load_capture_options(path, &Arc::new(AtomicBool::new(false)), load_wave_states, None)
 }
 pub fn sampling_methods(path: &Path) -> Result<Vec<String>, String> {
     let value = json(path)?;
     crate::pc_sampling::methods(arr(&value["rocprofiler-sdk-tool"]))
 }
+/// The single format-dispatch router. It always calls the cancellable importer
+/// variants, threading one `&AtomicBool` so every path (CLI, MCP, desktop
+/// project staging) is interruptible — previously the CLI went through a second,
+/// non-cancellable copy of this dispatch in `project.rs`. `project::load_input`
+/// wraps this with the input fingerprint; `load_capture` is a thin wrapper with a
+/// fresh flag for the internal/decoder callers that do not need cancellation.
+/// (rocpd needs a `'static` flag for its progress callback, so the flag is an
+/// `Arc`; the other importers borrow it.)
 pub fn load_capture_options(
     path: &Path,
+    cancelled: &Arc<AtomicBool>,
     load_wave_states: bool,
     sampling_method: Option<&str>,
 ) -> Result<Capture, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Import cancelled".into());
+    }
     let path = path.canonicalize().map_err(err)?;
     if sampling_method.is_some() && !path.extension().is_some_and(|e| e == "json") {
         return Err("PC sampling selection requires a raw SDK JSON input".into());
@@ -112,14 +125,14 @@ pub fn load_capture_options(
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("rocprof-capture"))
     {
-        return crate::capture_archive::read(&path, &std::sync::atomic::AtomicBool::new(false));
+        return crate::capture_archive::read(&path, cancelled);
     }
     if path.is_dir() {
         if !path.join("filenames.json").exists() {
             return crate::decoder::decode_with_wave_states(
                 &path,
                 &Default::default(),
-                &std::sync::atomic::AtomicBool::new(false),
+                cancelled,
                 load_wave_states,
             );
         }
@@ -129,13 +142,13 @@ pub fn load_capture_options(
         .extension()
         .is_some_and(|x| x == "rpd" || x == "rocpd" || x == "db" || x == "sqlite")
     {
-        return crate::rocpd::load(&path);
+        return crate::rocpd::load_cancellable(&path, Arc::clone(cancelled));
     }
     if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("rgp")) {
-        return crate::rgp::load(&path);
+        return crate::rgp::load_cancellable(&path, cancelled);
     }
     if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("irpf")) {
-        return crate::irpf::load(&path);
+        return crate::irpf::load_cancellable(&path, cancelled);
     }
     // A Loom compile report is a .json file, so it must be recognised before the
     // json-to-SPM arm below. It is matched by the .compile-report.json suffix or
@@ -144,16 +157,16 @@ pub fn load_capture_options(
     if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"))
         && crate::loom_report::is_loom_report(&path)
     {
-        return crate::loom_report::load(&path);
+        return crate::loom_report::load_cancellable(&path, cancelled);
     }
     match path.file_name().and_then(|p|p.to_str()) {
         Some("filenames.json" | "code.json" | "occupancy.json") => load_ui(path.parent().unwrap(), load_wave_states),
-        _ if path.extension().is_some_and(|x|x == "att") => crate::decoder::decode_with_wave_states(&path, &Default::default(), &std::sync::atomic::AtomicBool::new(false), load_wave_states),
-        _ if path.extension().is_some_and(|x|x == "csv") => load_csv(&path),
+        _ if path.extension().is_some_and(|x| x == "att" || x.eq_ignore_ascii_case("rocprof-att")) => crate::decoder::decode_with_wave_states(&path, &Default::default(), cancelled, load_wave_states),
+        _ if path.extension().is_some_and(|x|x == "csv") => load_csv_cancellable(&path, cancelled),
         _ if path.extension().is_some_and(|x|x == "json") => load_spm(&path, sampling_method),
         // An IRPF bundle (HRX native profile) carries its own magic, so a
         // differently-named file is still recognised rather than rejected.
-        _ if is_irpf_file(&path) => crate::irpf::load(&path),
+        _ if is_irpf_file(&path) => crate::irpf::load_cancellable(&path, cancelled),
         _ => Err("Open a decoded ui_output directory, rocprofv3 kernel trace CSV, SPM results JSON, a ROCm SDK ROCPD database, an HRX IRPF profile bundle, or a RADV Vulkan .rgp capture. Raw ATT requires the decoder Python package and V2 library.".into()),
     }
 }

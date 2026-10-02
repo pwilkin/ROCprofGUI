@@ -137,7 +137,7 @@ cargo run -p profile-core -- /path/to/spm_results.json
 cargo run -p profile-core -- /path/to/ui_output_capture se0_simd0_slot0_wave0.json
 ```
 
-The headless CLI and the desktop use different import dispatchers and do not accept the same inputs. The CLI goes through `import::load_capture_options`, which has no `.rocprof-att` manifest arm, computes no input fingerprint and passes no cancellation flag. The desktop goes through `project::load_input_options`, which handles `.rocprof-att`, fingerprints the input before and after import, and is cancellable. A `.rocprof-att` manifest that the desktop opens is therefore rejected by `cargo run -p profile-core`.
+The headless CLI, the desktop and the MCP server share one import router. The CLI (`cargo run -p profile-core`) goes through `project::load_input`, the same entry the desktop and MCP use: a single `import::load_capture_options` dispatch that always calls the cancellable importer variants, wrapped with the input file-set fingerprint. So the CLI accepts the same inputs (including `.rocprof-att` manifests), computes the input fingerprint (setting `input_path`/`input_fingerprint`, which the capture-archive overwrite guards key on) and is cancellable, exactly as the desktop is.
 
 Regenerate the synthetic example through the same Rust importer used by the desktop:
 

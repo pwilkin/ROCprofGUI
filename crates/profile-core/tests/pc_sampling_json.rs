@@ -1,6 +1,6 @@
 use profile_core::{capture_archive, load_capture, Capture};
 use serde_json::{json, Value};
-use std::{fs, sync::atomic::AtomicBool};
+use std::{fs, sync::atomic::AtomicBool, sync::Arc};
 
 fn sample(object: u64, offset: u64, issued: u64, reason: &str, index: i64) -> Value {
     json!({"inst_index": index, "record": {
@@ -358,8 +358,8 @@ fn explicit_method_selection_keeps_distributions_separate_and_retains_spm() {
     assert!(load_capture(&path)
         .unwrap_err()
         .contains("explicit method selection"));
-    let host = profile_core::load_capture_options(&path, true, Some("host-trap")).unwrap();
-    let stochastic = profile_core::load_capture_options(&path, true, Some("stochastic")).unwrap();
+    let host = profile_core::load_capture_options(&path, &Arc::new(AtomicBool::new(false)), true, Some("host-trap")).unwrap();
+    let stochastic = profile_core::load_capture_options(&path, &Arc::new(AtomicBool::new(false)), true, Some("stochastic")).unwrap();
     assert_eq!(
         host.instructions.iter().map(|i| i.pc_samples).sum::<u64>(),
         1
@@ -381,11 +381,11 @@ fn explicit_method_selection_keeps_distributions_separate_and_retains_spm() {
         serde_json::to_value(&host.counters).unwrap(),
         serde_json::to_value(&stochastic.counters).unwrap()
     );
-    assert!(profile_core::load_capture_options(&path, true, Some("unknown")).is_err());
+    assert!(profile_core::load_capture_options(&path, &Arc::new(AtomicBool::new(false)), true, Some("unknown")).is_err());
     value["rocprofiler-sdk-tool"][0]["buffer_records"]["pc_sample_host_trap"] = json!([]);
     fs::write(&path, value.to_string()).unwrap();
     assert!(
-        profile_core::load_capture_options(&path, true, Some("host-trap"))
+        profile_core::load_capture_options(&path, &Arc::new(AtomicBool::new(false)), true, Some("host-trap"))
             .unwrap_err()
             .contains("unavailable")
     );

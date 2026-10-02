@@ -4,11 +4,12 @@ fn main() {
         eprintln!("Usage: profile-core CAPTURE_PATH [WAVE_ID | --bundle | --hidden]");
         std::process::exit(2);
     };
-    let result =
-        profile_core::load_capture(std::path::Path::new(&path)).and_then(|mut capture| match args
-            .next()
-            .as_deref()
-        {
+    // Through the same fingerprinted, cancellable router the GUI and MCP use, so
+    // the CLI computes the input fingerprint and sets input_path/input_fingerprint
+    // (which the capture-archive overwrite guards key on) instead of diverging.
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = profile_core::project::load_input(std::path::Path::new(&path), cancelled)
+        .and_then(|mut capture| match args.next().as_deref() {
             Some("--hidden") => {
                 serde_json::to_value(profile_core::hidden::analyze_capture(&capture)?)
                     .map_err(|e| e.to_string())
