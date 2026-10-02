@@ -1,6 +1,7 @@
 pub mod att_manifest;
 pub mod att_runs;
 mod cancellable_read;
+pub mod caps;
 pub mod capture_archive;
 pub mod catalog_transfer;
 pub mod code_object_files;

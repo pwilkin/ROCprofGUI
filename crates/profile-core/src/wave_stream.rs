@@ -90,7 +90,7 @@ impl<'de, F: FnMut(Token) -> Result<(), String>> Visitor<'de> for TokensSeed<'_,
         Ok(())
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        for _ in 0..crate::import::MAX_ROWS {
+        for _ in 0..crate::caps::max_records() {
             let Some(row) = seq.next_element::<Value>()? else {
                 return Ok(());
             };

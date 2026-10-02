@@ -149,6 +149,18 @@ See [architecture](docs/architecture.md) for how the layers divide and where the
 
 Imports are capped at 256 MiB per file and two million records in the main record arrays. The 256 MiB per-file cap covers sidecar, JSON and CSV inputs; a ROCPD/`.rpd` database is bounded only by the two-million-record per-query limit, so a larger database can still be opened. Embedded source snapshots are capped at 2 MiB per file / 16 MiB per capture; larger native source mappings use absolute file references up to 512 MiB per file (see Workspace projects). Up to six native captures can remain open. Visible-wave queries reject windows exceeding 128 wave files or 500,000 tokens rather than silently sampling them. Hidden-latency analysis rejects captures above four million detailed tokens. The UI pages timeline lanes and ISA rows; it is not yet an indexed out-of-core viewer. See the architecture for the scalability plan.
 
+Several of these caps are **guardrails you can move**, not silent sampling thresholds. Set an environment variable before launch and the import still *rejects* anything past the configured bound — it just rejects at a different point, with the effective number in the message. The default equals the shipped value in every case, and a blank, non-numeric or zero value falls back to the default.
+
+| Variable | Cap it sets | Default |
+|---|---|---|
+| `ROCPROF_MAX_RECORDS` | records in the main import arrays (`check_rows` and the streamed wave-token limit) | 2,000,000 |
+| `ROCPROF_MAX_FILE_MIB` | per-file size (MiB) for sidecar/JSON/CSV inputs | 256 |
+| `ROCPROF_MAX_HIDDEN_TOKENS` | detailed tokens hidden-latency analysis will load | 4,000,000 |
+| `ROCPROF_MAX_ATT_TRACES` | trace files in one ATT manifest | 256 |
+| `ROCPROF_MAX_ATT_CODE_OBJECTS` | code-object files in one ATT manifest | 256 |
+
+These are the caps that bite live llama.cpp decode profiling, where the path streams row by row (CSV), loads waves one at a time (hidden latency) or is a plain file-count check (ATT manifest), and is cancellable. They apply everywhere the analysis core runs — desktop, headless CLI and MCP server — so an agent driving a large decode capture over MCP raises them the same way. The 128-wave / 500,000-token visible-wave budgets and the 4,096-wave statistics budget are **not** configurable: that query loads each selected wave fully into memory and its numbers are mirrored in the frontend, so it stays fixed until the indexed out-of-core viewer lands.
+
 Synthetic example values are not GPU measurements. Coverage cannot be proven from a dispatch CSV alone. No metric or diagram should be read as evidence that unobserved CUs, spills, bank conflicts or graph replays are zero.
 
 ## Raw ATT setup

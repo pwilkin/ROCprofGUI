@@ -254,6 +254,7 @@ pub fn analyze_capture_cancellable(
     let engines: BTreeSet<_> = capture.waves.iter().map(|w| w.se).collect();
     let mut result = HiddenAnalysis::default();
     let mut count = 0;
+    let max_tokens = crate::caps::max_hidden_tokens();
     for se in engines {
         check(cancelled)?;
         let mut loaded = vec![];
@@ -262,8 +263,8 @@ pub fn analyze_capture_cancellable(
         for (position, index) in capture.waves.iter().enumerate().filter(|(_, w)| w.se == se) {
             let wave = crate::import::load_wave_at_cancellable(capture, position, cancelled)?;
             count += wave.tokens.len();
-            if count > 4_000_000 {
-                return Err("Hidden-latency analysis exceeds four million tokens; import a smaller capture until the indexed analysis worker is available".into());
+            if count > max_tokens {
+                return Err(format!("Hidden-latency analysis exceeds {max_tokens} tokens; import a smaller capture until the indexed analysis worker is available"));
             }
             if let Some(cu) = wave.cu {
                 known_cus.insert(cu);

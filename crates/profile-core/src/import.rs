@@ -6,17 +6,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_FILE: u64 = 256 * 1024 * 1024;
-pub(crate) const MAX_ROWS: usize = 2_000_000;
+/// Default record cap; the effective cap is [`crate::caps::max_records`], which
+/// this equals unless `ROCPROF_MAX_RECORDS` overrides it. Kept as a constant for
+/// the boundary tests that allocate exactly at the default.
+#[cfg(test)]
+pub(crate) const MAX_ROWS: usize = crate::caps::MAX_RECORDS_DEFAULT;
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 fn json(path: &Path) -> Result<Value, String> {
     let size = fs::metadata(path).map_err(err)?.len();
-    if size > MAX_FILE {
+    if size > crate::caps::max_file_bytes() {
         return Err(format!(
-            "{} exceeds the 256 MiB per-file import limit",
-            path.display()
+            "{} exceeds the {} MiB per-file import limit",
+            path.display(),
+            crate::caps::max_file_mib()
         ));
     }
     serde_json::from_reader(fs::File::open(path).map_err(err)?)
@@ -65,8 +69,15 @@ fn required_number(v: &Value, field: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("Missing or invalid {field}"))
 }
 fn check_rows(n: usize) -> Result<(), String> {
-    if n > MAX_ROWS {
-        Err("Import exceeds the 2 million record limit; select a smaller capture window".into())
+    check_rows_cap(n, crate::caps::max_records())
+}
+/// Row check against an already-resolved cap, so per-record loops read the
+/// effective cap once instead of per row.
+fn check_rows_cap(n: usize, cap: usize) -> Result<(), String> {
+    if n > cap {
+        Err(format!(
+            "Import exceeds the {cap} record limit; select a smaller capture window"
+        ))
     } else {
         Ok(())
     }
@@ -707,7 +718,8 @@ fn deserialize_wave_tokens<'de, D: serde::Deserializer<'de>>(
                 }
             }
             let mut tokens = Vec::new();
-            while tokens.len() < MAX_ROWS {
+            let cap = crate::caps::max_records();
+            while tokens.len() < cap {
                 let Some(row) = seq.next_element::<Value>()? else {
                     return Ok(tokens);
                 };
@@ -796,10 +808,11 @@ fn load_wave_using(
         .ok_or("Wave is not part of this capture")?
         .id;
     let path = safe_path(&c.root, id)?;
-    if fs::metadata(&path).map_err(err)?.len() > MAX_FILE {
+    if fs::metadata(&path).map_err(err)?.len() > crate::caps::max_file_bytes() {
         return Err(format!(
-            "{} exceeds the 256 MiB per-file import limit",
-            path.display()
+            "{} exceeds the {} MiB per-file import limit",
+            path.display(),
+            crate::caps::max_file_mib()
         ));
     }
     let data = read(fs::File::open(&path).map_err(err)?)?;
@@ -878,8 +891,11 @@ pub(crate) fn load_csv_cancellable(
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<Capture, String> {
     crate::cancellable_read::check(cancelled)?;
-    if fs::metadata(path).map_err(err)?.len() > MAX_FILE {
-        return Err("CSV exceeds 256 MiB import limit".into());
+    if fs::metadata(path).map_err(err)?.len() > crate::caps::max_file_bytes() {
+        return Err(format!(
+            "CSV exceeds {} MiB import limit",
+            crate::caps::max_file_mib()
+        ));
     }
     let file = fs::File::open(path).map_err(err)?;
     load_csv_reader(path, file, cancelled)
@@ -1104,6 +1120,7 @@ fn load_spm(path: &Path, sampling_method: Option<&str>) -> Result<Capture, Strin
                 crate::spm_dimensions::instances(definition).map(|table| (key.clone(), table))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let record_cap = crate::caps::max_records();
         for (ordinal, group) in optional_array(
             &tool["callback_records"]["spm_counter_collection"],
             "SPM collections",
@@ -1178,7 +1195,7 @@ fn load_spm(path: &Path, sampling_method: Option<&str>) -> Result<Capture, Strin
                 raw.entry(key).or_default().push((timestamp, val));
                 origin = origin.min(timestamp);
                 count += 1;
-                check_rows(count)?;
+                check_rows_cap(count, record_cap)?;
             }
         }
     }

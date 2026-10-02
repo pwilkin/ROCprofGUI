@@ -27,14 +27,16 @@ pub struct Object {
 }
 impl AttManifest {
     pub fn resolve(&mut self, root: &Path) -> Result<(), String> {
+        let max_traces = crate::caps::max_att_traces();
+        let max_code_objects = crate::caps::max_att_code_objects();
         if self.version != 1
             || self.traces.is_empty()
-            || self.traces.len() > 256
-            || self.code_objects.len() > 256
+            || self.traces.len() > max_traces
+            || self.code_objects.len() > max_code_objects
         {
-            return Err(
-                "ATT manifest requires version 1, 1–256 traces and at most 256 code objects".into(),
-            );
+            return Err(format!(
+                "ATT manifest requires version 1, 1–{max_traces} traces and at most {max_code_objects} code objects"
+            ));
         }
         fn file(path: &mut PathBuf, root: &Path) -> Result<(), String> {
             if path.as_os_str().len() > 8192 {
