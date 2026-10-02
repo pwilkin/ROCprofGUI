@@ -17,7 +17,7 @@ switch(a.analysis){
    const blob=await timelineDocument({label:c.name,unit:c.unit,bounds:a.range||[c.start,c.end],timePages:a.timePages||1,lanesPerPage:a.lanesPerPage||12,stacked:true,load:async range=>marks.filter(m=>m.start<range[1]&&m.end>range[0]),signal:new AbortController().signal});
    result={html:await blob.text()};break;
  }
- case 'diagnostics':result=await diagnosticManifest({capture:c,workspace:a.workspace||{},sources:{},definitions:{version:1,selected:'',files:[]},hiddenPending:false,wave:null,runtime:{environment:'MCP',backendVersion:'0.2.0'}});break;
+ case 'diagnostics':result=await diagnosticManifest({capture:c,workspace:a.workspace||{},sources:{},definitions:{version:1,selected:'',files:[]},hiddenPending:false,wave:null,runtime:{environment:'MCP',backendVersion:'0.2.1'}});break;
  case 'kernels':result=kernelStats(c);break;
  case 'occupancy':result=occupancy(c,a.se,a.kernel);break;
  case 'activity':result=activityCost(c.instructions);break;

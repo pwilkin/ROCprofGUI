@@ -1,10 +1,13 @@
 {
   "name": "rocprof-studio-website",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Documentation site for rocprof-studio (self-contained; does not affect the app build).",
   "type": "module",
   "scripts": {
+    "sync-changelog": "node ../scripts/sync-changelog.mjs",
+    "predev": "node ../scripts/sync-changelog.mjs",
+    "prebuild": "node ../scripts/sync-changelog.mjs",
     "dev": "vitepress dev docs",
     "build": "vitepress build docs",
     "preview": "vitepress preview docs",

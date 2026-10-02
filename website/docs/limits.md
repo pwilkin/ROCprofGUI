@@ -6,7 +6,7 @@ This project's credibility rests on being honest about limits. The figures below
 
 | Cap | Value | Notes |
 | --- | --- | --- |
-| Per-file size | **256 MiB** | Enforced on sidecar/JSON/CSV files. Not applied to a ROCPD/SQLite database, which is bounded per query instead; a DB larger than 256 MiB can be opened. |
+| Per-file size | **256 MiB** | Enforced on sidecar/JSON/CSV and `.rgp` files. Not applied to a ROCPD/SQLite database, which is bounded per query instead; a DB larger than 256 MiB can be opened. |
 | Main record arrays | **2,000,000 records** | |
 | Open native captures | **6** (+ the bundled example) | |
 | Raw-ATT import timeout | **300 s** (5 min) | Plus a Cancel button; also aborts if the decoder log exceeds 16 MiB. |
@@ -17,7 +17,7 @@ This project's credibility rests on being honest about limits. The figures below
 | Variable | Cap it moves | Default |
 | --- | --- | --- |
 | `ROCPROF_MAX_RECORDS` | main record arrays (and the streamed wave-token limit) | 2,000,000 |
-| `ROCPROF_MAX_FILE_MIB` | per-file size for sidecar/JSON/CSV inputs | 256 |
+| `ROCPROF_MAX_FILE_MIB` | per-file size for sidecar/JSON/CSV/`.rgp` inputs | 256 |
 | `ROCPROF_MAX_HIDDEN_TOKENS` | tokens hidden-latency analysis will load | 4,000,000 |
 | `ROCPROF_MAX_ATT_TRACES` | trace files in one ATT manifest | 256 |
 | `ROCPROF_MAX_ATT_CODE_OBJECTS` | code-object files in one ATT manifest | 256 |

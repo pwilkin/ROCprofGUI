@@ -29,7 +29,7 @@ The table below is generated from a live server, not transcribed from prose. An 
 ROCPROFGUI_HOME=/tmp/rps-home rocprof-studio --headless --mcp-port 8791
 ```
 
-Then `initialize` → `notifications/initialized` → `tools/list` were sent over the legacy SSE transport and the returned JSON schemas turned into the table. The live server reported `serverInfo` `{name: "rocprof-studio", version: "0.2.0"}` and 31 tools.
+Then `initialize` → `notifications/initialized` → `tools/list` were sent over the legacy SSE transport and the returned JSON schemas turned into the table. The live server reported `serverInfo` `{name: "rocprof-studio", version: "0.2.1"}` and 31 tools.
 
 ::: tip Count check
 Live `tools/list` returns 31 tools. Some internal notes say 27; that count predates the four staged-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`). Trust 31.
@@ -102,7 +102,7 @@ Required arguments are marked `*`.
 The raw `tools/list` JSON — the full schema for every argument of every tool — was saved as the evidence this table was generated from.
 
 ::: tip Desktop Live profiling panel
-The four live-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`) also back a compact **Live profiling** panel in the desktop sidebar. It calls the same core through `live_profile_*` Tauri commands, so the launch, windowing and collection logic is shared, not forked: pick the tracer, enter the argv and working directory, start, trigger timed or triggered windows with streams and kernel filters, watch windows and attach attempts, then stop to collect.
+The four live-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`) also back a compact **Live profiling** panel in the desktop sidebar. It calls the same core through `live_profile_*` Tauri commands, so the launch, windowing and collection logic is shared, not forked: pick the tracer, enter the argv and working directory, start, trigger timed or triggered windows with streams, counters, ATT and its `targetCu`/`simdSelect`/`bufferSize`/`shaderEngineMask` sub-options, kernel include/exclude regexes and a kernel iteration range, watch windows and attach attempts, then stop to collect. The window duration is validated against the same 1–600000 ms bound the MCP schema enforces, and errors surface in the panel's own vocabulary rather than raw MCP tool names.
 :::
 
 ## Profiling examples {#profiling-examples}
@@ -141,8 +141,9 @@ The returned `files` list holds `counter_collection.csv`, the `*_kernel_trace.cs
 ```
 
 ::: warning rocprofv3 window caveats
-- **Every window of one process must request the same collection:** the same streams, counters, att, kernel filters, iteration range and mode (timed vs triggered). rocprofv3 pickles each PID's attach options and reattaches only with identical ones, so a mismatch is rejected up front, and an empty window still warns at `profile_stop`. Within timed windows, only `windowMs` may differ.
+- **Every window of one process must request the same collection:** the same streams, counters, att, kernel filters, iteration range and mode (timed vs triggered). rocprofv3 pickles each PID's attach options and reattaches only with identical ones, so a mismatch is rejected up front, and an empty window still warns at `profile_stop`. Within timed windows, only `windowMs` may differ. rocprofv3 never deletes the `/tmp/rocprofv3_attach_<pid>.pkl` it writes, so the app removes it best-effort at `profile_stop` and at shutdown, keeping a reused PID from inheriting a stale attach spec.
 - **Timed or triggered.** A timed window (`windowMs`) detaches on its own; a triggered window (`triggered: true`, no `windowMs`) stays attached until `profile_trigger` `{"end": true}` or `profile_stop`, so you can capture exactly one request without guessing a duration. Either way a window collects everything the application dispatches while it is open; it cannot isolate a single dispatch the way a RADV file trigger captures a single submit.
+- **`{"end": true}` only closes the open window.** Collection options passed alongside it are rejected; using it on a timed window that has already run out reports that the window detached rather than a misleading error. A window launch that fails rolls back its directory and the collection it would have committed, so a failed attempt does not poison later triggers with a stale "File exists".
 - **A default per-dispatch ATT trace samples each kernel name once.** A name regex still takes the first matching dispatch; use `kernelIterationRange` to reach a specific later launch.
 - **Attach can fail on a busy queue** (the ROCm `set_profiler_active_on_queue` handshake). `profile_trigger` retries with backoff while the target is alive and reports `attachAttempts`; a persistent failure is surfaced as an `attachWarning`, with a per-window warning at `profile_stop` carrying rocprofv3's stderr tail. This is a known ROCm limitation, not fixed here.
 - **Detachment can lag** the end of the window. `profile_status` reports `windowRunning` (and `windowTriggered` for a triggered window) until rocprofv3 has detached; `profile_stop` waits for an open window to detach, sending SIGINT (rocprofv3's documented alternative detach) after ~30 s and SIGKILL only past 180 s.
@@ -223,7 +224,7 @@ curl -s --max-time 10 -D - http://127.0.0.1:8765/mcp \
        "params":{"protocolVersion":"2024-11-05","capabilities":{},
                  "clientInfo":{"name":"demo","version":"1.0"}}}'
 # → Mcp-Session-Id: <id>
-# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.2.0"},...}}
+# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.2.1"},...}}
 ```
 
 ::: warning The handshake is per-connection

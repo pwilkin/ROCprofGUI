@@ -10,7 +10,7 @@ You are in browser preview (`npm run dev`). It loads the synthetic example and h
 
 ## Raw ATT import fails or times out
 
-Raw ATT needs the `rocprof-trace-decoder` package, its `pyelftools` dependency, and the native `librocprof-trace-decoder.so` (V2). Decoded captures need none of these. Point the app at them with `ROCPROF_GUI_PYTHON`, `ROCPROF_GUI_DECODER_LIB`, `ROCPROF_GUI_DECODER_PACKAGE`. Imports time out after 5 minutes and have a Cancel button; the import also aborts if the decoder log exceeds 16 MiB. If filenames are non-standard, use **ATT setup** to build a `.rocprof-att` manifest. (The headless CLI cannot open manifests; use the desktop app.)
+Raw ATT needs the `rocprof-trace-decoder` package, its `pyelftools` dependency, and the native `librocprof-trace-decoder.so` (V2). Decoded captures need none of these. Point the app at them with `ROCPROF_GUI_PYTHON`, `ROCPROF_GUI_DECODER_LIB`, `ROCPROF_GUI_DECODER_PACKAGE`. Imports time out after 5 minutes and have a Cancel button; the import also aborts if the decoder log exceeds 16 MiB. If filenames are non-standard, use **ATT setup** to build a `.rocprof-att` manifest. (The headless CLI opens those manifests too, through the shared import router.)
 
 ## An MCP client gets 401 / 403 / "Too many connections"
 

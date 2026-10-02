@@ -2,7 +2,40 @@
 
 All notable changes to rocprof studio are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
-This project is not yet published or tagged. 0.2.0 is the current state of `main`.
+This project is not yet published or tagged. 0.2.1 is the current state of `main`.
+
+## [0.2.1] - 2026-10-02
+
+A review-hardening release that applies the findings of an adversarial code review of the 0.2.0 remediation arc. There are no new features; the changes below make the live-profiling, import and tuning paths safer and more honest.
+
+### Fixed
+
+- The desktop GUI no longer freezes for up to 180 seconds while a live profile is stopped or triggered. Status polls never block on the live-profile lock, and the detach wait runs without holding it.
+- Live-profile detach escalates instead of killing outright: it writes a newline, then sends SIGINT after about 30 seconds, then SIGKILL only past 180 seconds. The previous SIGKILL-only path could truncate rocprofv3's synchronized output files and leave a surviving target in an unknown attach state.
+- A failed attach-window launch no longer poisons the session with a "File exists" error; its directory and the collection it would have committed are rolled back. The rocprofv3 attach-argument cache under `/tmp` (`rocprofv3_attach_<pid>.pkl`) is removed when the target stops and again at shutdown, so a reused PID does not inherit a stale attach spec. Ending an already-exited timed window reports that it detached instead of a misleading error, and ending a window rejects stray collection options.
+- The IRPF importer honors the producer's truncation contract. A truncated dispatch-events chunk is no longer silently relabelled as queue mode; truncated or dropped records and a failed session produce loud warnings; and a dynamic (all-zero) workgroup size renders as "Not recorded" instead of a fabricated grid.
+- A Loom compile report within the per-file size cap can no longer exhaust memory before the record-cap check: the importer rejects an over-cap collection before allocating for it. The Loom importer is also cancellable now, and validates wait-reason inventories like the strict version-zero loader.
+- `ROCPROF_MAX_FILE_MIB` now applies to `.rgp` imports. It was hard-coded to 256 MiB, so the variable was silently ineffective for RADV captures.
+- `kernelIterationRange` rejects degenerate values such as `-`, `,` and `0-3,,` that passed the old character-set check, and a blank or degenerate kernel name no longer crashes the tuning worker.
+- The tuning and shader workers no longer hang on an uninterruptible descendant after a kill: a timed-out process tree is reaped with a bounded post-kill wait.
+- Untracked bytecode and local scratch that had been swept into earlier commits are removed from version control.
+
+### Changed
+
+- "Stop and collect" is cancellable from the desktop, through a shared cancellation flag on the live-profile control.
+- The headless CLI uses the same cancellable, input-fingerprinted import router as the GUI and MCP, and accepts `.rocprof-att` manifests. The earlier CLI/desktop import divergence is gone.
+- The desktop Live profiling panel validates the window duration against the 1 to 600000 ms bound the MCP schema enforces, exposes the ATT sub-options (`targetCu`, `simdSelect`, `bufferSize`, `shaderEngineMask`) and the kernel iteration range, and reports errors in the panel's own vocabulary rather than raw MCP tool names.
+- Wave-budget and row-cap rejection messages interpolate their effective constants, so the message a user sees cannot drift from the enforced bound.
+- The rocprofv3 option vocabulary lives in one key table, and a contract test fails on a one-sided edit instead of letting a rocprofv3-only option be silently accepted on a RADV run.
+
+### Security
+
+- The tuning and shader workers no longer inherit `LD_PRELOAD`, `HSA_TOOLS_LIB` or `HSA_TOOLS_REPORT_LOAD_FAILURE` from the launching environment, and reject them if passed back in `env`, so a profiler library the app itself was launched under cannot perturb or instrument the kernel being measured.
+
+### Upgrade notes
+
+- An installed binary, including one run as a systemd service, must be rebuilt and reinstalled to pick up 0.2.1.
+- The headless CLI now computes the same input fingerprint as the desktop and MCP. A capture opened through the CLI participates in the same input-change detection: a file that changes during import is rejected, and the capture-archive overwrite guard refuses to overwrite an archive whose source file has since changed.
 
 ## [0.2.0] - 2026-10-02
 

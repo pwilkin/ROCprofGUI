@@ -32,7 +32,7 @@ cargo run -q -p profile-core -- fixtures/transpose-ui --bundle                  
 cargo run -q -p profile-core -- fixtures/transpose-ui --hidden                        # hidden-latency analysis
 ```
 
-The CLI banner documents `CAPTURE_PATH [WAVE_ID | --bundle]`; `--hidden` is also accepted. Note the CLI uses a different import dispatcher from the GUI and cannot open a `.rocprof-att` manifest (use the desktop app for those); it also computes no project fingerprint and passes no cancellation flag.
+The CLI banner documents `CAPTURE_PATH [WAVE_ID | --bundle]`; `--hidden` is also accepted. The CLI goes through the same cancellable, fingerprinted import router (`project::load_input`) as the GUI and MCP, so it opens the same inputs, including `.rocprof-att` manifests, and computes the input fingerprint.
 
 ## 4. Headless MCP server
 

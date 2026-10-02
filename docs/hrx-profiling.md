@@ -245,6 +245,14 @@ rejected, with an explicit message and never a panic, when any of these hold:
   counter/reason name↔id mapping, duplicates a `(function, counter_id, reason_id)`,
   violates a summary count invariant, or references a function no entry defines.
 
+The importer honours the same `ROCPROF_MAX_*` caps and cancellation as every
+other arm. It reads each collection's declared row count and rejects an over-cap
+report **before** allocating for it, not after materialising every row, so a
+report that is within the per-file size cap can no longer exhaust memory ahead of
+the record-cap check; the rejection interpolates the effective
+`ROCPROF_MAX_RECORDS` value. The load is cancellable: it checks the shared
+cancellation flag before and during the walk, like the IRPF and CSV arms.
+
 The pre-schema public sample, a benchmark result with an embedded older-shaped
 report and no version-zero envelope, is rejected on the same rule. The rejection
 names the expected `kind='loom.compile_report'` and `schema_version 0` and
@@ -344,16 +352,17 @@ additionally sweeps the original `benchmark-live` bundle directory when present.
 
 ## Where this is wired
 
-- Importer: `crates/profile-core/src/irpf.rs`, reached from both the headless
-  dispatcher (`import::load_capture_options`) and the desktop/MCP dispatcher
-  (`project::load_input_checked`) by the `.irpf` extension and by an IRPF magic
-  sniff, so an oddly-named bundle still opens.
+- Importer: `crates/profile-core/src/irpf.rs`, reached through the shared import
+  router (`project::load_input` → `import::load_capture_options`, the one
+  cancellable, fingerprinted path the GUI, headless CLI and MCP all use) by the
+  `.irpf` extension and by an IRPF magic sniff, so an oddly-named bundle still
+  opens.
 - Tests: synthetic round-trip, malformed/unfinalized rejection and cap behaviour
   run by default; the exact-count round-trips of the two retained bundles are
   `#[ignore]` and gated on `ROCPROF_IRPF_DISPATCH_BUNDLE` /
   `ROCPROF_IRPF_QUEUE_BUNDLE` (README, "Tests that do not run by default").
 - Loom compile-report importer: `crates/profile-core/src/loom_report.rs`, reached
-  from the same dispatchers by the `.compile-report.json` suffix or a
+  through the same router by the `.compile-report.json` suffix or a
   `loom.compile_report` content sniff, so a report named `.summary.json` or
   `.details.json` still opens. Tests in `crates/profile-core/tests/loom.rs`:
   synthetic validation and rejection, detail-flag gating, absent-stays-absent, the

@@ -47,6 +47,6 @@ For named rocprofv3 inputs (`*_shader_engine_<SE>_<RUN>.att`, `*_code_object_id_
 
 - **Decoded captures are self-contained.** They need no Python, no decoder library and no ROCm disassembly tools; only raw ATT does.
 - **Coverage cannot be proven from a dispatch CSV alone.** A CSV that looks complete does not prove every dispatch was observed. See [Limits & caveats](/limits).
-- The headless CLI cannot open `.rocprof-att` manifests; use the desktop app for those.
+- The headless CLI opens the same inputs as the desktop, including `.rocprof-att` manifests: all three surfaces share one cancellable, fingerprinted import router.
 
 Browser-testable fixtures ship with the repo: `public/demo.json` (the bundled synthetic example), `public/demo-hidden.json`, `fixtures/rocpd/sdk-3.0.4.json` and `.db`, `fixtures/transpose-ui/*`, and `fixtures/radv-rgp/*.rgp`.
