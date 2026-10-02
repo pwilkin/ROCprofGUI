@@ -197,6 +197,22 @@ fn file_cap_override_rejects_a_large_csv_on_size() {
 }
 
 #[test]
+fn file_cap_override_applies_to_rgp() {
+    // rgp.rs used to hard-code a 256 MiB cap, so ROCPROF_MAX_FILE_MIB was silently
+    // ineffective for .rgp. The size check (first thing in the importer) now routes
+    // through caps::max_file_bytes() and interpolates the effective value.
+    let _g = ENV_LOCK.lock().unwrap();
+    clear();
+    let dir = tempfile::tempdir().unwrap();
+    let rgp = dir.path().join("capture.rgp");
+    std::fs::write(&rgp, vec![0u8; 1_200_000]).unwrap();
+    std::env::set_var("ROCPROF_MAX_FILE_MIB", "1");
+    let err = profile_core::load_capture(&rgp).unwrap_err();
+    assert!(err.contains("1 MiB per-file import limit"), "{err}");
+    clear();
+}
+
+#[test]
 fn att_manifest_trace_cap_is_configurable() {
     let _g = ENV_LOCK.lock().unwrap();
     clear();

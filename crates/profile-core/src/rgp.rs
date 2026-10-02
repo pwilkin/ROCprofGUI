@@ -1,7 +1,6 @@
 use crate::model::*;
 use std::{fs, path::Path};
 
-const MAX_FILE: u64 = 256 * 1024 * 1024;
 const MAGIC: u32 = 0x5030_3042; // "B00P"
 const HEADER_BYTES: usize = 56;
 const CHUNK_HEADER_BYTES: usize = 16;
@@ -1047,8 +1046,12 @@ pub fn load_options(
     decode_thread_trace: bool,
 ) -> Result<Capture, String> {
     let size = fs::metadata(path).map_err(err)?.len();
-    if size > MAX_FILE {
-        return Err(format!("{} exceeds the 256 MiB per-file import limit", path.display()));
+    if size > crate::caps::max_file_bytes() {
+        return Err(format!(
+            "{} exceeds the {} MiB per-file import limit",
+            path.display(),
+            crate::caps::max_file_mib()
+        ));
     }
     let d = fs::read(path).map_err(err)?;
     let table = chunks(&d)?;
