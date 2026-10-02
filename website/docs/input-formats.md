@@ -3,7 +3,7 @@
 Every format below is resolved by the Rust core (`crates/profile-core/src/import.rs`, `load_capture_options`), which picks an adapter by path kind and extension. The GUI's file picker offers a single filter, **"ROCm and RADV captures"**, accepting:
 
 ```
-json  csv  att  rocprof-att  rocprof-capture  rocpd  rpd  db  sqlite  rgp
+json  csv  att  rocprof-att  rocprof-capture  rocpd  rpd  db  sqlite  rgp  irpf
 ```
 
 Directory mode instead selects a decoded `ui_output_*` directory or a raw ATT directory.
@@ -29,6 +29,7 @@ No adapter writes into your input. ROCPD databases are opened read-only / query-
 | Raw ATT `.att` file | rocprof-trace-decoder output | Decodes the matching process/run across SE files. Needs the decoder prerequisites. |
 | Raw ATT directory (no `filenames.json`) | as above | Discovers runs, then decodes; a directory with multiple runs opens a run chooser. |
 | RADV `.rgp` | Mesa RADV driver | Vulkan compute hardware counters, thread traces and kernel names (experimental — see [RADV](/radv)). |
+| HRX native `.irpf` | HRX `libhrx` (`HRX_PROFILE_MODE=queue\|dispatch`) | IREE HAL `IRPF` v2.0 profile bundle: resolved dispatches, function names, code-object identity and clock correlations. Raw device ticks converted to elapsed ns; events are not placed on a host timeline (device-tick-unaligned). Also recognised by magic when the file lacks the `.irpf` extension. See [HRX profiling](https://github.com/pwilkin/ROCprofGUI/blob/main/docs/hrx-profiling.md). |
 | `.rocprof-project` | this app's **Save project** | Restores a saved workspace; references the original capture paths (not loaded through the capture dispatcher — see [Projects](/projects)). |
 
 ## Raw ATT setup

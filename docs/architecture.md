@@ -26,6 +26,7 @@ flowchart LR
 |---|---|---|
 | Profile core | `crates/profile-core` | JSON/CSV imports, scoped sidecar access, timestamp normalization, wave reads, interval union, headless import CLI |
 | RADV RGP reader | `crates/profile-core/src/rgp.rs` | Chunked RGP container parsing; derived-SPM and raw user-configured counters on the GPU-timestamp axis; SQTT sanitizing, code-object placement by pipeline hash, and four validity checks before a thread trace is decoded through `decoder.rs`; capture-mode inference; RGP instrumentation markers read from userdata register tokens, which name kernels and give dispatch grids |
+| HRX IRPF reader | `crates/profile-core/src/irpf.rs` | Bounds-validated parser for HRX's native IREE HAL `IRPF` v2.0 bundles (`HRX_PROFILE_MODE=queue\|dispatch`): file/record headers, typed chunks, resolved dispatch/function names, code-object identity and clock correlations; elapsed-tick timing via the device frequency with the device-tick-unaligned limitation kept explicit; grid = workgroup count × size. See [`hrx-profiling.md`](hrx-profiling.md) |
 | Native host | `src-tauri` | Tauri window, native open dialog, background import tasks, capture handles and lifetime |
 | Bridge | `src/bridge.ts` | Typed IPC and explicitly synthetic browser fixture |
 | Analysis | `src/analysis.ts` | Visible-range wave statistics, occupancy sweep, safe scalar expression parser |

@@ -4,7 +4,7 @@
 
 <p align="center"><em>A GUI profiler for ROCm/RADV with a modern look and feel + agentic integration via MCP</em></p>
 
-rocprof studio opens the artifacts a GPU profiler already produced — decoded rocprofv3 output, kernel-trace and counter CSVs, SPM and PC-sampling JSON, ROCPD/legacy databases, raw ATT and RADV `.rgp` captures — and reconstructs the timeline, per-wave execution, ISA, source linkage, occupancy and counters, with evidence exports for what you saw. One Rust analysis core backs the Tauri 2 desktop app, a headless importer CLI and an MCP server; kernel- and shader-tuning sessions can capture, replay and compare variants of a single dispatch when you ask for them.
+rocprof studio opens the artifacts a GPU profiler already produced — decoded rocprofv3 output, kernel-trace and counter CSVs, SPM and PC-sampling JSON, ROCPD/legacy databases, raw ATT, RADV `.rgp` captures and HRX native IRPF profile bundles — and reconstructs the timeline, per-wave execution, ISA, source linkage, occupancy and counters, with evidence exports for what you saw. One Rust analysis core backs the Tauri 2 desktop app, a headless importer CLI and an MCP server; kernel- and shader-tuning sessions can capture, replay and compare variants of a single dispatch when you ask for them.
 
 **Documentation:** the full site is at <https://pwilkin.github.io/ROCprofGUI/> (built from [`website/`](website/)), covering installation, input formats, every view, the MCP tool reference and the tuning workflows. The sections below are the in-repo reference.
 
@@ -26,7 +26,7 @@ npm ci
 npm run tauri dev
 ```
 
-Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace or counter-collection CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, or a RADV Vulkan `.rgp` capture (experimental). The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches an argv under rocprofv3 or under RADV Vulkan tracing, and the kernel- and shader-tuning workers compile candidates and can write replacement source back to disk. They are described under [MCP server](#mcp-server), [Kernel tuning](#kernel-tuning) and [Shader tuning](#shader-tuning-vulkan-experimental); none runs unless invoked.
+Open a decoded `ui_output_*` directory with **Open capture**. Use the **+** beside capture tabs to open a rocprofv3 kernel trace or counter-collection CSV, `filenames.json`, an SPM results JSON, host-trap/stochastic PC sampling JSON, a RADV Vulkan `.rgp` capture (experimental), or an HRX native `.irpf` profile bundle (see [HRX profiling](docs/hrx-profiling.md)). The import path itself is read-only. Two other surfaces are not: the MCP server's `profile_run` tool launches an argv under rocprofv3 or under RADV Vulkan tracing, and the kernel- and shader-tuning workers compile candidates and can write replacement source back to disk. They are described under [MCP server](#mcp-server), [Kernel tuning](#kernel-tuning) and [Shader tuning](#shader-tuning-vulkan-experimental); none runs unless invoked.
 
 The browser preview uses an explicitly synthetic example capture:
 
@@ -63,6 +63,7 @@ This rebuilds the app, stages a copy for Tauri's bundle patching, and packages t
 - rocprofv3 kernel-trace CSV, per-dispatch counter-collection CSV and standalone SPM JSON import.
 - Read-only ROCPD kernel dispatch, event-associated PMC and timestamped SPM import, including UUID-partitioned ROCm SDK databases.
 - Raw ATT import through an isolated decoder V2 process, including code-object disassembly, cancellation and automatic temporary-output cleanup.
+- HRX native IRPF profile-bundle import: bounds-validated parser for the IREE HAL `IRPF` v2.0 container `libhrx` writes (`HRX_PROFILE_MODE=queue|dispatch`), resolving dispatches, function names, code-object identity and clock correlations, with elapsed-tick timing and the device-tick-unaligned limitation kept explicit. See [HRX profiling](docs/hrx-profiling.md).
 - Target-wave, CU-wave, SIMD activity, global residency, and dispatch timelines with shared range, zoom, pan and cycle measurement.
 - Linked ISA/source/token navigation, selected-wave loop occurrences, complete selection history, ISA wait arrows, section folding, resizable columns, search, latency sum/mean, and bounded visible-wave aggregation.
 - Rust hidden-latency analysis, with total/nonhidden selection, optional idle contribution, and independent upstream C++ oracle validation.
@@ -115,6 +116,8 @@ ROCPROF_WAVE_ARCHIVE=<archive> cargo test -p profile-core --offline -- --ignored
 | `token_index_archives::archived_native_window_oracles` | `ROCPROF_INDEX_CAPTURES` + `ROCPROF_INDEX_NATIVE_REPORT` |
 | `token_index_archives::mixed_archived_indexes_match_streaming_through_eviction_and_reuse` | `ROCPROF_INDEX_CAPTURES` (a JSON array of at least three paths) |
 | `rgp::default_mask_capture_decodes_to_consistent_waves`, `rgp::occupancy_capture_accounts_for_every_wave_in_the_dispatch`, `rgp::rocprof_compatible_capture_attributes_every_instruction_exactly`, `rgp::llama_capture_occupancy_matches_marker_grids`, `rgp::driver_internal_dispatches_are_named_after_their_command` | `ROCPROF_GUI_DECODER_PACKAGE` (+ `ROCPROF_GUI_DECODER_LIB` if the V2 library is not on the default path); fixtures are vendored |
+| `irpf::dispatch_bundle_roundtrips_with_exact_counts` (test `irpf`) | `ROCPROF_IRPF_DISPATCH_BUNDLE` (path to an HRX dispatch-mode `trace.irpf`) |
+| `irpf::queue_bundle_roundtrips_from_command_operations` (test `irpf`) | `ROCPROF_IRPF_QUEUE_BUNDLE` (path to an HRX queue-mode `trace.irpf`) |
 
 Run with `--ignored` but without the environment variable and these fifteen fail rather than skip. The remaining two take no environment variable and are opt-in boundary qualifications that allocate at the two-million limit: `wave_stream::tests::streaming_limit_counts_discarded_rows_and_rejects_extra_before_parsing` and `import::wave_read_cancellation_tests::streamed_token_limit_accepts_boundary_and_rejects_extra_before_parsing`.
 
@@ -143,7 +146,7 @@ cargo run -q -p profile-core -- fixtures/transpose-ui --bundle > public/demo.jso
 cargo run -q -p profile-core -- fixtures/transpose-ui --hidden > public/demo-hidden.json
 ```
 
-See [architecture](docs/architecture.md) for how the layers divide and where the query budgets live, [open work](docs/open-work.md) for the itemised outstanding work and what has been closed, [validation](docs/validation.md) for the checks actually performed, [blocked inputs](docs/blocked-inputs.md) for what the remaining work is waiting on, [profiling caveats](docs/profiling-caveats.md) for lessons recovered from the existing ROCm sessions, and [RADV profiling](docs/radv-profiling.md) for the experimental Vulkan path.
+See [architecture](docs/architecture.md) for how the layers divide and where the query budgets live, [open work](docs/open-work.md) for the itemised outstanding work and what has been closed, [validation](docs/validation.md) for the checks actually performed, [blocked inputs](docs/blocked-inputs.md) for what the remaining work is waiting on, [profiling caveats](docs/profiling-caveats.md) for lessons recovered from the existing ROCm sessions, [RADV profiling](docs/radv-profiling.md) for the experimental Vulkan path, and [HRX profiling](docs/hrx-profiling.md) for the HRX trace paths and the native IRPF importer.
 
 ## Current limits
 

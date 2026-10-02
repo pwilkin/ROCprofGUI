@@ -111,6 +111,7 @@ export async function openCapture(
                 "db",
                 "sqlite",
                 "rgp",
+                "irpf",
               ],
             },
           ],

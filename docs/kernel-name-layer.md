@@ -83,6 +83,26 @@ Establish the family's actual naming from its producer first — do not guess it
    textual match — and keep it honest about what it does and does not prove.
 
 The HRX beta campaign feeds ordinary rocprofv3 kernel/counter/ATT inputs through the
-existing importer arms, so steps 1–2 may need nothing new for that path; the native
-IRPF bundle path is where a dedicated arm and identity mechanism will be decided, once
-its producer schema is pinned.
+existing importer arms, so steps 1–2 need nothing new for that path (the counter-CSV
+grid/workgroup fix aside).
+
+**HRX/loom is now implemented along this checklist:**
+
+1. **Importer arm.** `crates/profile-core/src/irpf.rs` is the dedicated arm for HRX's
+   native IRPF bundles; it sets `Dispatch.kernel` from the pinned producer's
+   `executable-functions` records (resolved by `executable_id` + `function_ordinal`).
+   Names are plain (not mangled), so the built-in classification already covers them.
+2. **Marker decoding.** Not needed: IRPF carries resolved function names directly, so
+   there is no in-trace marker grammar to decode.
+3. **Name classification.** `src/kernelName.ts` registers an HRX matcher
+   (`hrxKernelFamily`) for the two producer-observed prefixes — `ggml_*` → `hrx-ggml`
+   and `iree_hal_amdgpu_device_*` → `hrx-runtime` (internal). Model-specific fused
+   kernels (`qwen*`, `llm_attention_*`) stay plain, having no stable backend prefix.
+   No tuning path exists for HRX, so `canonical_kernel`/`kernel_base` are untouched.
+4. **Identity mechanism.** IRPF code-object identity is the session-local
+   `code_object_id` (the hardware-trace marker id) plus the embedded ELF image and its
+   per-device load range, retained on `CodeObjectRecord`. No source-match digest is
+   claimed: these bundles carry no ISA/wave data to match against.
+
+See [hrx-profiling.md](hrx-profiling.md) for the trace paths, the importer's scope and
+limits, and the no-Loom-compile-report gap.
