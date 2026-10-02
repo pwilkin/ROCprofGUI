@@ -17,15 +17,34 @@ interface Node {
   children: Map<string, Node>;
   instruction?: Instruction;
 }
+export type FlameGrouping = "source" | "codeObject";
+/**
+ * The recorded code object an instruction belongs to, used as a flamegraph
+ * grouping label. For RADV captures this is already the pipeline/shader label
+ * (`PlacedCodeObject::label`); for HIP/ATT captures it is the ELF code-object
+ * id. An empty value is shown explicitly rather than guessed.
+ */
+export function codeObjectLabel(codeObject: string): string {
+  return codeObject || "Unknown code object";
+}
 export function sourceHierarchy(
   instructions: Instruction[],
   metric: "latency" | "pcSamples" | "pcIssued" | "pcStalled",
+  groupBy: FlameGrouping = "source",
 ): SourceFrame[] {
   return weightedSourceHierarchy(
     instructions.map((instruction) => ({
       instruction,
       weight: instruction[metric] ?? 0,
-      prefix: [],
+      prefix:
+        groupBy === "codeObject"
+          ? [
+              {
+                key: `codeObject:${instruction.codeObject}`,
+                label: codeObjectLabel(instruction.codeObject),
+              },
+            ]
+          : [],
     })),
   );
 }

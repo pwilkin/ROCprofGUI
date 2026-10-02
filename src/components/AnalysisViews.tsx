@@ -4,7 +4,12 @@ import { topHotspots } from "../hotspots";
 import TraceAssociations from "./TraceAssociations";
 import { counterGaps } from "../counterGaps";
 import { counterDetail } from "../counterMetadata";
-import { sourceHierarchy, clipSourceHierarchy } from "../sourceHierarchy";
+import {
+  sourceHierarchy,
+  clipSourceHierarchy,
+  codeObjectLabel,
+  type FlameGrouping,
+} from "../sourceHierarchy";
 import { useAnalysisPreference } from "../analysisPreferences";
 import HostCalls from "./HostCalls";
 import MonitorIntervals from "./MonitorIntervals";
@@ -922,10 +927,15 @@ export function FlameView({
     "flame.hierarchy",
     false,
   );
+  const [grouping, setGrouping] = useAnalysisPreference<FlameGrouping>(
+    "flame.groupBy",
+    "source",
+  );
   const plots = useContext(PlotAxesContext);
   const viewportKey = plotAxisKey(
     "source-flamegraph",
     metric,
+    grouping,
     focus === null ? "all" : "source",
     focus || "",
     ...(hierarchy ? ["hierarchy"] : []),
@@ -935,10 +945,13 @@ export function FlameView({
     const map = new Map<string, Instruction[]>();
     for (const i of instructions)
       if (weight(i) > 0) {
-        const source = i.source || "Unmapped ISA";
-        const group = map.get(source);
+        const name =
+          grouping === "codeObject"
+            ? codeObjectLabel(i.codeObject)
+            : i.source || "Unmapped ISA";
+        const group = map.get(name);
         if (group) group.push(i);
-        else map.set(source, [i]);
+        else map.set(name, [i]);
       }
     return [...map]
       .map(([name, rows]) => ({
@@ -947,8 +960,13 @@ export function FlameView({
         total: rows.reduce((s, i) => s + weight(i), 0),
       }))
       .sort((a, b) => b.total - a.total);
-  }, [instructions, metric]);
-  const shown = focus ? groups.filter((g) => g.name === focus) : groups;
+  }, [instructions, metric, grouping]);
+  // A saved focus from one grouping (e.g. a source line) is not a group name in
+  // the other (code objects); ignore it until it matches a current group.
+  const focused = focus && groups.some((g) => g.name === focus) ? focus : null;
+  const allLabel =
+    grouping === "codeObject" ? "All code objects" : "All mapped source lines";
+  const shown = focused ? groups.filter((g) => g.name === focused) : groups;
   const total = shown.reduce((s, g) => s + g.total, 0);
   const domain: Range = [0, Math.max(1, total)];
   const viewport = savedViewport
@@ -975,14 +993,15 @@ export function FlameView({
     () =>
       hierarchy
         ? sourceHierarchy(
-            (focus
-              ? groups.filter((group) => group.name === focus)
+            (focused
+              ? groups.filter((group) => group.name === focused)
               : groups
             ).flatMap((group) => group.rows),
             metric,
+            grouping,
           )
         : [],
-    [groups, focus, metric, hierarchy],
+    [groups, focused, metric, hierarchy, grouping],
   );
   const visibleFrames = clipSourceHierarchy(frames, viewport);
   const hierarchyHeight =
@@ -1023,9 +1042,13 @@ export function FlameView({
             : "Stalled source samples"
       }
       detail={
-        metric === "latency"
-          ? "Width is accumulated instruction latency. This is source-to-ISA aggregation, not a sampled call stack or hidden-latency analysis."
-          : "Width is the recorded sample count, grouped by source location and ISA. Missing counts are excluded. This is not a call stack or cycle estimate."
+        (metric === "latency"
+          ? "Width is accumulated instruction latency."
+          : "Width is the recorded sample count. Missing counts are excluded.") +
+        (grouping === "codeObject"
+          ? " Grouped by the recorded code object (the compiled kernel unit: a pipeline/kernel label for RADV, an ELF id for HIP), then source and ISA."
+          : " Grouped by source location and ISA.") +
+        " This is source-to-ISA aggregation, not a sampled call stack, cycle estimate or per-dispatch cost split."
       }
       tools={
         <>
@@ -1040,8 +1063,8 @@ export function FlameView({
                   width: 1000,
                   height: 28,
                   color: "#adb8c7",
-                  label: focus || "All mapped source lines",
-                  detail: `${focus || "All mapped source lines"}: ${total} ${unit}`,
+                  label: focused || allLabel,
+                  detail: `${focused || allLabel}: ${total} ${unit}`,
                 },
               ];
               if (hierarchy)
@@ -1085,17 +1108,30 @@ export function FlameView({
                 boxes,
                 1000,
                 hierarchy ? hierarchyHeight + 30 : 90,
-                `Source flamegraph · ${metric}`,
-                `${exportContext} · ${total} ${unit} · visible cumulative weight ${viewport[0]}–${viewport[1]} ${unit} · source-to-ISA aggregation, not a call stack`,
+                `Source flamegraph · ${metric} · ${grouping === "codeObject" ? "by code object" : "by source location"}`,
+                `${exportContext} · ${total} ${unit} · visible cumulative weight ${viewport[0]}–${viewport[1]} ${unit} · ${grouping === "codeObject" ? "grouped by recorded code object · " : ""}source-to-ISA aggregation, not a call stack`,
               );
             }}
           />
-          <button disabled={!focus} onClick={() => setFocus(null)}>
+          <button disabled={!focused} onClick={() => setFocus(null)}>
             Reset zoom
           </button>
         </>
       }
     >
+      <label>
+        Group by{" "}
+        <select
+          aria-label="Flamegraph grouping"
+          value={grouping}
+          onChange={(event) =>
+            setGrouping(event.target.value as FlameGrouping)
+          }
+        >
+          <option value="source">Source location</option>
+          <option value="codeObject">Code object (kernel/pipeline)</option>
+        </select>
+      </label>
       <label>
         <input
           type="checkbox"
@@ -1145,7 +1181,7 @@ export function FlameView({
         </span>
       </div>
       <div className="flame-root">
-        {focus || "All mapped source lines"}{" "}
+        {focused || allLabel}{" "}
         <span>
           {fmt(total)} {unit}
         </span>

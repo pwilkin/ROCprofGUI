@@ -1,5 +1,9 @@
 import { expect, it } from "vitest";
-import { sourceHierarchy, clipSourceHierarchy } from "./sourceHierarchy";
+import {
+  sourceHierarchy,
+  clipSourceHierarchy,
+  codeObjectLabel,
+} from "./sourceHierarchy";
 import type { Instruction } from "./types";
 const row = (
   index: number,
@@ -65,4 +69,62 @@ it("keeps paths intact and only weights positive available samples", () => {
   );
   expect(frames[0].label).toBe("C:\\src\\kernel.h");
   expect(frames.filter((f) => f.instruction).map((f) => f.total)).toEqual([3]);
+});
+it("defaults to source grouping with no code-object root frame", () => {
+  const frames = sourceHierarchy(
+    [{ ...row(0, "x.cl:1", 2), codeObject: "pipeline A" }],
+    "latency",
+  );
+  expect(frames[0].label).toBe("x.cl");
+});
+it("groups by code object with the source hierarchy nested beneath", () => {
+  const frames = sourceHierarchy(
+    [
+      { ...row(0, "a.cl:1", 5), codeObject: "pipeline A" },
+      { ...row(1, "a.cl:2", 3), codeObject: "pipeline A" },
+      { ...row(2, "b.cl:1", 4), codeObject: "code object 2" },
+    ],
+    "latency",
+    "codeObject",
+  );
+  const roots = frames.filter((f) => f.depth === 0);
+  expect(roots.map((f) => [f.label, f.total])).toEqual([
+    ["pipeline A", 8],
+    ["code object 2", 4],
+  ]);
+  // The source file of the first code object nests beneath it, carrying only
+  // that code object's weight.
+  const file = frames.find((f) => f.label === "a.cl" && f.depth === 1);
+  expect(file?.total).toBe(8);
+  // Every ISA leaf keeps its own weight; nothing is double counted.
+  const leaves = frames.filter((f) => f.instruction);
+  expect(leaves.reduce((sum, f) => sum + f.total, 0)).toBe(12);
+});
+it("keeps same-source instructions in distinct code objects apart", () => {
+  const frames = sourceHierarchy(
+    [
+      { ...row(0, "shared.cl:7", 6), codeObject: "pipeline A" },
+      { ...row(1, "shared.cl:7", 2), codeObject: "pipeline B" },
+    ],
+    "latency",
+    "codeObject",
+  );
+  expect(frames.filter((f) => f.depth === 0).map((f) => f.label)).toEqual([
+    "pipeline A",
+    "pipeline B",
+  ]);
+  expect(frames.filter((f) => f.instruction).map((f) => f.total)).toEqual([
+    6, 2,
+  ]);
+});
+it("labels an empty code object explicitly instead of guessing", () => {
+  expect(codeObjectLabel("")).toBe("Unknown code object");
+  expect(codeObjectLabel("pipeline deadbeef")).toBe("pipeline deadbeef");
+  const frames = sourceHierarchy(
+    [{ ...row(0, "x:1", 2), codeObject: "" }],
+    "latency",
+    "codeObject",
+  );
+  expect(frames[0].label).toBe("Unknown code object");
+  expect(frames[0].depth).toBe(0);
 });

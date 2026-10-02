@@ -86,6 +86,8 @@ export function validAnalysisPreference(key: string, value: unknown): boolean {
     return ["latency", "pcSamples", "pcIssued", "pcStalled"].includes(
       value as string,
     );
+  if (key === "flame.groupBy")
+    return value === "source" || value === "codeObject";
   if (key === "hardware.cursor")
     return (
       typeof value === "number" &&
