@@ -103,6 +103,7 @@ pub fn create(
         let state = json!({"mode":"vulkan","config":config,"version":1,"id":id,"kernel":dispatch.kernel,"traceDispatch":dispatch,"captureId":capture_id,"runs":[],"directory":directory});
         fs::write(directory.join("session.json"), serde_json::to_vec_pretty(&state).unwrap()).map_err(|e| e.to_string())?;
         fs::write(directory.join("worker.py"), include_str!("shader_worker.py")).map_err(|e| e.to_string())?;
+        fs::write(directory.join("_util.py"), include_str!("_util.py")).map_err(|e| e.to_string())?;
         tuning.sessions.lock().map_err(|e| e.to_string())?.insert(
             id.clone(),
             Session { directory, child: None, started: Instant::now(), error: None },
@@ -127,6 +128,7 @@ pub fn create(
         include_str!("tuning_worker.py"),
     )
     .map_err(|e| e.to_string())?;
+    fs::write(directory.join("_util.py"), include_str!("_util.py")).map_err(|e| e.to_string())?;
     fs::write(
         directory.join("tuning_calibration.py"),
         include_str!("tuning_calibration.py"),

@@ -23,10 +23,17 @@ def assert_tree_killed(test, run_tree, root):
     with test.assertRaises(subprocess.TimeoutExpired):
         run_tree([sys.executable, '-c', script, str(pidfile)], 1)
     grandchild = Path(f'/proc/{int(pidfile.read_text())}/stat')
+    def dead():
+        # A vanished /proc entry (reaped) or a zombie both mean killed. Read in one
+        # shot so there is no exists()/read_text() TOCTOU as the process is torn down.
+        try:
+            return grandchild.read_text().split(') ')[-1][0] == 'Z'
+        except FileNotFoundError:
+            return True
     deadline = time.time() + 5
-    while grandchild.exists() and grandchild.read_text().split(') ')[-1][0] != 'Z' and time.time() < deadline:
+    while not dead() and time.time() < deadline:
         time.sleep(0.05)
-    test.assertFalse(grandchild.exists() and grandchild.read_text().split(') ')[-1][0] != 'Z', 'grandchild survived')
+    test.assertTrue(dead(), 'grandchild survived')
 
 
 class TuningTests(unittest.TestCase):

@@ -1,5 +1,4 @@
 import csv
-import hashlib
 import json
 import math
 import os
@@ -10,11 +9,11 @@ import shutil
 import subprocess
 import struct
 import sys
-import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tuning_calibration as calibration
+from _util import digest, file_digest, atomic
 
 MAX_SOURCE = 8 * 1024 * 1024
 # A capture snapshots every allocation the kernel's arguments point into; for
@@ -27,15 +26,6 @@ RESERVED_ENV = {'LD_PRELOAD', 'HSA_TOOLS_LIB', 'HSA_TOOLS_REPORT_LOAD_FAILURE', 
 # for kernels that reach memory some other way.
 CAPTURE_SCOPES = ('reachable', 'all')
 EXTENSIONS = {'.hip', '.cu', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.cuh'}
-
-
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-def file_digest(path):
-    with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def tree_bytes(path):
@@ -57,22 +47,6 @@ def application_env(cfg):
             raise ValueError('Environment variable not allowed: ' + key)
         env[key] = str(value)
     return env
-
-
-def atomic(path, data):
-    path = Path(path)
-    fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        if path.exists():
-            os.chmod(tmp, path.stat().st_mode & 0o777)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
 
 
 def read_source(path):

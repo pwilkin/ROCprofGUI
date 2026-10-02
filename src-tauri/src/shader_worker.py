@@ -5,7 +5,6 @@ and after). The shader's GLSL recipe is recovered by rebuilding the project's sh
 through a logging glslc and matching the captured SPIR-V, and edited variants are
 compiled with that recipe and replayed in isolation with vkreplay."""
 import glob
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,39 +15,16 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _util import digest, file_digest, atomic
 
 MAX_SOURCE = 8 * 1024 * 1024
 # OpCapability, OpExtension, OpExecutionMode, OpExecutionModeId: instructions an
 # application may add to or remove from a shader at run time without changing it.
 PREAMBLE = {17, 10, 16, 331}
 OP_ENTRY_POINT = 15
-
-
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
-
-
-def file_digest(path):
-    with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
-
-
-def atomic(path, data):
-    path = Path(path)
-    fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        if path.exists():
-            os.chmod(tmp, path.stat().st_mode & 0o777)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
 
 
 def descendants(pid):
@@ -76,6 +52,13 @@ def kill_tree(pid):
     for p in tree[1:]:
         try: os.kill(p, signal.SIGSTOP)
         except OSError: pass
+    # Re-snapshot once the known tree is stopped to catch a grandchild that forked
+    # during the sweep, before the kill (the /proc walk is cheap).
+    for p in descendants(pid):
+        if p not in tree:
+            tree.append(p)
+            try: os.kill(p, signal.SIGSTOP)
+            except OSError: pass
     for p in tree:
         try: os.kill(p, signal.SIGKILL)
         except OSError: pass
@@ -90,7 +73,12 @@ def run_tree(argv, timeout, capture_output=False, **kwargs):
             out, err = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             kill_tree(process.pid)
-            process.communicate()
+            # Bound the post-kill reap: a D-state descendant can hold the pipe open
+            # forever, so communicate() without a timeout would hang the worker.
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
             raise
         return subprocess.CompletedProcess(process.args, process.returncode, out, err)
 
