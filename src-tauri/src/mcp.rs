@@ -238,6 +238,11 @@ pub struct Control {
     shutting_down: AtomicBool,
     active: Mutex<Option<Active>>,
     live_profile: Mutex<Option<LiveProfile>>,
+    /// Shared cancellation flag for the desktop `live_profile_*` commands. They run
+    /// outside `active` (so `Active.cancel` cannot reach them), so they need a flag
+    /// with a stored owner that `Control::cancel` / `shutdown` can set; a fresh
+    /// `AtomicBool::new(false)` per call would have no owner and could never fire.
+    live_cancel: Arc<AtomicBool>,
     workspace: Mutex<Value>,
     revision: AtomicU64,
     endpoint: Mutex<Value>,
@@ -305,11 +310,21 @@ impl Control {
                 a.cancel.store(true, Ordering::SeqCst);
             }
         }
+        // A desktop live-profile op (trigger/stop) runs outside `active`; its shared
+        // cancellation flag lets mcp_cancel / shutdown reach an in-flight detach wait.
+        self.live_cancel.store(true, Ordering::SeqCst);
     }
     fn status(&self) -> Value {
         let a = self.active.lock().unwrap();
-        let live = self.live_profile.lock().unwrap();
-        json!({"active":a.as_ref().map(|a|json!({"requestId":a.id,"tool":a.name,"cancelling":a.cancel.load(Ordering::SeqCst),"elapsedSeconds":a.started.elapsed().as_secs()})),"liveProfile":live.as_ref().map(|p|json!({"id":p.id,"directory":p.folder,"triggerFile":p.radv_trigger()})),"revision":self.revision.load(Ordering::SeqCst),"workspace":*self.workspace.lock().unwrap(),"server":*self.endpoint.lock().unwrap()})
+        // A status poll must never block. `live_profile` is held across multi-second
+        // child waits (trigger/stop), and `mcp_status` runs on the GUI main thread,
+        // so blocking here would freeze the whole app. try_lock keeps the poll
+        // nonblocking; a busy lock reports the field as unavailable rather than wait.
+        let live = match self.live_profile.try_lock() {
+            Ok(guard) => guard.as_ref().map(|p| json!({"id":p.id,"directory":p.folder,"triggerFile":p.radv_trigger()})),
+            Err(_) => Some(json!("unavailable")),
+        };
+        json!({"active":a.as_ref().map(|a|json!({"requestId":a.id,"tool":a.name,"cancelling":a.cancel.load(Ordering::SeqCst),"elapsedSeconds":a.started.elapsed().as_secs()})),"liveProfile":live,"revision":self.revision.load(Ordering::SeqCst),"workspace":*self.workspace.lock().unwrap(),"server":*self.endpoint.lock().unwrap()})
     }
 }
 pub fn ensure_local(app: &tauri::AppHandle) -> Result<(), String> {
@@ -356,18 +371,25 @@ pub async fn live_profile_start(control: tauri::State<'_, Arc<Control>>, args: V
 #[tauri::command]
 pub async fn live_profile_trigger(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
     let control = control.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || profile_trigger_core(&control, &args, &AtomicBool::new(false)))
+    control.live_cancel.store(false, Ordering::SeqCst);
+    let cancel = control.live_cancel.clone();
+    tauri::async_runtime::spawn_blocking(move || profile_trigger_core(&control, &args, &cancel))
         .await
         .map_err(|e| e.to_string())?
 }
 #[tauri::command]
-pub fn live_profile_status(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
-    profile_status_core(&control, &args)
+pub async fn live_profile_status(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
+    let control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || profile_status_core(&control, &args))
+        .await
+        .map_err(|e| e.to_string())?
 }
 #[tauri::command]
 pub async fn live_profile_stop(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
     let control = control.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || profile_stop_core(&control, &args, &AtomicBool::new(false)))
+    control.live_cancel.store(false, Ordering::SeqCst);
+    let cancel = control.live_cancel.clone();
+    tauri::async_runtime::spawn_blocking(move || profile_stop_core(&control, &args, &cancel))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -1744,6 +1766,10 @@ fn profile_stop_core(control: &Control, a: &Value, flag: &AtomicBool) -> Result<
         }
     }
     let LiveProfile { mut child, folder, program, started, triggers, gate, .. } = live.take().unwrap();
+    // Release the live_profile mutex before the up-to-180 s detach wait below.
+    // Holding it across the wait would block Control::status()'s try_lock on the
+    // GUI poll and (with a blocking lock) any concurrent status call.
+    drop(live);
     let status = child.try_wait().map_err(|e| e.to_string())?;
     match gate {
         Gate::Radv { trigger } => {
@@ -2754,6 +2780,28 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
         c.cancel(Some("one"), Some(&json!(7)));
         assert!(flag.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn status_poll_never_blocks_on_a_held_live_profile_lock() {
+        // The GUI polls mcp_status on the main thread every 150 ms; the
+        // live_profile mutex can be held across multi-second child waits. If
+        // status() took that lock with `.lock()` instead of `try_lock`, this test
+        // would deadlock (std Mutex is not reentrant) — so it pins the invariant
+        // that a status poll is nonblocking regardless of the lock being held.
+        let c = Control::default();
+        let held = c.live_profile.lock().unwrap();
+        assert_eq!(c.status()["liveProfile"], json!("unavailable"));
+        drop(held);
+        assert!(c.status()["liveProfile"].is_null());
+    }
+    #[test]
+    fn mcp_cancel_reaches_a_desktop_live_profile_op() {
+        // The desktop live_profile_* commands share Control::live_cancel (they run
+        // outside `active`), so cancel()/shutdown can abort an in-flight detach.
+        let c = Control::default();
+        assert!(!c.live_cancel.load(Ordering::SeqCst));
+        c.cancel(None, None);
+        assert!(c.live_cancel.load(Ordering::SeqCst));
     }
     #[test]
     fn undelivered_results_go_once_to_an_identical_retry() {
