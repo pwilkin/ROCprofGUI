@@ -1110,7 +1110,7 @@ export function FlameView({
                 1000,
                 hierarchy ? hierarchyHeight + 30 : 90,
                 `Source flamegraph · ${metric} · ${grouping === "codeObject" ? "by code object" : "by source location"}`,
-                `${exportContext} · ${total} ${unit} · visible cumulative weight ${viewport[0]}–${viewport[1]} ${unit} · ${grouping === "codeObject" ? "grouped by recorded code object · " : ""}source-to-ISA aggregation, not a call stack`,
+                `${exportContext} · ${total} ${unit} · visible cumulative weight ${viewport[0]}–${viewport[1]} ${unit} · ${grouping === "codeObject" ? "grouped by recorded code object · " : ""}${hierarchy ? "nested file and inline source hierarchy, not a sampled call stack" : "source-to-ISA aggregation, not a sampled call stack"}`,
               );
             }}
           />

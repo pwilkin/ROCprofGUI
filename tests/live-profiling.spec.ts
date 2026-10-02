@@ -1,4 +1,25 @@
 import { test, expect } from "@playwright/test";
+import { readFileSync } from "node:fs";
+
+// The specs below stub __TAURI_INTERNALS__.invoke, so they verify the bridge ->
+// invoke argument mapping but not the Rust registration. This source-level guard
+// catches a dropped generate_handler! entry or a bridge rename: the four desktop
+// commands must stay invoked by bridge.ts AND listed in main.rs.
+test("the four live_profile_* commands stay registered and bridged", () => {
+  const commands = [
+    "live_profile_start",
+    "live_profile_trigger",
+    "live_profile_status",
+    "live_profile_stop",
+  ];
+  const bridge = readFileSync(new URL("../src/bridge.ts", import.meta.url), "utf8");
+  const mainRs = readFileSync(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8");
+  const handler = mainRs.slice(mainRs.indexOf("generate_handler!"));
+  for (const command of commands) {
+    expect(bridge, `${command} invoked by bridge.ts`).toContain(`"${command}"`);
+    expect(handler, `${command} in generate_handler!`).toContain(command);
+  }
+});
 
 // Drives the desktop "Live profiling" panel through a stubbed Tauri IPC bridge,
 // the same convention as the wave-loading and target-mark-reuse specs. It checks

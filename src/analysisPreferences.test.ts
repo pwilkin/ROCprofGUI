@@ -23,6 +23,8 @@ it("validates persisted analysis controls without accepting unknown state", () =
     ["sampling.metric", "pcSamples"],
     ["sampling.order", "samples"],
     ["flame.pcSamples", "kernel.hip"],
+    ["flame.groupBy", "source"],
+    ["flame.groupBy", "codeObject"],
     ["dispatch.sort", "count"],
   ])
     expect(valid(key as string, value)).toBe(true);
@@ -45,6 +47,8 @@ it("validates persisted analysis controls without accepting unknown state", () =
     ["summary.counts", "true"],
     ["sampling.order", "latency"],
     ["dispatch.sort", ["total"]],
+    ["flame.groupBy", "callstack"],
+    ["flame.groupBy", true],
     ["host.search", "é".repeat(4097)],
     ["host.search", "a\0b"],
   ])

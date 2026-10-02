@@ -27,6 +27,11 @@ export type FlameGrouping = "source" | "codeObject";
 export function codeObjectLabel(codeObject: string): string {
   return codeObject || "Unknown code object";
 }
+// Upper bound on distinct flamegraph hierarchy frames. Reached only by a
+// pathological hierarchy; a normal capture is bounded well below it. Wired in so
+// the weightedSourceHierarchy guard is real protection, not a dead branch (the
+// flamegraph path previously passed no cap, so it could never fire).
+export const MAX_FLAME_FRAMES = 2_000_000;
 export function sourceHierarchy(
   instructions: Instruction[],
   metric: "latency" | "pcSamples" | "pcIssued" | "pcStalled",
@@ -46,6 +51,7 @@ export function sourceHierarchy(
             ]
           : [],
     })),
+    MAX_FLAME_FRAMES,
   );
 }
 export interface SourceObservation {
