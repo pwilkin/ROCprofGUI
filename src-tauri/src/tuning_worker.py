@@ -94,14 +94,20 @@ def canonical_kernel(name):
 
 
 def kernel_base(name):
-    name = canonical_kernel(name).replace('(anonymous namespace)', '')
+    canonical = canonical_kernel(name)
+    cleaned = canonical.replace('(anonymous namespace)', '')
     depth, head = 0, []
-    for char in name:
+    for char in cleaned:
         if char == '(' and depth == 0: break
         if char == '<': depth += 1
         elif char == '>': depth = max(0, depth - 1)
         elif depth == 0: head.append(char)
-    return ''.join(head).split('::')[-1].split()[-1]
+    tokens = ''.join(head).split('::')[-1].split()
+    # Mirror the TS kernelBase `token || canonical`: an empty head (a degenerate
+    # or blank name) falls back to the canonical name instead of raising
+    # IndexError on `[][-1]`, so a blank Kernel_Name yields a clean no-match
+    # rather than crashing the worker.
+    return tokens[-1] if tokens else canonical
 
 
 def parameter_list(code, name):
@@ -551,8 +557,13 @@ def main(root, request):
                     hint = '. The capture kept only the allocations reachable from the kernel\'s arguments; if the kernel reaches memory another way, open a new session and capture with config.captureScope "all"'
                 raise RuntimeError('Isolated replay failed; see job.log' + hint)
             attempt_replay = json.loads(output.read_text())
-            if attempt_replay['execution']['mode'] != expected_mode:
-                raise ValueError(f"Replay ran in {attempt_replay['execution']['mode']!r} mode, not the requested {conditions['mode']!r}; the kernel-tuning runtime may predate replay conditions (rerun scripts/setup-kernel-tuning.py)")
+            # A runtime that predates replay conditions omits the whole 'execution'
+            # block, so index it defensively: a missing block is treated as the
+            # mismatch this very message describes, rather than raising a bare
+            # KeyError('execution') that hides the real cause.
+            actual_mode = attempt_replay.get('execution', {}).get('mode')
+            if actual_mode != expected_mode:
+                raise ValueError(f"Replay ran in {actual_mode!r} mode, not the requested {conditions['mode']!r}; the kernel-tuning runtime may predate replay conditions (rerun scripts/setup-kernel-tuning.py)")
             replays.append(attempt_replay)
         # The representative replay is the fastest average across fresh-allocation
         # repeats -- the isolated best case; the spread below shows placement sensitivity.

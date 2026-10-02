@@ -1,0 +1,10 @@
+[
+  { "name": "void mul_mat_q<(ggml_type)8, 32, false>(char const*)", "base": "mul_mat_q" },
+  { "name": "void k_bin_bcast<&(op_add(float, float)), float>(float*)", "base": "k_bin_bcast" },
+  { "name": "space::kernel<int>(float*)", "base": "kernel" },
+  { "name": "void a::(anonymous namespace)::Gemm<64, true>(void const*)", "base": "Gemm" },
+  { "name": "a::(anonymous namespace)::Row(float const*)", "base": "Row" },
+  { "name": "scale_f32(float*) [clone .kd]", "base": "scale_f32" },
+  { "name": "", "base": "" },
+  { "name": "()", "base": "()" }
+]

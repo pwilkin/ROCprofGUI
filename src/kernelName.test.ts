@@ -6,6 +6,16 @@ import {
   registerKernelFamily,
   type KernelNameInfo,
 } from "./kernelName";
+import sharedBaseCases from "../tests/kernel-name-bases.json";
+
+it("agrees with the tuning worker's kernel_base on the shared fixture", () => {
+  // The same table tests/test_tuning_worker.py loads, so the TS/Python parity
+  // claim is enforced, not just asserted in a comment. (Mangled names are the
+  // one deliberate divergence and are excluded from the fixture.)
+  for (const { name, base } of sharedBaseCases) {
+    expect(kernelBase(name), name).toBe(base);
+  }
+});
 
 it("reduces a demangled signature to its bare function name", () => {
   // The same cases the tuning worker's kernel_base covers (tests/test_tuning_worker.py).

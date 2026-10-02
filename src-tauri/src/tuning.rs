@@ -310,6 +310,14 @@ pub fn start(tuning: &Tuning, id: &str, mut request: Value) -> Result<(), String
         .stdin(Stdio::null())
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(log);
+    // The worker and its timed replays must not inherit a profiler library the
+    // app was launched under; otherwise every `--list-avail` and dispatch timing
+    // it reports would include that tools library. tuning_calibration.execute and
+    // the MCP spawn_process_env_stdin already strip these — do it at the one place
+    // the worker itself is spawned too.
+    for key in ["LD_PRELOAD", "HSA_TOOLS_LIB", "HSA_TOOLS_REPORT_LOAD_FAILURE"] {
+        command.env_remove(key);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

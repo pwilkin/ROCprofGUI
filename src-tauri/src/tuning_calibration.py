@@ -70,6 +70,14 @@ def kill_tree(pid):
     for p in tree[1:]:
         try: os.kill(p, signal.SIGSTOP)
         except OSError: pass
+    # A grandchild that forked between the first snapshot and its parent's SIGSTOP
+    # is not in `tree`; re-snapshot now the known tree is stopped to catch it and
+    # stop it too, before the kill sweep (the /proc walk is cheap).
+    for p in descendants(pid):
+        if p not in tree:
+            tree.append(p)
+            try: os.kill(p, signal.SIGSTOP)
+            except OSError: pass
     for p in tree:
         try: os.kill(p, signal.SIGKILL)
         except OSError: pass
@@ -85,7 +93,15 @@ def run_tree(argv, timeout, capture_output=False, **kwargs):
             out, err = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             kill_tree(process.pid)
-            process.communicate()
+            # Bound the post-kill reap: a descendant stuck in uninterruptible sleep
+            # (D state, e.g. an amdgpu ioctl after a GPU fault) can hold the pipe
+            # open forever, so communicate() without a timeout would hang the
+            # worker. Fall back to killing the direct child; a true D-state is
+            # cleared only by the GPU driver, but the worker no longer blocks.
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
             raise
         return subprocess.CompletedProcess(process.args, process.returncode, out, err)
 

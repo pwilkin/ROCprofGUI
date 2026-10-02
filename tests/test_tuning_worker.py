@@ -46,6 +46,14 @@ class TuningTests(unittest.TestCase):
         self.assertEqual(w.kernel_base('void a::(anonymous namespace)::Gemm<64, true>(void const*)'), 'Gemm')
         self.assertEqual(w.kernel_base('a::(anonymous namespace)::Row(float const*)'), 'Row')
 
+    def test_kernel_base_matches_shared_fixture_with_the_ts_classifier(self):
+        # The same table src/kernelName.test.ts loads: parity between the Python
+        # kernel_base and the TS kernelBase is enforced, not just claimed in a
+        # comment. Includes the degenerate empty head that used to raise IndexError.
+        cases = json.loads((Path(__file__).parent / 'kernel-name-bases.json').read_text())
+        for case in cases:
+            self.assertEqual(w.kernel_base(case['name']), case['base'], case['name'])
+
     def test_mangled_att_kernel_matches_kerncap_name(self):
         self.assertEqual(w.canonical_kernel('_Z5saxpyPKfS0_Pfi'), 'saxpy(float const*, float const*, float*, int)')
         self.assertEqual(w.canonical_kernel('saxpy(float const*, float const*, float*, int) [clone .kd]'), 'saxpy(float const*, float const*, float*, int)')
