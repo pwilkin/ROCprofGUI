@@ -1412,8 +1412,8 @@ impl Server {
                 )
                 .map_err(|e| e.to_string())?;
                 if a["tracer"] == "radv" {
-                    if ["counters", "profiler", "traces", "att", "kernelIncludeRegex", "kernelExcludeRegex", "kernelIterationRange"].iter().any(|key| a.get(*key).is_some()) {
-                        return Err("counters, traces, att, kernelIncludeRegex, kernelExcludeRegex, kernelIterationRange and profiler apply to rocprofv3 only".into());
+                    if rocprofv3_only_run_keys().iter().any(|key| a.get(*key).is_some()) {
+                        return Err(format!("{} apply to tracer rocprofv3 only", rocprofv3_only_run_keys().join(", ")));
                     }
                     let started = std::time::SystemTime::now();
                     let mut vars = vec![
@@ -1501,17 +1501,39 @@ impl Server {
         }
     }
 }
-/// Keys that only mean something for the rocprofv3 attach tracer, rejected for RADV.
-const ROCPROFV3_ONLY_TRIGGER_KEYS: [&str; 8] = [
-    "windowMs",
-    "counters",
-    "traces",
-    "att",
-    "kernelIncludeRegex",
-    "kernelExcludeRegex",
-    "kernelIterationRange",
-    "triggered",
+/// One request key that applies only to the rocprofv3 tracer, tagged with the
+/// contexts it is valid in. The RADV denylists (profile_run's and the
+/// profile_trigger window gate) and the end+collection guard all derive from this
+/// one table, so they cannot drift or fail open on a one-sided edit; a contract
+/// test cross-checks the table against the tool schemas. `run` covers profile_run
+/// (and, for `profiler`, profile_start handled separately); `window` covers a
+/// profile_trigger collection window. `end` is a command, not a collection
+/// option, so it is excluded here and rejected by its own dedicated check.
+struct Rocprofv3OnlyKey {
+    key: &'static str,
+    run: bool,
+    window: bool,
+}
+const ROCPROFV3_ONLY_KEYS: [Rocprofv3OnlyKey; 9] = [
+    Rocprofv3OnlyKey { key: "counters", run: true, window: true },
+    Rocprofv3OnlyKey { key: "traces", run: true, window: true },
+    Rocprofv3OnlyKey { key: "att", run: true, window: true },
+    Rocprofv3OnlyKey { key: "kernelIncludeRegex", run: true, window: true },
+    Rocprofv3OnlyKey { key: "kernelExcludeRegex", run: true, window: true },
+    Rocprofv3OnlyKey { key: "kernelIterationRange", run: true, window: true },
+    Rocprofv3OnlyKey { key: "profiler", run: true, window: false },
+    Rocprofv3OnlyKey { key: "windowMs", run: false, window: true },
+    Rocprofv3OnlyKey { key: "triggered", run: false, window: true },
 ];
+/// rocprofv3-only keys valid on profile_run (the RADV reject list there).
+fn rocprofv3_only_run_keys() -> Vec<&'static str> {
+    ROCPROFV3_ONLY_KEYS.iter().filter(|k| k.run).map(|k| k.key).collect()
+}
+/// rocprofv3-only collection/window keys for a profile_trigger window (the RADV
+/// gate reject list, and the keys `end` may not be combined with).
+fn rocprofv3_only_window_keys() -> Vec<&'static str> {
+    ROCPROFV3_ONLY_KEYS.iter().filter(|k| k.window).map(|k| k.key).collect()
+}
 
 /// Starts the long-lived application for gated live profiling. Shared by the MCP
 /// `profile_start` arm and the `live_profile_start` desktop command.
@@ -1634,8 +1656,8 @@ fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Resu
             if end {
                 return Err("end applies to tracer rocprofv3 only".into());
             }
-            if ROCPROFV3_ONLY_TRIGGER_KEYS.iter().any(|key| a.get(*key).is_some()) {
-                return Err(format!("{} apply to tracer rocprofv3 only", ROCPROFV3_ONLY_TRIGGER_KEYS.join(", ")));
+            if rocprofv3_only_window_keys().iter().any(|key| a.get(*key).is_some()) {
+                return Err(format!("{} apply to tracer rocprofv3 only", rocprofv3_only_window_keys().join(", ")));
             }
             fs::OpenOptions::new().write(true).create_new(true).open(trigger.as_path())
                 .map_err(|e| format!("Cannot create RADV trigger (a previous trigger may still be pending): {e}"))?;
@@ -1646,7 +1668,7 @@ fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Resu
             if end {
                 // end only closes the open window; combining it with collection
                 // options silently dropped them before, so reject that up front.
-                if let Some(key) = ROCPROFV3_ONLY_TRIGGER_KEYS.iter().find(|key| a.get(**key).is_some()) {
+                if let Some(key) = rocprofv3_only_window_keys().iter().find(|key| a.get(**key).is_some()) {
                     return Err(format!("end only closes the open window and cannot be combined with collection options ({key} given); open a new window to change the collection"));
                 }
                 let mut open = window.take().ok_or("No collection window is open to end")?;
@@ -2739,6 +2761,47 @@ mod tests {
             .find(|t| t["name"] == "tuning_action")
             .unwrap()["inputSchema"];
         assert!(validate(&json!({"id":"x","request":{"op":"shell"}}), run).is_err());
+    }
+    #[test]
+    fn rocprofv3_option_vocabulary_matches_the_schema() {
+        use std::collections::BTreeSet;
+        let catalog = tools();
+        let schema = |name: &str| {
+            catalog.iter().find(|t| t["name"] == name).unwrap()["inputSchema"]["properties"].clone()
+        };
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        // The hand-written traces enum and att property set in the tool schemas must
+        // equal the TRACE_STREAMS / ATT_OPTIONS consts that build the rocprofv3
+        // command line, for both tools — a one-sided edit would otherwise accept or
+        // reject streams the other side disagrees with.
+        let trace_names = set(&TRACE_STREAMS.map(|(s, _)| s));
+        let att_names = set(&ATT_OPTIONS.map(|(n, _)| n));
+        for tool in ["profile_run", "profile_trigger"] {
+            let props = schema(tool);
+            let traces_enum: BTreeSet<String> = props["traces"]["items"]["enum"]
+                .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            assert_eq!(traces_enum, trace_names, "{tool} traces enum vs TRACE_STREAMS");
+            let att_props: BTreeSet<String> = props["att"]["properties"]
+                .as_object().unwrap().keys().cloned().collect();
+            assert_eq!(att_props, att_names, "{tool} att properties vs ATT_OPTIONS");
+        }
+        // Every schema key is EITHER a universal key OR a rocprofv3-only key in the
+        // single ROCPROFV3_ONLY_KEYS table — so adding a rocprofv3-only option to a
+        // schema without adding it to the table (which drives the RADV denylists)
+        // fails here, closing the fail-open gap.
+        let run_keys = ROCPROFV3_ONLY_KEYS.iter().filter(|k| k.run).map(|k| k.key).collect::<BTreeSet<_>>();
+        let window_keys = ROCPROFV3_ONLY_KEYS.iter().filter(|k| k.window).map(|k| k.key).collect::<BTreeSet<_>>();
+        let run_universal = set(&["argv", "cwd", "tracer", "env", "timeoutSeconds"]);
+        for key in schema("profile_run").as_object().unwrap().keys() {
+            assert_eq!(run_universal.contains(key), !run_keys.contains(key.as_str()),
+                "profile_run key {key}: must be either a universal key or in ROCPROFV3_ONLY_KEYS(run)");
+        }
+        // `end` is a command (its own check), `id` is universal; all else is a window key.
+        let trigger_universal = set(&["id", "end"]);
+        for key in schema("profile_trigger").as_object().unwrap().keys() {
+            assert_eq!(trigger_universal.contains(key), !window_keys.contains(key.as_str()),
+                "profile_trigger key {key}: must be id/end or in ROCPROFV3_ONLY_KEYS(window)");
+        }
     }
     #[test]
     fn rocprof_streams_combine_and_validate() {
