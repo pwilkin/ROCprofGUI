@@ -33,6 +33,11 @@ const RECORD_HEADER_LEN: usize = 104;
 const SUPPORTED_MAJOR: u16 = 2;
 
 const RECORD_TYPE_CHUNK: u16 = 2;
+const RECORD_TYPE_SESSION_END: u16 = 3;
+
+/// `IREE_HAL_PROFILE_CHUNK_FLAG_TRUNCATED` (profile_sink.h): the chunk is partial
+/// because the producer dropped or truncated data. `chunk_flags` is a `uint64_t`.
+const CHUNK_FLAG_TRUNCATED: u64 = 1 << 0;
 
 /// Content-type prefix shared by every HAL profile chunk.
 const CONTENT_PREFIX: &str = "application/vnd.iree.hal.profile.";
@@ -94,6 +99,12 @@ struct Record<'a> {
     /// Content-type family after [`CONTENT_PREFIX`], e.g. `"dispatch-events"`.
     family: Option<&'a str>,
     payload: &'a [u8],
+    /// `chunk_flags`@80 — carries [`CHUNK_FLAG_TRUNCATED`] for CHUNK records.
+    chunk_flags: u64,
+    /// `dropped_record_count`@88 — typed records the producer omitted (0 if none/unknown).
+    dropped_record_count: u64,
+    /// `session_status_code`@96 — nonzero means a SESSION_END record reports failure.
+    session_status_code: u32,
 }
 
 /// Parses the file header and every record within the logical bundle length.
@@ -114,6 +125,11 @@ fn parse_records(d: &[u8]) -> Result<Vec<Record<'_>>, String> {
     let header_length = u32_at(d, 8)? as usize;
     if header_length < FILE_HEADER_LEN {
         return Err("IRPF file header length is smaller than 24 bytes".into());
+    }
+    // The file-header `flags`@12 field is reserved and must be zero; a nonzero
+    // value means a producer wrote a format revision this importer does not read.
+    if u32_at(d, 12)? != 0 {
+        return Err("IRPF file header reserved flags field is nonzero; refusing to import an unknown format revision".into());
     }
     let file_length = u64_at(d, 16)? as usize;
     if file_length == 0 {
@@ -138,7 +154,16 @@ fn parse_records(d: &[u8]) -> Result<Vec<Record<'_>>, String> {
         let rec_header_length = u32_at(logical, pos + 56)? as usize;
         let content_type_length = u32_at(logical, pos + 60)? as usize;
         let name_length = u32_at(logical, pos + 64)? as usize;
+        // chunk_flags@80, dropped_record_count@88 and session_status_code@96 sit
+        // inside the fixed 104-byte header (bounds already ensured above).
+        let chunk_flags = u64_at(logical, pos + 80)?;
+        let dropped_record_count = u64_at(logical, pos + 88)?;
+        let session_status_code = u32_at(logical, pos + 96)?;
         let record_type = u16_at(logical, pos + 100)?;
+        // The record-header `flags`@102 field is reserved and must be zero.
+        if u16_at(logical, pos + 102)? != 0 {
+            return Err("IRPF record header reserved flags field is nonzero; refusing to import an unknown format revision".into());
+        }
         if rec_header_length < RECORD_HEADER_LEN {
             return Err("IRPF record header length is smaller than 104 bytes".into());
         }
@@ -166,6 +191,9 @@ fn parse_records(d: &[u8]) -> Result<Vec<Record<'_>>, String> {
             record_type,
             family: content_type.strip_prefix(CONTENT_PREFIX),
             payload,
+            chunk_flags,
+            dropped_record_count,
+            session_status_code,
         });
         pos = end;
     }
@@ -183,6 +211,39 @@ fn chunk_bytes(records: &[Record], family: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Whether any CHUNK record of a family is flagged TRUNCATED, and the total
+/// producer-side dropped-record count across that family's chunks. A TRUNCATED
+/// chunk means the producer dropped or truncated data, so the family is partial.
+fn chunk_truncation(records: &[Record], family: &str) -> (bool, u64) {
+    let mut truncated = false;
+    let mut dropped = 0u64;
+    for r in records {
+        if r.record_type == RECORD_TYPE_CHUNK && r.family == Some(family) {
+            if r.chunk_flags & CHUNK_FLAG_TRUNCATED != 0 {
+                truncated = true;
+            }
+            dropped = dropped.saturating_add(r.dropped_record_count);
+        }
+    }
+    (truncated, dropped)
+}
+
+/// Every CHUNK family present in the bundle, in first-seen order — so truncation
+/// can be checked per family without the build function naming them all.
+fn chunk_families<'a>(records: &[Record<'a>]) -> Vec<&'a str> {
+    let mut seen = Vec::new();
+    for r in records {
+        if r.record_type == RECORD_TYPE_CHUNK {
+            if let Some(f) = r.family {
+                if !seen.contains(&f) {
+                    seen.push(f);
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Walks a chunk payload as a packed array of self-sized sub-records, calling
@@ -291,7 +352,12 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
     )?;
     let device = devices.first();
     let frequency_hz = device.and_then(|d| d.frequency_hz).filter(|f| *f > 0);
-    let device_label = format!("HRX device {}", device.map(|d| d.ordinal).unwrap_or(0));
+    // The schema's default ordinal is UINT32_MAX; fabricating "HRX device 0" when
+    // no device record is present would claim an ordinal that was never recorded.
+    let device_label = match device {
+        Some(d) => format!("HRX device {}", d.ordinal),
+        None => "HRX device (unrecorded)".into(),
+    };
 
     // Queue stream id (single queue in the observed bundles) for dispatch scope.
     let queues = walk_subrecords(
@@ -394,9 +460,20 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
         .any(|flags| flags & CLOCK_FLAG_DEVICE_TICK_UNALIGNED != 0);
 
     // Dispatches. Prefer device-timestamped dispatch events; fall back to the
-    // static command-operation dispatch program when a queue-mode bundle carries
-    // no dispatch events.
+    // static command-operation dispatch program ONLY for a genuine queue-mode
+    // bundle (no dispatch-events chunk at all). A TRUNCATED dispatch-events chunk
+    // with zero payload must not silently fall through to the queue arm: that
+    // would relabel a partial dispatch capture as a queue-mode capture with
+    // entirely different timing semantics. The producer contract says precise
+    // execution timelines should fail the session rather than truncate, so we
+    // reject it explicitly instead.
     let dispatch_events = chunk_bytes(&records, "dispatch-events");
+    let (dispatch_truncated, dispatch_dropped) = chunk_truncation(&records, "dispatch-events");
+    if dispatch_events.is_empty() && dispatch_truncated {
+        return Err(format!(
+            "IRPF dispatch-events chunk is TRUNCATED (producer dropped {dispatch_dropped} record(s)) and carries no payload. Refusing to import a partial dispatch capture as complete, and refusing to relabel it as a queue-mode capture. The producer should fail the session rather than truncate dispatch/device timelines (profile_sink.h); re-capture with a bounded filter or a larger sink."
+        ));
+    }
     let (mut dispatches, dispatch_source, origin_tick) = if !dispatch_events.is_empty() {
         let raw = walk_subrecords(
             &dispatch_events,
@@ -508,10 +585,14 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
             // the exact value rocprofv3 reports as Grid_Size (verified on the
             // shared hrx-b99 kernels). Keep workgroup = workgroup size.
             grid: grid_string(&d.workgroup_count, &d.workgroup_size),
-            workgroup: format!(
-                "{} × {} × {}",
-                d.workgroup_size[0], d.workgroup_size[1], d.workgroup_size[2]
-            ),
+            workgroup: if d.workgroup_size.iter().all(|s| *s == 0) {
+                "Not recorded".into()
+            } else {
+                format!(
+                    "{} × {} × {}",
+                    d.workgroup_size[0], d.workgroup_size[1], d.workgroup_size[2]
+                )
+            },
         });
     }
     out.dispatches = model;
@@ -579,6 +660,30 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
             "This queue-mode bundle has no device-timestamped dispatch events; the dispatches are the static command-operation program and carry no execution timing.".into(),
         ),
     }
+    // A TRUNCATED chunk of any family means the producer dropped data; surface it
+    // loudly (naming the family and dropped count) so partial data is never
+    // presented as a complete representation. dispatch-events is handled above
+    // (empty+truncated is rejected); a non-empty-but-truncated dispatch stream is
+    // imported but still warned here.
+    for family in chunk_families(&records) {
+        let (truncated, dropped) = chunk_truncation(&records, family);
+        if truncated {
+            out.warnings.push(format!(
+                "IRPF {family} chunk is TRUNCATED: the producer dropped {dropped} record(s) from this stream. The imported {family} data is partial, not a complete representation of the capture."
+            ));
+        }
+    }
+    // A SESSION_END record with a nonzero status means the profiled session ended
+    // in failure; the capture still imports but must say so rather than present as
+    // a clean run (file_length != 0 only proves finalization, not success).
+    for r in &records {
+        if r.record_type == RECORD_TYPE_SESSION_END && r.session_status_code != 0 {
+            out.warnings.push(format!(
+                "The HRX profiling session ended with a nonzero status code ({}); this capture may be incomplete or reflect a failed run.",
+                r.session_status_code
+            ));
+        }
+    }
     if unaligned {
         out.warnings.push(format!(
             "The {correlation_count} clock-correlation records are flagged DEVICE_TICK_UNALIGNED: the device clock must not be fit to a host timeline. Events keep raw device ordering and tick durations only."
@@ -600,9 +705,12 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
 }
 
 /// Per-dimension global work items (workgroup count × workgroup size), rendered
-/// like the other importers. Returns "Not recorded" when the count is absent.
+/// like the other importers. Returns "Not recorded" when either the count or the
+/// workgroup size is all-zero: the schema defines an all-zero workgroup size as a
+/// dynamic/indirect dispatch (INDIRECT_PARAMETERS), so fabricating `count × 1`
+/// would present an unrecorded grid as a measured one.
 fn grid_string(count: &[u32; 3], size: &[u32; 3]) -> String {
-    if count.iter().all(|c| *c == 0) {
+    if count.iter().all(|c| *c == 0) || size.iter().all(|s| *s == 0) {
         return "Not recorded".into();
     }
     format!(
@@ -634,16 +742,31 @@ mod tests {
     struct Chunk {
         family: String,
         payload: Vec<u8>,
+        flags: u64,
+        dropped: u64,
     }
     fn chunk(family: &str, payload: Vec<u8>) -> Chunk {
         Chunk {
             family: format!("{CONTENT_PREFIX}{family}"),
             payload,
+            flags: 0,
+            dropped: 0,
+        }
+    }
+    fn chunk_truncated(family: &str, payload: Vec<u8>, dropped: u64) -> Chunk {
+        Chunk {
+            family: format!("{CONTENT_PREFIX}{family}"),
+            payload,
+            flags: CHUNK_FLAG_TRUNCATED,
+            dropped,
         }
     }
     fn bundle(chunks: &[Chunk]) -> Vec<u8> {
+        bundle_ex(chunks, 0)
+    }
+    fn bundle_ex(chunks: &[Chunk], session_status: u32) -> Vec<u8> {
         let mut body = Vec::new();
-        let mut push_record = |rtype: u16, ct: &str, payload: &[u8]| {
+        let mut push_record = |rtype: u16, ct: &str, payload: &[u8], flags: u64, dropped: u64, status: u32| {
             let header_len = RECORD_HEADER_LEN as u64;
             let ctl = ct.len() as u32;
             let total = header_len + ct.len() as u64 + payload.len() as u64;
@@ -653,16 +776,19 @@ mod tests {
             h[56..60].copy_from_slice(&(RECORD_HEADER_LEN as u32).to_le_bytes());
             h[60..64].copy_from_slice(&ctl.to_le_bytes());
             h[64..68].copy_from_slice(&0u32.to_le_bytes()); // name_length
+            h[80..88].copy_from_slice(&flags.to_le_bytes()); // chunk_flags
+            h[88..96].copy_from_slice(&dropped.to_le_bytes()); // dropped_record_count
+            h[96..100].copy_from_slice(&status.to_le_bytes()); // session_status_code
             h[100..102].copy_from_slice(&rtype.to_le_bytes());
             body.extend_from_slice(&h);
             body.extend_from_slice(ct.as_bytes());
             body.extend_from_slice(payload);
         };
-        push_record(1, &format!("{CONTENT_PREFIX}session"), &[]);
+        push_record(1, &format!("{CONTENT_PREFIX}session"), &[], 0, 0, 0);
         for c in chunks {
-            push_record(RECORD_TYPE_CHUNK, &c.family, &c.payload);
+            push_record(RECORD_TYPE_CHUNK, &c.family, &c.payload, c.flags, c.dropped, 0);
         }
-        push_record(3, &format!("{CONTENT_PREFIX}session"), &[]);
+        push_record(3, &format!("{CONTENT_PREFIX}session"), &[], 0, 0, session_status);
         let mut out = vec![0u8; FILE_HEADER_LEN];
         out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
         out[4..6].copy_from_slice(&2u16.to_le_bytes());
@@ -878,6 +1004,95 @@ mod tests {
         // walk, not the header check, catches the truncation.
         d[16..24].copy_from_slice(&(cut as u64).to_le_bytes());
         assert!(build(&d, "x".into(), &flag).is_err());
+    }
+
+    #[test]
+    fn truncated_dispatch_events_with_zero_payload_is_rejected_not_relabelled_queue_mode() {
+        // The M1 scenario: a dispatch-mode bundle whose dispatch-events chunk is
+        // TRUNCATED with zero payload must NOT fall back to the command-operations
+        // (queue-mode) arm, which would silently change the timing semantics.
+        let functions = function(1, 0, "ggml_rope_f32");
+        let b = bundle(&[
+            chunk("devices", device(100_000_000)),
+            chunk("executable-functions", functions),
+            chunk_truncated("dispatch-events", Vec::new(), 512),
+        ]);
+        let e = build(&b, "trace.irpf".into(), &AtomicBool::new(false)).unwrap_err();
+        assert!(e.contains("TRUNCATED") && e.contains("512"), "{e}");
+        assert!(!e.contains("queue-mode") || e.contains("refusing to relabel"), "{e}");
+    }
+
+    #[test]
+    fn truncated_aggregate_family_imports_with_a_loud_warning() {
+        // An aggregate observability stream (the contract permits these to
+        // truncate) imports, but the partial data must be flagged, not silent.
+        let mut functions = function(1, 0, "ggml_rope_f32");
+        functions.extend(function(2, 0, "ggml_get_rows_f32"));
+        let mut events = dispatch_event(1, 1, 0, [32, 1, 1], [32, 1, 1], 1000, 1100);
+        events.extend(dispatch_event(2, 2, 0, [3, 2, 1], [256, 1, 1], 1200, 1500));
+        let b = bundle(&[
+            chunk("devices", device(100_000_000)),
+            chunk("executable-functions", functions),
+            chunk("dispatch-events", events),
+            chunk_truncated("command-operations", Vec::new(), 7),
+        ]);
+        let c = build(&b, "trace.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(c.dispatches.len(), 2); // dispatch-events still imported
+        assert!(
+            c.warnings.iter().any(|w| w.contains("command-operations") && w.contains("TRUNCATED") && w.contains('7')),
+            "{:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    fn nonzero_session_status_is_warned() {
+        let functions = function(1, 0, "ggml_rope_f32");
+        let events = dispatch_event(1, 1, 0, [32, 1, 1], [32, 1, 1], 1000, 1100);
+        let b = bundle_ex(
+            &[
+                chunk("devices", device(100_000_000)),
+                chunk("executable-functions", functions),
+                chunk("dispatch-events", events),
+            ],
+            9,
+        );
+        let c = build(&b, "trace.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert!(
+            c.warnings.iter().any(|w| w.contains("nonzero status code") && w.contains('9')),
+            "{:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    fn all_zero_workgroup_size_renders_not_recorded_not_fabricated_grid() {
+        // A dynamic/indirect dispatch (all-zero workgroup_size per the schema) must
+        // not be rendered as `count × 1`, which would present an unrecorded grid as
+        // measured.
+        let functions = function(1, 0, "ggml_dynamic");
+        let events = dispatch_event(1, 1, 0, [8, 1, 1], [0, 0, 0], 1000, 1100);
+        let b = bundle(&[
+            chunk("devices", device(100_000_000)),
+            chunk("executable-functions", functions),
+            chunk("dispatch-events", events),
+        ]);
+        let c = build(&b, "trace.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(c.dispatches[0].grid, "Not recorded");
+        assert_eq!(c.dispatches[0].workgroup, "Not recorded");
+    }
+
+    #[test]
+    fn nonzero_reserved_flag_fields_are_rejected() {
+        // File-header flags@12 nonzero.
+        let mut d = dispatch_bundle();
+        d[12..16].copy_from_slice(&1u32.to_le_bytes());
+        assert!(build(&d, "x".into(), &AtomicBool::new(false)).unwrap_err().contains("reserved flags"));
+        // Record-header flags@102 nonzero (first record header starts at FILE_HEADER_LEN).
+        let mut d = dispatch_bundle();
+        let off = FILE_HEADER_LEN + 102;
+        d[off..off + 2].copy_from_slice(&1u16.to_le_bytes());
+        assert!(build(&d, "x".into(), &AtomicBool::new(false)).unwrap_err().contains("reserved flags"));
     }
 
     // The ROCPROF_MAX_RECORDS cap is exercised in tests/configurable_caps.rs,

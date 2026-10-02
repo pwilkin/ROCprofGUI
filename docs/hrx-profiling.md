@@ -78,7 +78,13 @@ chunks whose payloads are packed arrays of self-sized sub-records tagged with
   function name (by `executable_id` + `function_ordinal`), grid, workgroup and
   start/end ticks. A **queue-mode** bundle has no `dispatch-events`; the importer
   then falls back to the static `command-operations` dispatch program (named,
-  gridded, but with no device timing), clearly labelled as such.
+  gridded, but with no device timing), clearly labelled as such. A
+  `dispatch-events` chunk flagged `TRUNCATED` with **zero payload** is *not*
+  relabelled queue-mode — that would silently change the timing semantics — it is
+  rejected (the producer is expected to fail the session rather than truncate a
+  dispatch/device timeline). An all-zero workgroup size (a dynamic/indirect
+  dispatch per the schema) renders grid and workgroup as `Not recorded`, never as
+  a fabricated `count × 1`.
 - **Kernel names.** Resolved from the `executable-functions` chunk (46 functions
   in both retained bundles, all dispatch names resolved).
 - **Code-object identity.** From `executable-code-objects` +
@@ -111,9 +117,16 @@ the full elapsed span of the dispatch bundle is 552.986 ms.
   samples.
 - Rejects malformed input with an explicit message and never panics: bad magic,
   an unsupported major version, a declared file length past the actual bytes, a
-  truncated record, an over-long sub-record, and an **unfinalized** bundle
+  truncated record, an over-long sub-record, an **unfinalized** bundle
   (`file_length == 0`, which is exactly what the `executable`/`all` modes
-  produce).
+  produce), and a nonzero value in either reserved "must be zero" `flags` field
+  (file header `@12`, record header `@102`).
+- Honours the producer's **chunk-truncation contract**. The record header carries
+  `chunk_flags` (`TRUNCATED`), `dropped_record_count` and `session_status_code`.
+  Any `TRUNCATED` chunk imports with a loud warning naming the family and the
+  dropped-record count, so partial data is never presented as complete; a
+  `SESSION_END` record with a nonzero status code is surfaced as a warning that
+  the run may have failed.
 - Labels provenance: `format = "HRX native profile · IRPF 2.0"`, with
   `metadata.hrxProfileMode`, `hrxFunctionCount`, `hrxDispatchCount`,
   `hrxCodeObjectCount` and `hrxTimestampFrequencyHz`.
