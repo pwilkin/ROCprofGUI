@@ -42,10 +42,6 @@ The six-open-capture limit and the wave-query budgets below (128-wave / 500,000-
 | Timeline HTML export | 512 MiB document, 256 time segments, 512 pages, and a two-mode drawn-record bound: 2,000,000 (native streaming) vs 100,000 (browser). |
 | Portable archive | 100,000 files, 128 MiB manifest, 128 GiB total, 2M instruction/observation caps. |
 
-::: tip Known-stale figures in the repository docs
-The summary cap is 2,000,000 samples — `docs/upstream-parity.md:34` still says 500,000 and is stale (`src/summary.ts:173`). The wave-statistics cap is 4096 waves (128 is only the *viewport* bound) — `docs/architecture.md:144` and `:152` say 128 for both and are wrong (`wave_index.rs:7-8`). This site follows the code.
-:::
-
 ## Correctness caveats (verbatim in substance)
 
 - *"Synthetic example values are not GPU measurements."* The bundled demo exists to explore the interface.

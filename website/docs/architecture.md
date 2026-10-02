@@ -14,8 +14,8 @@ src-tauri/ (Tauri 2 shell: main.rs, mcp.rs, tuning.rs)   commands, MCP server, t
 crates/profile-core/ (Rust: import + analysis)    the one analysis core
 ```
 
-- `crates/profile-core` does all importing and analysis (≈45 files). It also builds the headless importer CLI (`cargo run -p profile-core -- …`) and backs the MCP server. The GUI and the CLI use *different* import dispatchers (`project::load_input_options` vs `import::load_capture_options`); only the GUI path accepts `.rocprof-att`.
-- `src-tauri` registers 46 Tauri commands (`generate_handler!` at `main.rs:1563` — 39 in `main.rs`, 3 in `mcp.rs`, 4 in `tuning.rs`), hosts the [MCP server](/mcp), and owns the [kernel-tuning](/kernel-tuning) subsystem. Its capability set is deliberately tiny: `core:default` + `dialog:allow-open`, with a strict CSP and only the dialog plugin. Every file save/pick goes through Rust.
+- `crates/profile-core` does all importing and analysis (≈45 files). It also builds the headless importer CLI (`cargo run -p profile-core -- …`) and backs the MCP server. The GUI, CLI and MCP all go through one cancellable, fingerprinted import router (`project::load_input` wrapping `import::load_capture_options`), so they accept the same inputs (including `.rocprof-att`).
+- `src-tauri` registers 50 Tauri commands (`generate_handler!` at `main.rs:1563` — 39 in `main.rs`, 7 in `mcp.rs`, 4 in `tuning.rs`), hosts the [MCP server](/mcp), and owns the [kernel-tuning](/kernel-tuning) subsystem. Its capability set is deliberately tiny: `core:default` + `dialog:allow-open`, with a strict CSP and only the dialog plugin. Every file save/pick goes through Rust.
 - `src` is React with no store library: plain hooks in one large `App` component, four Contexts, a `useRef` per-capture "shadow store", and `window` CustomEvents for cross-surface IPC. `src/bridge.ts` is the single IPC seam and the only place the browser-preview fallback is decided. The frontend's pure `.ts` modules carry the analysis math and have sibling Vitest tests; the `.tsx` components are thin and are covered through Playwright.
 
 ## Two things to know
