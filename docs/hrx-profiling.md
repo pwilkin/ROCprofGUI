@@ -229,7 +229,14 @@ rejected, with an explicit message and never a panic, when any of these hold:
   footprint.
 
 The pre-schema public sample, a benchmark result with an embedded older-shaped
-report and no version-zero envelope, is rejected on the same rule.
+report and no version-zero envelope, is rejected on the same rule. The rejection
+names the expected `kind='loom.compile_report'` and `schema_version 0` and
+carries the regenerate-with-this-compiler instruction, under both filenames: a
+`.compile-report.json` copy reaches the Loom validator directly, and the sample
+under its original plain `.json` name — which misses the suffix and the
+content sniff because it has no version-zero discriminator — is still steered to
+the same regeneration guidance because it is recognisably compile-report-shaped.
+Genuinely unrelated JSON keeps the ordinary "unrecognized JSON" message.
 
 ### What it surfaces
 
@@ -247,6 +254,15 @@ limiting resource; the static and dynamic instruction mix; economics; wait plan;
 workload geometry; move causes; planning), the residency constraints, and in
 detail mode the row collections. Every field is optional. A field the compiler
 did not establish stays absent; it is never defaulted to zero.
+
+Over MCP these facts are queryable with `capture_query` and dataset
+`compileReports`: one row per report, each carrying the report- and per-entry
+identity, detail flags, the broken-out target resources (SGPR/VGPR final counts
+and scheduled pressure, subgroup geometry, static occupancy percent, limiting
+resource, residency summary), the instruction mix, the allocation/spill and
+emitted-instruction counters, the wait plan, the workload geometry and the
+residency constraints. Every row carries `unit: "static"` and the version-zero
+stability label, so a client cannot read it as a measurement.
 
 ### What it refuses to infer
 
@@ -271,6 +287,44 @@ importer marks provenance unavailable and says so in a warning, rather than
 guessing. The report file itself is covered by the existing SHA-256 input
 fingerprint on the desktop and MCP import paths.
 
+### A real benchmark envelope
+
+The importer is tested against a real `iree-benchmark-loom` envelope, not only
+synthetic fixtures. `fixtures/loom/shared_memory_vector_tile.benchmark-envelope.compile-report.json`
+(116,031 bytes, sha256 `0390e3e2083054e4eaac6f18263c7af27b78395be423c773e786baa17c7b5747`)
+is the sidecar the benchmark tool wrote while compiling and running one kernel
+once on a gfx1151 GPU. It is an envelope: `type=compile_report`, `state=ok`, with
+`run_id`/`candidate_id`/`candidate_index`/`benchmark`/`case` context wrapping a
+nested `kind=loom.compile_report`, `schema_version=0`, `mode=details` report with
+one entry, `backend=amdgpu-hal`, `target_key=gfx1151`.
+
+It was produced with the provider-enabled tool, which stock public Loom builds do
+not include — the AMDGPU HAL driver must be compiled in. The tool was built from
+pinned hrx-system `32b86d42d96a8e3098d9a56bea201e5f83d44f85` with:
+
+```shell
+python3 dev.py bazel build //loom/src/loom/tools/iree-benchmark-loom:iree-benchmark-loom \
+  --//runtime/config/hal:drivers=amdgpu,task \
+  --//runtime/src/iree/hal/drivers/amdgpu:targets=gfx1151
+```
+
+and run once against the hrx-b99 runtime on gfx1151:
+
+```shell
+iree-benchmark-loom shared_memory_vector_tile.loom \
+  --device=amdgpu --target=amdgpu:gfx1151 \
+  --artifact-bundle-dir=.../bundle --artifact-bundle-policy=debug \
+  --compile-report=details --output-format=jsonl \
+  --iterations=1 --warmup-iterations=0 --batch-size=1 \
+  --min-time-ms=0 --max-batches=1 --stable-p90-to-p50-ppm=0 --input-ring-count=1
+```
+
+`fixtures/loom/PROVENANCE.md` records the tool and source hashes and the full
+discovery. An ungated test (`imports_real_benchmark_envelope_fixture`) imports
+this vendored envelope through the real path and asserts the outer envelope
+context and the nested report's facts; the env-gated real-report test
+additionally sweeps the original `benchmark-live` bundle directory when present.
+
 ## Where this is wired
 
 - Importer: `crates/profile-core/src/irpf.rs`, reached from both the headless
@@ -285,7 +339,14 @@ fingerprint on the desktop and MCP import paths.
   from the same dispatchers by the `.compile-report.json` suffix or a
   `loom.compile_report` content sniff, so a report named `.summary.json` or
   `.details.json` still opens. Tests in `crates/profile-core/tests/loom.rs`:
-  synthetic validation and rejection, detail-flag gating, absent-stays-absent and
-  the benchmark-envelope path run by default; the validation against the retained
-  real reports is `#[ignore]` and gated on `ROCPROF_LOOM_REPORTS_DIR` (default
-  `/devel/tools/loom-reports`).
+  synthetic validation and rejection, detail-flag gating, absent-stays-absent, the
+  benchmark-envelope path, the binary-level routing and regeneration-wording
+  checks (the pre-schema gist under both filenames, and unrelated JSON keeping its
+  message), and the import of the real vendored `fixtures/loom/` envelope all run
+  by default; the validation against the retained real reports is `#[ignore]` and
+  gated on `ROCPROF_LOOM_REPORTS_DIR` (default `/devel/tools/loom-reports`), and
+  now also sweeps the `benchmark-live` bundle directory when present.
+- MCP queryability: `src-tauri/src/mcp.rs` adds `compileReports` to the
+  `capture_query` dataset dispatch (helpers `compile_report_rows` /
+  `target_resource_facts` / `instruction_mix_facts`), tested by
+  `mcp::tests::compile_reports_dataset_surfaces_labelled_static_facts`.

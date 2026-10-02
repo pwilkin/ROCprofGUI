@@ -1132,6 +1132,18 @@ fn load_spm(path: &Path, sampling_method: Option<&str>) -> Result<Capture, Strin
         return Err("Selected PC sampling method is unavailable in this input".into());
     }
     if tools.is_empty() {
+        // A compile report that reached this arm is a pre-schema or drifted Loom
+        // report (the version-zero discriminator was absent, so the suffix/literal
+        // sniff missed it). Name the expected schema and the regenerate path
+        // rather than the generic SPM hint; genuinely unrelated JSON keeps it.
+        if crate::loom_report::looks_like_report(&value) {
+            return Err(format!(
+                "Not a version-zero Loom compile report: expected kind='{}', schema_version {}. {}",
+                crate::loom_report::KIND,
+                crate::loom_report::SCHEMA_VERSION,
+                crate::loom_report::REGENERATE
+            ));
+        }
         return Err("Unrecognized JSON. Select filenames.json for a decoded thread trace or a rocprofv3 SPM results file.".into());
     }
     let mut c = if sampling {

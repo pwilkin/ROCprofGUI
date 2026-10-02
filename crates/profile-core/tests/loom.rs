@@ -409,6 +409,162 @@ fn rejects_pre_schema_gist_shape() {
     assert!(e.contains("kind: expected a string"), "{e}");
 }
 
+// ---- binary-level routing and rejection wording ----
+
+/// Mirrors the real pre-schema public gist: a benchmark RESULT whose embedded
+/// `compile_report` predates schema versioning. It carries the compile-report
+/// signature (an `entries` object, `detail_flags`, target identity and an
+/// instruction mix) but no `kind` and no `schema_version`, and the outer object
+/// is not a `type='compile_report'` envelope. SYNTHETIC, built to the shape of
+/// the retained gist rather than recorded from a tool.
+fn pre_schema_gist() -> Value {
+    json!({
+        "benchmark": "shared_memory_tile",
+        "case": "roundtrip",
+        "status": {"code": 0, "name": "OK"},
+        "measured_duration_ns": 1234,
+        "compile_report": {
+            "artifact_kind": "hal-executable",
+            "status_code": 0,
+            "status": "OK",
+            "detail_flags": 260026047u64,
+            "backend": "amdgpu-hal",
+            "target_family": "amdgpu",
+            "target_key": "gfx1151",
+            "function": "k",
+            "static_instruction_mix": {"vector_alu_count": 2},
+            "entries": {"count": 1, "rows": [{"index": 0, "function": "k"}]}
+        }
+    })
+}
+
+/// The pre-schema gist must be rejected through the real import path with
+/// regeneration guidance under BOTH filenames: its original plain `.json` (which
+/// misses the suffix/literal sniff and reaches the SPM arm) and a byte-identical
+/// `.compile-report.json` copy (which reaches the Loom validator). Neither may
+/// fall back to the generic "unrecognized JSON" hint.
+#[test]
+fn import_routes_pre_schema_gist_to_regeneration_guidance() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = serde_json::to_vec(&pre_schema_gist()).unwrap();
+
+    let original = dir.path().join("shared_memory_tile_benchmark_result.json");
+    std::fs::write(&original, &bytes).unwrap();
+    let e = load_capture(&original).unwrap_err();
+    assert!(e.contains("kind='loom.compile_report'"), "original: {e}");
+    assert!(e.contains("schema_version 0"), "original: {e}");
+    assert!(
+        e.contains("regenerate the report with this compiler checkout"),
+        "original: {e}"
+    );
+    assert!(!e.contains("Unrecognized JSON"), "original: {e}");
+
+    let suffixed = dir
+        .path()
+        .join("shared_memory_tile_benchmark_result.compile-report.json");
+    std::fs::write(&suffixed, &bytes).unwrap();
+    let e = load_capture(&suffixed).unwrap_err();
+    assert!(e.contains("kind='loom.compile_report'"), "suffixed: {e}");
+    assert!(e.contains("schema_version 0"), "suffixed: {e}");
+    assert!(e.contains("type='compile_report'"), "suffixed: {e}");
+    assert!(
+        e.contains("regenerate the report with this compiler checkout"),
+        "suffixed: {e}"
+    );
+}
+
+/// Genuinely unrelated JSON (no compile-report signature) keeps the existing
+/// SPM/thread-trace hint, not the Loom regeneration message.
+#[test]
+fn import_leaves_unrelated_json_with_its_existing_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("something.json");
+    std::fs::write(&path, br#"{"hello":"world","values":[1,2,3]}"#).unwrap();
+    let e = load_capture(&path).unwrap_err();
+    assert!(e.contains("Unrecognized JSON"), "{e}");
+    assert!(!e.contains("regenerate the report"), "{e}");
+}
+
+// ---- real vendored benchmark-envelope fixture (ungated) ----
+
+/// Imports the real `iree-benchmark-loom` envelope vendored under
+/// `fixtures/loom/` through the actual import path and asserts the outer
+/// envelope context and the nested version-zero report facts. See the fixture's
+/// PROVENANCE.md: gfx1151, pinned commit 32b86d42, produced by the
+/// provider-enabled tool.
+#[test]
+fn imports_real_benchmark_envelope_fixture() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../fixtures/loom/shared_memory_vector_tile.benchmark-envelope.compile-report.json",
+    );
+    let capture = load_capture(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(capture.format.contains("Loom compile report"));
+    assert_eq!(capture.unit, "static");
+    assert_eq!(capture.architecture, "gfx1151");
+    // Static facts never land as dispatches, counters or waves.
+    assert!(capture.dispatches.is_empty());
+    assert!(capture.counters.is_empty());
+    assert!(capture.waves.is_empty());
+    assert_eq!(capture.compile_reports.len(), 1);
+
+    let report = &capture.compile_reports[0];
+    assert_eq!(report.container_kind, "benchmarkEnvelope");
+    assert_eq!(report.schema_version, 0);
+    assert_eq!(report.status_code, 0);
+    assert_eq!(report.status_name, "OK");
+    assert_eq!(report.mode, "details");
+    assert_eq!(
+        report.provenance.producing_tool.as_deref(),
+        Some("iree-benchmark-loom")
+    );
+
+    // Outer envelope context (this envelope carries no sample ids; absent stays absent).
+    assert_eq!(report.envelope_context["run_id"], json!("r000173d5b66fd99c"));
+    assert_eq!(report.envelope_context["candidate_id"], json!("c0"));
+    assert_eq!(report.envelope_context["candidate_index"], json!(0));
+    assert_eq!(
+        report.envelope_context["case"],
+        json!("case_shared_memory_vector_tile_roundtrip")
+    );
+    assert_eq!(
+        report.envelope_context["benchmark"],
+        json!("bench_shared_memory_vector_tile_roundtrip")
+    );
+    assert!(!report.envelope_context.contains_key("sample_id"));
+
+    // Nested report identity and facts.
+    assert_eq!(
+        report.identity.get("target_key").map(String::as_str),
+        Some("gfx1151")
+    );
+    assert_eq!(
+        report.identity.get("backend").map(String::as_str),
+        Some("amdgpu-hal")
+    );
+    assert_eq!(report.entries.len(), 1);
+    let entry = &report.entries[0];
+    assert_eq!(entry.display_name, "shared_memory_vector_tile_roundtrip");
+    assert_eq!(entry.counters.get("code_byte_count"), Some(&76));
+    assert_eq!(entry.counters.get("instruction_count"), Some(&14));
+    assert_eq!(entry.counters.get("allocation_spill_count"), Some(&0));
+    assert_eq!(entry.counters.get("local_memory_bytes"), Some(&1024));
+    let tr = entry.sections.get("target_resources").expect("target_resources");
+    assert_eq!(tr["occupancy_percent"], json!(100));
+    assert_eq!(tr["limiting_resource"], json!("max_waves"));
+    assert_eq!(tr["scalar"]["final"]["register_count"], json!(8));
+    assert_eq!(tr["vector"]["final"]["register_count"], json!(8));
+
+    // Report-level wait plan and workload geometry survive.
+    assert_eq!(report.sections["wait_plan"]["action_count"], json!(5));
+    assert_eq!(report.sections["workload"]["dispatch_workitem_count"], json!(64));
+
+    // Labelled as static facts, never a measurement.
+    assert!(capture
+        .warnings
+        .iter()
+        .any(|w| w.contains("version-zero, same-compiler-horizon")));
+}
+
 // ---- real-report integration hook (env-gated) ----
 
 /// Validates the importer against the REAL retained Loom reports. Point
@@ -467,5 +623,56 @@ fn real_reports_validate_and_map() {
             loom_report::parse(&value, "<gist>").is_err(),
             "pre-schema gist must be rejected"
         );
+    }
+
+    // Sweep the real benchmark-live bundle when present: each producer-written
+    // *_compile_report.json is an iree-benchmark-loom envelope with a nested
+    // version-zero report. Import through the real path and confirm the envelope
+    // context and nested facts survive without becoming dispatches.
+    let bench = base.join("benchmark-live");
+    if bench.is_dir() {
+        let mut envelopes = Vec::new();
+        collect_envelopes(&bench, &mut envelopes);
+        for path in &envelopes {
+            assert!(
+                loom_report::is_loom_report(path),
+                "{} not detected as a loom report",
+                path.display()
+            );
+            let capture = load_capture(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(capture.compile_reports.len(), 1, "{}", path.display());
+            let report = &capture.compile_reports[0];
+            assert_eq!(report.container_kind, "benchmarkEnvelope", "{}", path.display());
+            assert_eq!(report.schema_version, 0, "{}", path.display());
+            assert_eq!(report.status_code, 0, "{}", path.display());
+            assert_eq!(report.entries.len(), 1, "{}", path.display());
+            assert!(
+                !report.envelope_context.is_empty(),
+                "{} has no envelope context",
+                path.display()
+            );
+            assert!(capture.dispatches.is_empty(), "{} must not create dispatches", path.display());
+        }
+        eprintln!("swept {} benchmark-live envelope(s)", envelopes.len());
+    }
+}
+
+/// Collects producer-written compile-report envelope files (`*_compile_report.json`)
+/// recursively beneath a directory.
+fn collect_envelopes(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_envelopes(&path, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("compile_report.json"))
+        {
+            out.push(path);
+        }
     }
 }

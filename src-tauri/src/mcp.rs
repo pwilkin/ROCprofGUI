@@ -1063,6 +1063,7 @@ impl Server {
                     "sources" => {
                         return Ok(json!({"paths":profile_core::source_files::recorded_paths(&c)}))
                     }
+                    "compileReports" => json!(compile_report_rows(&c)),
                     _ => return Err("Unknown dataset".into()),
                 };
                 let view = match dataset {
@@ -1947,7 +1948,161 @@ fn new_target(p: &Path) -> Result<(), String> {
     }
 }
 fn summary(c: &Capture) -> Value {
-    json!({"id":c.id,"name":c.name,"path":c.input_path,"format":c.format,"architecture":c.architecture,"unit":c.unit,"start":c.start,"end":c.end,"warnings":c.warnings,"dispatches":c.dispatches.len(),"instructions":c.instructions.len(),"waves":c.waves.len(),"counters":c.counters.len()})
+    json!({"id":c.id,"name":c.name,"path":c.input_path,"format":c.format,"architecture":c.architecture,"unit":c.unit,"start":c.start,"end":c.end,"warnings":c.warnings,"dispatches":c.dispatches.len(),"instructions":c.instructions.len(),"waves":c.waves.len(),"counters":c.counters.len(),"compileReports":c.compile_reports.len()})
+}
+/// Builds the queryable `compileReports` rows: one row per imported Loom compile
+/// report, each carrying its report-level static facts and a nested per-entry
+/// array. These are compile-time static facts (unit "static", version-zero,
+/// same-compiler-horizon), never measurements; the labelling travels with every
+/// row so a client reading the dataset cannot mistake it for runtime data.
+fn compile_report_rows(c: &Capture) -> Vec<Value> {
+    c.compile_reports.iter().map(compile_report_row).collect()
+}
+fn compile_report_row(r: &profile_core::loom_report::LoomCompileReport) -> Value {
+    let mut o = serde_json::Map::new();
+    o.insert("stability".into(), json!(r.stability));
+    o.insert("unit".into(), json!("static"));
+    o.insert("facts".into(), json!("Compile-time static facts from the Loom compiler; not measurements, dispatches or runtime counts. Absent fields are unavailable, not zero. Version-zero, same-compiler-horizon: not comparable across targets or compiler horizons."));
+    o.insert("containerKind".into(), json!(r.container_kind));
+    o.insert("mode".into(), json!(r.mode));
+    o.insert("schemaVersion".into(), json!(r.schema_version));
+    o.insert(
+        "status".into(),
+        json!({"code": r.status_code, "name": r.status_name}),
+    );
+    if !r.identity.is_empty() {
+        o.insert("identity".into(), json!(r.identity));
+    }
+    if let Some(flags) = r.detail_flags {
+        o.insert("detailFlags".into(), json!(flags));
+    }
+    if !r.detail_flag_names.is_empty() {
+        o.insert("detailFlagNames".into(), json!(r.detail_flag_names));
+    }
+    if !r.envelope_context.is_empty() {
+        o.insert("envelopeContext".into(), json!(r.envelope_context));
+    }
+    if let Some(size) = r.artifact_size {
+        o.insert("artifactSize".into(), json!(size));
+    }
+    if !r.config_bindings.is_empty() {
+        o.insert("configBindings".into(), json!(r.config_bindings));
+    }
+    o.insert("provenance".into(), json!(r.provenance));
+    if let Some(tr) = target_resource_facts(r.sections.get("target_resources")) {
+        o.insert("targetResources".into(), tr);
+    }
+    if let Some(mix) = instruction_mix_facts(&r.sections) {
+        o.insert("instructionMix".into(), mix);
+    }
+    if let Some(wp) = r.sections.get("wait_plan") {
+        o.insert("waitPlan".into(), wp.clone());
+    }
+    if let Some(wl) = r.sections.get("workload") {
+        o.insert("workload".into(), wl.clone());
+    }
+    if !r.residency_constraints.is_empty() {
+        o.insert("residencyConstraints".into(), json!(r.residency_constraints));
+    }
+    o.insert(
+        "entries".into(),
+        json!(r.entries.iter().map(compile_entry_row).collect::<Vec<_>>()),
+    );
+    Value::Object(o)
+}
+fn compile_entry_row(e: &profile_core::loom_report::LoomCompileEntry) -> Value {
+    let mut o = serde_json::Map::new();
+    o.insert("index".into(), json!(e.index));
+    o.insert("displayName".into(), json!(e.display_name));
+    if !e.identity.is_empty() {
+        o.insert("identity".into(), json!(e.identity));
+    }
+    if let Some(flags) = e.detail_flags {
+        o.insert("detailFlags".into(), json!(flags));
+    }
+    if !e.detail_flag_names.is_empty() {
+        o.insert("detailFlagNames".into(), json!(e.detail_flag_names));
+    }
+    // Flat integer counters keep their producer names: allocation/spill counts,
+    // emitted instruction counts, code byte counts, local/private memory bytes.
+    if !e.counters.is_empty() {
+        o.insert("counters".into(), json!(e.counters));
+    }
+    if let Some(tr) = target_resource_facts(e.sections.get("target_resources")) {
+        o.insert("targetResources".into(), tr);
+    }
+    if let Some(mix) = instruction_mix_facts(&e.sections) {
+        o.insert("instructionMix".into(), mix);
+    }
+    if let Some(wp) = e.sections.get("wait_plan") {
+        o.insert("waitPlan".into(), wp.clone());
+    }
+    if let Some(wl) = e.sections.get("workload") {
+        o.insert("workload".into(), wl.clone());
+    }
+    Value::Object(o)
+}
+/// Pulls the called-out target-resource facts out of the verbatim section:
+/// SGPR/VGPR final counts plus scheduled pressure, subgroup geometry, the static
+/// occupancy percent, the limiting resource and the residency summary. Absent
+/// sub-fields stay absent rather than defaulting to zero.
+fn target_resource_facts(tr: Option<&Value>) -> Option<Value> {
+    let tr = tr?.as_object()?;
+    let mut out = serde_json::Map::new();
+    let registers = |class: &str| -> Option<Value> {
+        let r = tr.get(class)?.as_object()?;
+        let mut m = serde_json::Map::new();
+        if let Some(v) = r.get("register_class") {
+            m.insert("registerClass".into(), v.clone());
+        }
+        if let Some(f) = r.get("final").and_then(Value::as_object) {
+            if let Some(v) = f.get("register_count") {
+                m.insert("finalRegisterCount".into(), v.clone());
+            }
+            if let Some(v) = f.get("overhead_units") {
+                m.insert("overheadUnits".into(), v.clone());
+            }
+        }
+        if let Some(p) = r.get("scheduled_pressure").and_then(Value::as_object) {
+            if let Some(v) = p.get("peak_live_units") {
+                m.insert("scheduledPeakLiveUnits".into(), v.clone());
+            }
+        }
+        (!m.is_empty()).then(|| Value::Object(m))
+    };
+    if let Some(v) = registers("scalar") {
+        out.insert("sgpr".into(), v);
+    }
+    if let Some(v) = registers("vector") {
+        out.insert("vgpr".into(), v);
+    }
+    for (src, dst) in [
+        ("subgroup_size", "subgroupSize"),
+        ("max_subgroups_per_simd", "maxSubgroupsPerSimd"),
+        ("resident_subgroups_per_simd", "residentSubgroupsPerSimd"),
+        ("occupancy_percent", "occupancyPercent"),
+        ("limiting_resource", "limitingResource"),
+    ] {
+        if let Some(v) = tr.get(src) {
+            out.insert(dst.into(), v.clone());
+        }
+    }
+    if let Some(v) = tr.get("residency") {
+        out.insert("residency".into(), v.clone());
+    }
+    (!out.is_empty()).then(|| Value::Object(out))
+}
+/// Surfaces the static (and dynamic, when present) instruction-mix sections
+/// verbatim under camelCase keys, or nothing when neither is present.
+fn instruction_mix_facts(sections: &BTreeMap<String, Value>) -> Option<Value> {
+    let mut m = serde_json::Map::new();
+    if let Some(v) = sections.get("static_instruction_mix") {
+        m.insert("static".into(), v.clone());
+    }
+    if let Some(v) = sections.get("dynamic_instruction_mix") {
+        m.insert("dynamic".into(), v.clone());
+    }
+    (!m.is_empty()).then(|| Value::Object(m))
 }
 fn page(v: Value, a: &Value, flag: &AtomicBool) -> Result<Value, String> {
     let rows = v.as_array().ok_or("Dataset is not a list")?;
@@ -2012,7 +2167,7 @@ fn tools() -> Vec<Value> {
  ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), or every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3). An open timed window is given up to 180 s to detach on its own; an open triggered window is detached first by writing a newline to rocprofv3's stdin, then given up to 180 s — both abort with a warning past that. Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
  ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex); kernelIterationRange (--kernel-iteration-range, e.g. \"64\" or \"0-3\") selects which occurrences are sampled, the only way to target a dispatch other than the first under a given kernel name. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_,"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
- ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources. Limit <=1000. Counter rows include recorded samples.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":num}),vec!["captureId","dataset"]),
+ ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources, compileReports. Limit <=1000. Counter rows include recorded samples. compileReports returns Loom compile-time STATIC facts (unit static, version-zero/same-compiler-horizon), one row per report with report- and per-entry identity, detail flags, target resources (SGPR/VGPR, subgroup geometry, static occupancy percent, limiting resource, residency), instruction mix, allocation/spill and emitted-instruction counters, wait plan and workload geometry; these are compiler evidence, never measurements, dispatches or runtime counts.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":num}),vec!["captureId","dataset"]),
  ("workspace_select","Follow a capture, view, range, wave, instruction or dispatch in the GUI. Views: reference, trace, hardware, summary, sampling, occupancy, dispatch, hotspots, flame, markers, counters, evidence.",json!({"captureId":str_,"view":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"waveId":str_,"dispatchId":str_,"instruction":num,"timeline":str_,"se":num}),vec!["captureId"]),
  ("wave_read","Read a detailed ATT wave including instruction execution and wait tokens.",json!({"captureId":str_,"waveId":str_}),vec!["captureId","waveId"]),
  ("wave_overview","Load bounded wave/timeline overview bins, optionally architecture-aware SIMD utilization with separate LDS attribution.",json!({"captureId":str_,"indices":{"type":"array","items":num},"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"utilization":{"type":"boolean"},"separateLds":{"type":"boolean"}}),vec!["captureId","indices","range"]),
@@ -2707,5 +2862,86 @@ mod tests {
         assert!(w.get("range").is_none());
         assert!(w.get("dispatchId").is_none());
         assert_eq!(w["view"], "summary");
+    }
+    #[test]
+    fn compile_reports_dataset_surfaces_labelled_static_facts() {
+        // A synthetic version-zero report (no GPU, no compiler), shaped like the
+        // real ones, driven through the same dataset builder capture_query calls.
+        let report_json = json!({
+            "kind": "loom.compile_report",
+            "schema_version": 0,
+            "mode": "details",
+            "status": {"code": 0, "name": "OK"},
+            "function": "k",
+            "backend": "amdgpu-hal",
+            "target_family": "amdgpu",
+            "target_key": "gfx1151",
+            "detail_flags": 1u64 << 13, // TARGET_RESOURCES
+            "static_instruction_mix": {"vector_alu_count": 7, "branch_count": 1},
+            "wait_plan": {"action_count": 5},
+            "workload": {"dispatch_workitem_count": 64},
+            "target_resources": {
+                "scalar": {"register_class": "amdgpu.sgpr", "final": {"register_count": 98, "overhead_units": 2}, "scheduled_pressure": {"peak_live_units": 80}},
+                "vector": {"register_class": "amdgpu.vgpr", "final": {"register_count": 63, "overhead_units": 4}},
+                "subgroup_size": 32,
+                "occupancy_percent": 100,
+                "limiting_resource": "max_waves",
+                "residency": {"best_tier": 16, "current_tier": 16}
+            },
+            "entries": {"count": 1, "rows": [{
+                "index": 0, "function": "k", "source_function": "k",
+                "allocation_spill_count": 0, "code_byte_count": 1794, "instruction_count": 1794,
+                "static_instruction_mix": {"vector_alu_count": 7},
+                "target_resources": {
+                    "scalar": {"register_class": "amdgpu.sgpr", "final": {"register_count": 98}},
+                    "vector": {"register_class": "amdgpu.vgpr", "final": {"register_count": 63}},
+                    "occupancy_percent": 100,
+                    "limiting_resource": "max_waves"
+                }
+            }]}
+        });
+        let report = profile_core::loom_report::parse(&report_json, "<test>").unwrap();
+        let mut capture = Capture::empty(
+            "k.compile-report.json".into(),
+            "Loom compile report (version-zero static facts)",
+            "static",
+        );
+        capture.compile_reports.push(report);
+
+        let rows = compile_report_rows(&capture);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        // Epistemic labelling travels with every row.
+        assert_eq!(r["unit"], json!("static"));
+        assert_eq!(r["stability"], json!(profile_core::loom_report::STABILITY));
+        assert!(r["facts"].as_str().unwrap().contains("not measurements"));
+        assert_eq!(r["schemaVersion"], json!(0));
+        assert_eq!(r["status"]["code"], json!(0));
+        assert_eq!(r["identity"]["target_key"], json!("gfx1151"));
+        assert!(r["detailFlagNames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "TARGET_RESOURCES"));
+        // Report-level target resources are broken out as called for.
+        assert_eq!(r["targetResources"]["sgpr"]["finalRegisterCount"], json!(98));
+        assert_eq!(r["targetResources"]["sgpr"]["scheduledPeakLiveUnits"], json!(80));
+        assert_eq!(r["targetResources"]["vgpr"]["finalRegisterCount"], json!(63));
+        assert_eq!(r["targetResources"]["subgroupSize"], json!(32));
+        assert_eq!(r["targetResources"]["occupancyPercent"], json!(100));
+        assert_eq!(r["targetResources"]["limitingResource"], json!("max_waves"));
+        assert_eq!(r["targetResources"]["residency"]["best_tier"], json!(16));
+        assert_eq!(r["instructionMix"]["static"]["vector_alu_count"], json!(7));
+        assert_eq!(r["waitPlan"]["action_count"], json!(5));
+        assert_eq!(r["workload"]["dispatch_workitem_count"], json!(64));
+        // Per-entry facts: identity, allocation/spill and emitted-instruction
+        // counters, and broken-out target resources.
+        let e = &r["entries"][0];
+        assert_eq!(e["displayName"], json!("k"));
+        assert_eq!(e["counters"]["code_byte_count"], json!(1794));
+        assert_eq!(e["counters"]["instruction_count"], json!(1794));
+        assert_eq!(e["counters"]["allocation_spill_count"], json!(0));
+        assert_eq!(e["targetResources"]["vgpr"]["finalRegisterCount"], json!(63));
+        assert_eq!(e["targetResources"]["occupancyPercent"], json!(100));
     }
 }

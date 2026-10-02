@@ -46,11 +46,15 @@ Required arguments are marked `*`.
 | `workspace` | List open captures, tuning sessions, current view and MCP status. | — |
 | `capture_open` | Import a trace / counters / ATT run / sampling / portable capture from a path. | `path*`, `samplingMethod`, `loadWaveStates` |
 | `capture_close` | Close an imported capture. | `captureId*` |
-| `capture_query` | Page/search a capture dataset (summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources). Limit ≤ 1000. | `captureId*`, `dataset*`, `query`, `offset`, `limit` |
+| `capture_query` | Page/search a capture dataset (summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources, compileReports). Limit ≤ 1000. | `captureId*`, `dataset*`, `query`, `offset`, `limit` |
 | `capture_export` | Export a portable capture to a new path. | `captureId*`, `path*` |
 | `workspace_select` | Follow a capture/view/range/wave/instruction/dispatch in the GUI. | `captureId*`, `view`, `range`, `waveId`, `instruction`, `dispatchId`, `se`, `timeline` |
 | `project_open` | Open a project and restore its captures/workspace. | `path*` |
 | `project_save` | Write a project document to a new path. | `path*`, `project` |
+
+:::note Loom compile reports as static facts
+`capture_query` with `dataset: "compileReports"` returns the imported Loom compile-time facts — one row per report, each with report- and per-entry identity, detail flags, target resources (SGPR/VGPR final counts and scheduled pressure, subgroup geometry, static occupancy percent, limiting resource, residency summary), instruction mix, allocation/spill and emitted-instruction counters, wait plan and workload geometry. Every row carries `unit: "static"` and the version-zero/same-compiler-horizon stability label: these are compiler evidence, never measurements, dispatches or runtime counts, and absent fields stay absent rather than defaulting to zero. A capture with no Loom report returns an empty list. See [Input formats](/input-formats) for the import contract.
+:::
 
 ### Analysis (read-only)
 

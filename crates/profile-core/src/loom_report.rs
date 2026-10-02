@@ -48,6 +48,11 @@ pub const KIND: &str = "loom.compile_report";
 pub const SCHEMA_VERSION: i64 = 0;
 /// The epistemic label attached to every imported report.
 pub const STABILITY: &str = "version-zero, same-compiler-horizon";
+/// The regeneration instruction the stability contract demands. Both the
+/// validator and the import router carry it verbatim, so a report that is
+/// rejected for a schema mismatch always says how to produce an accepted one
+/// rather than guessing at a compatibility path.
+pub const REGENERATE: &str = "Compile reports are version-zero, same-compiler-horizon diagnostics; regenerate the report with this compiler checkout.";
 
 const REPORT_STRING_IDENTITY_FIELDS: &[&str] = &[
     "artifact_kind",
@@ -354,6 +359,52 @@ pub fn is_loom_report(path: &Path) -> bool {
     head[..read].windows(needle.len()).any(|w| w == needle)
 }
 
+/// True when a decoded document is shaped like a Loom compile report even if it
+/// lacks the version-zero discriminator: a direct report (`kind`), a benchmark
+/// envelope (`type='compile_report'`), the pre-schema gist shape (a
+/// `compile_report` object carrying the report signature), or a bare
+/// report-shaped object. The import router uses this to steer a pre-schema or
+/// drifted report to the regeneration message instead of the generic
+/// "unrecognized JSON" rejection, while leaving genuinely unrelated JSON alone.
+pub fn looks_like_report(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if obj.get("kind").and_then(Value::as_str) == Some(KIND) {
+        return true;
+    }
+    if obj.get("type").and_then(Value::as_str) == Some("compile_report") {
+        return true;
+    }
+    if obj.get("compile_report").is_some_and(is_report_shaped) {
+        return true;
+    }
+    is_report_shaped(value)
+}
+
+/// A conservative structural signature for a compile-report body: an `entries`
+/// object plus at least two compiler-specific identity/analysis fields. Chosen
+/// to match the pre-schema gist's embedded report without matching SPM results,
+/// decoded UI JSON or unrelated documents.
+fn is_report_shaped(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if !obj.get("entries").is_some_and(Value::is_object) {
+        return false;
+    }
+    const SIGNATURE: &[&str] = &[
+        "detail_flags",
+        "static_instruction_mix",
+        "target_resources",
+        "target_family",
+        "target_key",
+        "backend",
+        "artifact_kind",
+    ];
+    SIGNATURE.iter().filter(|k| obj.contains_key(**k)).count() >= 2
+}
+
 /// Loads and validates a Loom compile report file into a [`Capture`] of static
 /// compile facts.
 pub fn load(path: &Path) -> Result<Capture, String> {
@@ -399,7 +450,7 @@ pub fn parse(value: &Value, source: &str) -> Result<LoomCompileReport, String> {
         embedded
     } else {
         return Err(format!(
-            "{source}: expected kind='{KIND}' or an explicit type='compile_report' benchmark envelope"
+            "{source}: expected kind='{KIND}' with schema_version {SCHEMA_VERSION}, or an explicit type='compile_report' benchmark envelope wrapping one. {REGENERATE}"
         ));
     };
 
