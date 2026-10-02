@@ -24,13 +24,17 @@ def assert_tree_killed(test, run_tree, root):
         run_tree([sys.executable, '-c', script, str(pidfile)], 1)
     grandchild = Path(f'/proc/{int(pidfile.read_text())}/stat')
     def dead():
-        # A vanished /proc entry (reaped) or a zombie both mean killed. Read in one
-        # shot so there is no exists()/read_text() TOCTOU as the process is torn down.
+        # A zombie, or any error reading /proc as the process is torn down, means
+        # killed. Catch OSError broadly: a reaped pid raises FileNotFoundError or,
+        # on newer kernels/Python, ProcessLookupError (both OSError). Read in one
+        # shot so there is no exists()/read_text() TOCTOU.
         try:
             return grandchild.read_text().split(') ')[-1][0] == 'Z'
-        except FileNotFoundError:
+        except OSError:
             return True
-    deadline = time.time() + 5
+    # Generous deadline: a SIGKILL + reparent + reap can lag under parallel-test
+    # load, and this only bounds how long we wait to observe the (certain) death.
+    deadline = time.time() + 15
     while not dead() and time.time() < deadline:
         time.sleep(0.05)
     test.assertTrue(dead(), 'grandchild survived')
