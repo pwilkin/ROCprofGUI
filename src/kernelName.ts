@@ -40,7 +40,12 @@ export interface KernelNameInfo {
 
 /** A backend-family detector. Returns a classification for names it recognises, or
  *  null to defer to the next matcher / the built-ins. A new backend family registers
- *  one of these instead of editing `classifyKernelName`. */
+ *  one of these instead of editing `classifyKernelName`.
+ *
+ *  Contract: a matcher must be total. If it throws on an unexpected name,
+ *  `classifyKernelName` treats the throw as a `null` (defer to the next matcher),
+ *  so a buggy third-party matcher degrades classification rather than taking down
+ *  the dispatch table — and the React tree with it, since this runs during render. */
 export type KernelFamilyMatcher = (name: string) => KernelNameInfo | null;
 
 const registered: KernelFamilyMatcher[] = [];
@@ -89,7 +94,14 @@ export function classifyKernelName(name: string): KernelNameInfo {
       internal: false,
     };
   for (const matcher of registered) {
-    const hit = matcher(trimmed);
+    // A matcher that throws defers to the next one: classification runs during
+    // render (DispatchView), so one buggy backend matcher must not crash the app.
+    let hit: KernelNameInfo | null = null;
+    try {
+      hit = matcher(trimmed);
+    } catch {
+      hit = null;
+    }
     if (hit) return hit;
   }
   if (trimmed.endsWith("(RADV internal)"))

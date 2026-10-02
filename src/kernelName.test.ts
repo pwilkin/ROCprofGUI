@@ -107,3 +107,28 @@ it("lets a new backend family register a matcher that takes precedence", () => {
   // After unregistering, the custom family no longer applies.
   expect(classifyKernelName("loom::fused_attention").family).toBe("plain");
 });
+
+it("treats a throwing matcher as a defer, not a crash", () => {
+  // classifyKernelName runs during render, so a buggy backend matcher must not
+  // throw out of it; a throw defers to the next matcher / the built-ins.
+  const unregister = registerKernelFamily(() => {
+    throw new Error("matcher bug");
+  });
+  try {
+    expect(() => classifyKernelName("scale_f32(float*)")).not.toThrow();
+    expect(classifyKernelName("scale_f32(float*)").family).toBe("plain");
+    // A later matcher still runs even though the earlier one threw.
+    const after = registerKernelFamily((name) =>
+      name === "scale_f32(float*)"
+        ? { family: "plain", base: "scaled", mangled: false, internal: false }
+        : null,
+    );
+    try {
+      expect(classifyKernelName("scale_f32(float*)").base).toBe("scaled");
+    } finally {
+      after();
+    }
+  } finally {
+    unregister();
+  }
+});
