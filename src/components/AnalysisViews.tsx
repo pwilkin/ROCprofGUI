@@ -37,6 +37,7 @@ import {
 import type { Capture, Instruction, Range, Wave } from "../types";
 import { fmt, colors } from "../types";
 import { kernelStats, occupancy, union } from "../analysis";
+import { isInternalKernel } from "../kernelName";
 import { LineChart } from "./Plots";
 import TensorCounters from "./TensorCounters";
 export function Empty({ title, detail }: { title: string; detail: string }) {
@@ -1377,7 +1378,7 @@ export function DispatchView({
                   <td>{k.waves ? fmt(k.waves) : "—"}</td>
                   <td>{k.activeTime ? fmt(k.activeTime) : "—"}</td>
                   <td>
-                    {onTune && !k.name.endsWith("(RADV internal)") && (
+                    {onTune && !isInternalKernel(k.name) && (
                       <button onClick={() => onTune(capture.dispatches.find((d) => d.kernel === k.name)!)}>
                         {capture.format.startsWith("RADV RGP") ? "Tune shader" : "Tune kernel"}
                       </button>

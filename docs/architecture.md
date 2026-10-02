@@ -106,6 +106,8 @@ The rejection messages are a **cross-language contract**: `src/waveOverview.ts::
 - Upstream viewer inspected at [`ea1ce2b87562b28e3fb5c8819b5e12573cc14424`](https://github.com/ROCm/rocprof-compute-viewer/tree/ea1ce2b87562b28e3fb5c8819b5e12573cc14424).
 - [Tauri architecture](https://v2.tauri.app/concept/architecture/) and [capabilities](https://v2.tauri.app/security/capabilities/).
 - `profiling-caveats.md` records the recovered local evidence and its practical implications.
+- [`kernel-name-layer.md`](kernel-name-layer.md) maps where `Dispatch.kernel` names are produced, parsed and classified, and the checklist a new backend family (e.g. HRX/loom) must satisfy.
+- [`kernel-tuning-parity.md`](kernel-tuning-parity.md) records the HIP (Kerncap) vs Vulkan (vkcap) replay-condition and identity asymmetry.
 
 ### Exact visible-wave statistics
 
