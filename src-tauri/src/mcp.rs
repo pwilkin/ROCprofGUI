@@ -1644,13 +1644,13 @@ fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Resu
         }
         Gate::Rocprofv3 { profiler, window, collection } => {
             if end {
-                let open = window.take().ok_or("No collection window is open to end")?;
+                let mut open = window.take().ok_or("No collection window is open to end")?;
                 if !open.triggered {
                     *window = Some(open);
                     return Err("This window ends on its own timer (windowMs); wait for profile_status to report windowRunning=false".into());
                 }
                 let count = new_triggers;
-                let (detached, warn) = end_triggered_window(open, flag)?;
+                let (detached, warn) = detach(&mut open.child, true, flag)?;
                 let warnings: Vec<String> = warn.into_iter().collect();
                 json!({"id":id,"ended":count,"detached":detached,"directory":folder.join(format!("window-{count}")),"warnings":warnings,"next":"Collect with profile_stop, or trigger again for another window with the same streams, filters and mode"})
             } else {
@@ -1786,25 +1786,12 @@ fn profile_stop_core(control: &Control, a: &Value, flag: &AtomicBool) -> Result<
         }
         Gate::Rocprofv3 { window, .. } => {
             let mut warnings = Vec::new();
-            if let Some(open) = window {
-                if open.triggered {
-                    // A triggered window is ended by a newline on rocprofv3's stdin.
-                    if let (_, Some(warn)) = end_triggered_window(open, flag)? {
-                        warnings.push(warn);
-                    }
-                } else {
-                    // A timed window detaches on its own once its duration ends;
-                    // give it time to write output, then abort it.
-                    let mut open_child = open.child;
-                    let waited = Instant::now();
-                    while open_child.try_wait().map_err(|e| e.to_string())?.is_none() {
-                        if flag.load(Ordering::SeqCst) || waited.elapsed() > Duration::from_secs(180) {
-                            tuning::stop(&mut open_child);
-                            warnings.push("The open collection window was aborted before rocprofv3 detached; its files may be missing or incomplete.".to_owned());
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
+            if let Some(mut open) = window {
+                // A triggered window is detached by a newline (then SIGINT/SIGKILL);
+                // a timed window detaches on its own, so detach only escalates if it
+                // has not finished. One primitive handles both.
+                if let (_, Some(warn)) = detach(&mut open.child, open.triggered, flag)? {
+                    warnings.push(warn);
                 }
             }
             tuning::stop(&mut child);
@@ -1930,24 +1917,49 @@ fn spawn_attach_window(command: &[String], dir: &Path, triggered: bool, pid: u32
     }
 }
 
-/// Ends a triggered attach window: writes a newline to rocprofv3's stdin (its
-/// `input()` returns, which detaches) and waits for a clean exit so
-/// `--attach-sync-output` can finish the files. Aborts after 180 s with a warning.
-fn end_triggered_window(mut window: AttachWindow, flag: &AtomicBool) -> Result<(bool, Option<String>), String> {
-    if let Some(mut stdin) = window.child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(b"\n");
-        let _ = stdin.flush();
-        // Dropping stdin here also closes the pipe (EOF), a second detach signal.
+/// Sends SIGINT to a window's process group. The window is its own group
+/// (`process_group(0)`), so this reaches rocprofv3 and anything it spawned.
+fn send_sigint(child: &Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGINT);
+    }
+}
+
+/// Detaches a rocprofv3 attach window and waits for it to exit so
+/// `--attach-sync-output` can finish writing. For a triggered window
+/// (`write_newline`), first writes a newline to rocprofv3's stdin (its `input()`
+/// returns → detach) and closes the pipe (EOF, a second detach signal). If the
+/// window has not exited after ~30 s, sends SIGINT — rocprofv3's documented
+/// alternative detach signal (docs/using-rocprofv3-process-attachment.rst:93) —
+/// which still flushes the sync-output files; only past 180 s does it SIGKILL,
+/// which can truncate them and leave a surviving target in an unknown attach
+/// state. Returns (detached_cleanly, optional warning). Shared by the `end:true`
+/// trigger path and the profile_stop timed/triggered window collection.
+fn detach(child: &mut Child, write_newline: bool, flag: &AtomicBool) -> Result<(bool, Option<String>), String> {
+    const SIGINT_AFTER: Duration = Duration::from_secs(30);
+    const DEADLINE: Duration = Duration::from_secs(180);
+    if write_newline {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+            // Dropping stdin here also closes the pipe (EOF), a second detach signal.
+        }
     }
     let waited = Instant::now();
+    let mut interrupted = false;
     loop {
-        if window.child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
             return Ok((true, None));
         }
-        if flag.load(Ordering::SeqCst) || waited.elapsed() > Duration::from_secs(180) {
-            tuning::stop(&mut window.child);
-            return Ok((false, Some("The triggered collection window was aborted before rocprofv3 detached (detachment can take 1-2 minutes under ROCm); its files may be missing or incomplete.".to_owned())));
+        if flag.load(Ordering::SeqCst) || waited.elapsed() > DEADLINE {
+            tuning::stop(child);
+            return Ok((false, Some("The collection window was aborted before rocprofv3 detached (detachment can take 1-2 minutes under ROCm); its files may be missing or incomplete.".to_owned())));
+        }
+        if !interrupted && waited.elapsed() > SIGINT_AFTER {
+            send_sigint(child);
+            interrupted = true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2190,7 +2202,7 @@ fn tools() -> Vec<Value> {
  ("profile_start","Start a long-lived application for gated live profiling. tracer radv (default) runs a Vulkan server under RADV RGP file-trigger capture: headless compute needs a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only on swapchain presentation, and the capture gets the next eligible submit after each trigger. tracer rocprofv3 starts a HIP/ROCm application armed with ROCP_TOOL_ATTACH=1 so each profile_trigger attaches rocprofv3 for one bounded, time-based collection window; profiler overrides the rocprofv3 path. Returns an ID and log paths immediately. Only one live profile can run at a time; the process is stopped when rocprof-studio shuts down. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"env":obj,"tracer":{"enum":["radv","rocprofv3"]},"profiler":str_}),vec!["argv","cwd"]),
  ("profile_trigger","Fire one capture in a live profile. tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application, collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) plus optional kernelIncludeRegex/kernelExcludeRegex (mapped to --kernel-include-regex/--kernel-exclude-regex, honoured in attach mode including for att data) and optional kernelIterationRange (mapped to --kernel-iteration-range, e.g. \"64\" or \"0-3\": ATT otherwise samples the FIRST occurrence of each kernel name and a name regex cannot discriminate grids that share a name, so an iteration range is the only way to target a later dispatch) into a window-N directory. Two window modes: a TIMED window (windowMs milliseconds, default 5000) that detaches on its own, or a TRIGGERED window (triggered:true, no windowMs) that stays attached until you end it with profile_trigger end:true (writes a newline to rocprofv3's stdin so it detaches) or profile_stop — use it to capture exactly one request without guessing a duration. A window is time- or trigger-based and cannot isolate a single dispatch; only one window is open at a time; detachment can lag by 1-2 minutes (ROCm); and because rocprofv3 pickles each PID's attach options and reattaches only with identical ones, every window of one process must request the same streams, counters, att, kernel filters AND mode (timed vs triggered) — a mismatch is rejected up front, and an empty window still warns at profile_stop. Attach is retried with backoff when the ROCm set_profiler_active handshake times out on a busy queue; attachAttempts and any attachWarning are reported.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"triggered":{"type":"boolean"},"end":{"type":"boolean"},"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_}),vec!["id"]),
  ("profile_status","Check whether a live profiled process is running. tracer radv also reports whether its trigger is pending and how many RGP saves RADV has announced; tracer rocprofv3 reports whether the current attach window is still open (windowRunning) and whether it is a triggered window (windowTriggered). Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
- ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), or every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3). An open timed window is given up to 180 s to detach on its own; an open triggered window is detached first by writing a newline to rocprofv3's stdin, then given up to 180 s — both abort with a warning past that. Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
+ ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), or every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3). An open triggered window is detached first by writing a newline to rocprofv3's stdin; a timed window detaches on its own. If a window has not detached after ~30 s it is sent SIGINT (rocprofv3's documented alternative detach, which still flushes --attach-sync-output), and only past 180 s is it SIGKILLed with a warning (SIGKILL can truncate the sync-output files). Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
  ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex); kernelIterationRange (--kernel-iteration-range, e.g. \"64\" or \"0-3\") selects which occurrences are sampled, the only way to target a dispatch other than the first under a given kernel name. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_,"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
  ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources, compileReports. Limit <=1000. Counter rows include recorded samples. compileReports returns Loom compile-time STATIC facts (unit static, version-zero/same-compiler-horizon), one row per report with report- and per-entry identity, detail flags, target resources (SGPR/VGPR, subgroup geometry, static occupancy percent, limiting resource, residency), instruction mix, allocation/spill and emitted-instruction counters, wait plan and workload geometry; these are compiler evidence, never measurements, dispatches or runtime counts.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":num}),vec!["captureId","dataset"]),
