@@ -76,3 +76,129 @@ test("live profiling panel drives start, triggered + timed windows, and collect"
   await expect(page.getByText("1 file(s)", { exact: false })).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: "same streams" })).toBeVisible();
 });
+
+// ATT sub-options and kernelIterationRange map through verbatim; a non-numeric
+// window duration is rejected locally instead of silently defaulting to 5000 ms.
+test("live profiling maps ATT sub-options and iteration range, and validates windowMs", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.isTauri = true;
+    w.triggerCalls = [];
+    let count = 0;
+    w.__TAURI_INTERNALS__ = {
+      invoke: async (command: string, payload: any) => {
+        if (command === "mcp_status") return { active: null, revision: 0, workspace: {}, server: null };
+        const args = payload?.args ?? {};
+        if (command === "live_profile_start")
+          return { id: "live-1", pid: 1, directory: "/jobs/live-1" };
+        if (command === "live_profile_trigger") {
+          w.triggerCalls.push(args);
+          count += 1;
+          return { id: "live-1", window: count, mode: "timed", windowMs: args.windowMs ?? null, directory: `/jobs/live-1/window-${count}`, attachAttempts: 1, warnings: [] };
+        }
+        throw Error(command);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await page.getByLabel("Command").fill("/app --model m.gguf");
+  await page.getByLabel("Working directory").fill("/work");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByText("Running live-1")).toBeVisible();
+
+  // The number input blocks non-numeric text at the browser level; an
+  // out-of-range value (0 < 1) is rejected locally, so no trigger is sent and
+  // the Rust range check is no longer unreachable from the UI.
+  await page.getByLabel("Window (ms)").fill("0");
+  await page.getByRole("button", { name: "Trigger window", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "Window (ms) must be a whole number between 1 and 600000" })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).triggerCalls.length)).toBe(0);
+
+  // Valid duration + ATT sub-options + iteration range all map through.
+  await page.getByLabel("Window (ms)").fill("2000");
+  await page.getByLabel("ATT thread trace").check();
+  await page.getByLabel("ATT target CU").fill("3");
+  await page.getByLabel("ATT buffer size (bytes)").fill("536870912");
+  await page.getByLabel("Kernel iteration range").fill("0-3");
+  await page.getByRole("button", { name: "Trigger window", exact: true }).click();
+  await expect(page.getByText("window-1 · timed")).toBeVisible();
+  const sent = await page.evaluate(() => (window as any).triggerCalls.at(-1));
+  expect(sent.windowMs).toBe(2000);
+  expect(sent.att).toEqual({ targetCu: 3, bufferSize: 536870912 });
+  expect(sent.kernelIterationRange).toBe("0-3");
+});
+
+// The error path renders the rejection, and a status refresh does not wipe it.
+test("live profiling surfaces errors and a status refresh keeps them", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.isTauri = true;
+    w.__TAURI_INTERNALS__ = {
+      invoke: async (command: string) => {
+        if (command === "mcp_status") return { active: null, revision: 0, workspace: {}, server: null };
+        if (command === "live_profile_start")
+          return { id: "live-1", pid: 1, directory: "/jobs/live-1" };
+        if (command === "live_profile_trigger")
+          throw "A live profile is already running; stop it here first";
+        if (command === "live_profile_status")
+          return { id: "live-1", running: true, windowRunning: false, triggerCount: 0, directory: "/jobs/live-1" };
+        throw Error(command);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await page.getByLabel("Command").fill("/app");
+  await page.getByLabel("Working directory").fill("/work");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByText("Running live-1")).toBeVisible();
+
+  await page.getByRole("button", { name: "Trigger window", exact: true }).click();
+  const err = page.getByRole("alert").filter({ hasText: "already running" });
+  await expect(err).toBeVisible();
+  // A status refresh must not clear the previous error (it uses clearError=false).
+  await page.getByRole("button", { name: "Refresh status", exact: true }).click();
+  await expect(err).toBeVisible();
+});
+
+// The RADV branch shows "Arm RGP trigger" and hides the rocprofv3-only inputs.
+test("live profiling RADV branch arms an RGP trigger", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.isTauri = true;
+    w.triggerCalls = [];
+    w.__TAURI_INTERNALS__ = {
+      invoke: async (command: string, payload: any) => {
+        if (command === "mcp_status") return { active: null, revision: 0, workspace: {}, server: null };
+        if (command === "live_profile_start")
+          return { id: "live-radv", pid: 2, directory: "/jobs/live-radv", triggerFile: "/jobs/live-radv/radv-trigger" };
+        if (command === "live_profile_trigger") {
+          w.triggerCalls.push(payload?.args ?? {});
+          return { id: "live-radv", triggerFile: "/jobs/live-radv/radv-trigger", triggerCount: 1 };
+        }
+        throw Error(command);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await page.getByLabel("Tracer").selectOption("radv");
+  await page.getByLabel("Command").fill("/vk-app");
+  await page.getByLabel("Working directory").fill("/work");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByText("Running live-radv")).toBeVisible();
+  await expect(page.getByLabel("Window mode")).toHaveCount(0);
+  await page.getByRole("button", { name: "Arm RGP trigger", exact: true }).click();
+  const sent = await page.evaluate(() => (window as any).triggerCalls.at(-1));
+  expect(sent).toEqual({ id: "live-radv" });
+});
+
+// Outside the desktop app the panel explains it is desktop-only and runs no IPC.
+test("live profiling is desktop-only in the browser preview", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Live profiling", level: 1 })).toBeVisible();
+  await expect(page.getByText("runs only in the desktop app")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start profiling" })).toHaveCount(0);
+});

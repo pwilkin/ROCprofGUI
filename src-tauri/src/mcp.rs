@@ -361,12 +361,30 @@ pub fn mcp_capture(
 // on a blocking task because trigger/stop can wait seconds (attach confirmation,
 // detach). They are not in `block_local_invoke`'s allowlist, so they are refused
 // while an MCP action is active; only the read-only status poll is allowlisted.
+// Their errors pass through desktop_error so the panel never names an MCP tool.
+
+/// Rewrites core error strings (written in MCP tool-name vocabulary) into desktop
+/// panel wording, so the Live profiling panel never tells a user to run a tool
+/// that does not exist in the GUI. The logic is shared; only the words differ.
+fn desktop_error(e: String) -> String {
+    match e.as_str() {
+        "A live profile is already running; use profile_stop first" =>
+            "A live profile is already running; stop it here first, or (if the MCP server started it) cancel the MCP session".into(),
+        "No live profile; use profile_start first" | "No live profile; use profile_stop to collect a finished run" =>
+            "No live profile is running; start one first".into(),
+        "No live profile" => "No live profile is running".into(),
+        "Profiled process has exited; use profile_stop to collect artifacts" =>
+            "The profiled process has exited; stop and collect to gather its artifacts".into(),
+        _ => e,
+    }
+}
 #[tauri::command]
 pub async fn live_profile_start(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
     let control = control.inner().clone();
     tauri::async_runtime::spawn_blocking(move || profile_start_core(&control, &args))
         .await
         .map_err(|e| e.to_string())?
+        .map_err(desktop_error)
 }
 #[tauri::command]
 pub async fn live_profile_trigger(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
@@ -376,6 +394,7 @@ pub async fn live_profile_trigger(control: tauri::State<'_, Arc<Control>>, args:
     tauri::async_runtime::spawn_blocking(move || profile_trigger_core(&control, &args, &cancel))
         .await
         .map_err(|e| e.to_string())?
+        .map_err(desktop_error)
 }
 #[tauri::command]
 pub async fn live_profile_status(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
@@ -383,6 +402,7 @@ pub async fn live_profile_status(control: tauri::State<'_, Arc<Control>>, args: 
     tauri::async_runtime::spawn_blocking(move || profile_status_core(&control, &args))
         .await
         .map_err(|e| e.to_string())?
+        .map_err(desktop_error)
 }
 #[tauri::command]
 pub async fn live_profile_stop(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
@@ -392,6 +412,7 @@ pub async fn live_profile_stop(control: tauri::State<'_, Arc<Control>>, args: Va
     tauri::async_runtime::spawn_blocking(move || profile_stop_core(&control, &args, &cancel))
         .await
         .map_err(|e| e.to_string())?
+        .map_err(desktop_error)
 }
 
 fn random() -> Result<String, String> {
@@ -2924,6 +2945,23 @@ mod tests {
         assert_eq!(c.status()["liveProfile"], json!("unavailable"));
         drop(held);
         assert!(c.status()["liveProfile"].is_null());
+    }
+    #[test]
+    fn desktop_error_maps_mcp_tool_vocabulary() {
+        // The panel's buttons are "Start profiling"/"Stop and collect"; it must
+        // never surface the MCP tool names profile_start/profile_stop.
+        for mcp in [
+            "A live profile is already running; use profile_stop first",
+            "No live profile; use profile_start first",
+            "No live profile; use profile_stop to collect a finished run",
+            "No live profile",
+            "Profiled process has exited; use profile_stop to collect artifacts",
+        ] {
+            let mapped = desktop_error(mcp.into());
+            assert!(!mapped.contains("profile_start") && !mapped.contains("profile_stop"), "{mcp} -> {mapped}");
+        }
+        // Errors with no MCP vocabulary pass through unchanged.
+        assert_eq!(desktop_error("windowMs must be between 1 and 600000".into()), "windowMs must be between 1 and 600000");
     }
     #[test]
     fn mcp_cancel_reaches_a_desktop_live_profile_op() {

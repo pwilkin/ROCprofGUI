@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   desktop,
   liveProfileStart,
@@ -23,8 +23,13 @@ export default function LiveProfiling() {
   const [traces, setTraces] = useState("");
   const [counters, setCounters] = useState("");
   const [att, setAtt] = useState(false);
+  const [attTargetCu, setAttTargetCu] = useState("");
+  const [attSimdSelect, setAttSimdSelect] = useState("");
+  const [attBufferSize, setAttBufferSize] = useState("");
+  const [attShaderEngineMask, setAttShaderEngineMask] = useState("");
   const [includeRegex, setIncludeRegex] = useState("");
   const [excludeRegex, setExcludeRegex] = useState("");
+  const [iterationRange, setIterationRange] = useState("");
   const [profile, setProfile] = useState<Json | null>(null);
   const [status, setStatus] = useState<Json | null>(null);
   const [result, setResult] = useState<Json | null>(null);
@@ -33,17 +38,37 @@ export default function LiveProfiling() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  // Guard against setState after an in-flight invoke resolves post-unmount
+  // (the panel unmounts when the user switches views), following McpControl.
+  // Set true on each effect run so StrictMode's mount/unmount/mount in dev
+  // leaves the ref true, not stuck false after the first cleanup.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
   const rocprofv3 = tracer === "rocprofv3";
   const list = (s: string) => s.split(/[\s,]+/).filter(Boolean);
-  const run = async (fn: () => Promise<void>) => {
+  // Parses a nonnegative-integer option field; blank means "not set".
+  const intOption = (label: string, raw: string): number | undefined => {
+    const t = raw.trim();
+    if (t === "") return undefined;
+    const n = Number(t);
+    if (!Number.isInteger(n) || n < 0) throw new Error(`${label} must be a nonnegative integer`);
+    return n;
+  };
+  // A status refresh must not wipe a previous action's error, so poll passes
+  // clearError=false; every other action clears before it runs.
+  const run = async (fn: () => Promise<void>, clearError = true) => {
     setBusy(true);
-    setError("");
+    if (clearError) setError("");
     try {
       await fn();
     } catch (e) {
-      setError(String(e));
+      if (mounted.current) setError(String(e));
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   };
 
@@ -52,6 +77,7 @@ export default function LiveProfiling() {
       const args: Json = { argv: list(argv), cwd, tracer };
       if (rocprofv3 && profiler.trim()) args.profiler = profiler.trim();
       const started = await liveProfileStart(args);
+      if (!mounted.current) return;
       setProfile(started);
       setStatus(null);
       setResult(null);
@@ -65,14 +91,34 @@ export default function LiveProfiling() {
       const args: Json = { id: profile.id as string };
       if (rocprofv3) {
         if (triggered) args.triggered = true;
-        else args.windowMs = Number(windowMs);
+        else {
+          // Validate here so a non-numeric/out-of-range value surfaces an error
+          // instead of coercing to NaN -> null -> the silent 5000 ms default.
+          const ms = Number(windowMs);
+          if (!Number.isInteger(ms) || ms < 1 || ms > 600000)
+            throw new Error("Window (ms) must be a whole number between 1 and 600000");
+          args.windowMs = ms;
+        }
         if (traces.trim()) args.traces = list(traces);
         if (counters.trim()) args.counters = list(counters);
-        if (att) args.att = {};
+        if (att) {
+          const opts: Json = {};
+          const targetCu = intOption("Target CU", attTargetCu);
+          const simdSelect = intOption("SIMD select", attSimdSelect);
+          const bufferSize = intOption("Buffer size", attBufferSize);
+          const shaderEngineMask = intOption("Shader engine mask", attShaderEngineMask);
+          if (targetCu !== undefined) opts.targetCu = targetCu;
+          if (simdSelect !== undefined) opts.simdSelect = simdSelect;
+          if (bufferSize !== undefined) opts.bufferSize = bufferSize;
+          if (shaderEngineMask !== undefined) opts.shaderEngineMask = shaderEngineMask;
+          args.att = opts;
+        }
         if (includeRegex.trim()) args.kernelIncludeRegex = includeRegex.trim();
         if (excludeRegex.trim()) args.kernelExcludeRegex = excludeRegex.trim();
+        if (iterationRange.trim()) args.kernelIterationRange = iterationRange.trim();
       }
       const res = await liveProfileTrigger(args);
+      if (!mounted.current) return;
       if (typeof res.window === "number")
         setWindows((w) => [...w, { count: res.window as number, mode: String(res.mode ?? "timed") }]);
       if (res.mode === "triggered") setOpenTriggered(true);
@@ -83,6 +129,7 @@ export default function LiveProfiling() {
     run(async () => {
       if (!profile) return;
       const res = await liveProfileTrigger({ id: profile.id as string, end: true });
+      if (!mounted.current) return;
       setOpenTriggered(false);
       setStatus(res);
     });
@@ -90,13 +137,16 @@ export default function LiveProfiling() {
   const poll = () =>
     run(async () => {
       if (!profile) return;
-      setStatus(await liveProfileStatus(profile.id as string));
-    });
+      const res = await liveProfileStatus(profile.id as string);
+      if (!mounted.current) return;
+      setStatus(res);
+    }, false);
 
   const stop = () =>
     run(async () => {
       if (!profile) return;
       const res = await liveProfileStop(profile.id as string);
+      if (!mounted.current) return;
       setResult(res);
       setProfile(null);
       setStatus(null);
@@ -190,7 +240,14 @@ export default function LiveProfiling() {
               {!triggered && (
                 <label>
                   Window (ms)
-                  <input value={windowMs} onChange={(e) => setWindowMs(e.target.value)} disabled={busy} />
+                  <input
+                    type="number"
+                    min={1}
+                    max={600000}
+                    value={windowMs}
+                    onChange={(e) => setWindowMs(e.target.value)}
+                    disabled={busy}
+                  />
                 </label>
               )}
               <label>
@@ -210,6 +267,26 @@ export default function LiveProfiling() {
                 <input type="checkbox" checked={att} onChange={(e) => setAtt(e.target.checked)} disabled={busy} />
                 ATT thread trace
               </label>
+              {att && (
+                <div className="live-att">
+                  <label>
+                    ATT target CU
+                    <input type="number" min={0} value={attTargetCu} onChange={(e) => setAttTargetCu(e.target.value)} disabled={busy} />
+                  </label>
+                  <label>
+                    ATT SIMD select
+                    <input type="number" min={0} value={attSimdSelect} onChange={(e) => setAttSimdSelect(e.target.value)} disabled={busy} />
+                  </label>
+                  <label>
+                    ATT buffer size (bytes)
+                    <input type="number" min={0} value={attBufferSize} onChange={(e) => setAttBufferSize(e.target.value)} disabled={busy} />
+                  </label>
+                  <label>
+                    ATT shader engine mask
+                    <input type="number" min={0} value={attShaderEngineMask} onChange={(e) => setAttShaderEngineMask(e.target.value)} disabled={busy} />
+                  </label>
+                </div>
+              )}
               <label>
                 Kernel include regex
                 <input value={includeRegex} onChange={(e) => setIncludeRegex(e.target.value)} disabled={busy} />
@@ -217,6 +294,15 @@ export default function LiveProfiling() {
               <label>
                 Kernel exclude regex
                 <input value={excludeRegex} onChange={(e) => setExcludeRegex(e.target.value)} disabled={busy} />
+              </label>
+              <label>
+                Kernel iteration range
+                <input
+                  value={iterationRange}
+                  onChange={(e) => setIterationRange(e.target.value)}
+                  placeholder="64 or 0-3 (targets a later dispatch under a kernel name)"
+                  disabled={busy}
+                />
               </label>
               <div className="live-actions">
                 <button onClick={trigger} disabled={busy || openTriggered}>
