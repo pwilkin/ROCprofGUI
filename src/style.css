@@ -2211,3 +2211,16 @@ select {
 .mcp-lock-card strong { font-size: 18px; }.mcp-lock-card p { margin: 7px 0; }.mcp-lock-card button { color: #fff; background: #994129; padding: 8px 16px; }
 .mcp-connection { position: fixed; bottom: 8px; right: 12px; z-index: 900; max-width: 560px; padding: 6px 12px; background: #19212f; color: #eef4ff; border: 1px solid #526075; border-radius: 8px; font-size: 12px; }
 .tuning-conditions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:16px 0 0;padding:12px 14px;border:1px solid var(--border);border-radius:8px;}.tuning-conditions legend{font-weight:600;padding:0 6px;}.tuning-conditions label{display:flex;align-items:center;gap:8px;}.tuning-conditions input[type="number"]{width:70px;}.tuning-conditions p{flex-basis:100%;margin:0;font-size:12px;color:var(--muted);}
+.live-profiling{max-width:760px;}
+.live-profiling .live-form,.live-profiling .live-session{display:flex;flex-direction:column;gap:12px;margin-top:16px;max-width:560px;}
+.live-profiling label{display:flex;flex-direction:column;gap:5px;font-size:13px;font-weight:600;color:var(--muted);}
+.live-profiling label.live-check{flex-direction:row;align-items:center;gap:8px;}
+.live-profiling input,.live-profiling select,.live-profiling textarea{font:inherit;font-weight:400;padding:7px 9px;border:1px solid var(--border);border-radius:7px;background:var(--panel);color:inherit;}
+.live-profiling textarea{min-height:52px;resize:vertical;font-family:ui-monospace,monospace;}
+.live-profiling .live-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:4px;}
+.live-profiling .live-id{font-size:14px;}
+.live-profiling .live-windows ul{margin:6px 0 0;padding-left:18px;}
+.live-profiling .live-windows li{font-family:ui-monospace,monospace;font-size:13px;}
+.live-profiling .live-status{font-size:13px;color:var(--muted);}
+.live-profiling .live-warning{border-left:3px solid #e6b66c;padding:6px 10px;background:#e6b66c1a;border-radius:4px;font-size:13px;}
+.live-profiling .live-error{border-left:3px solid #c0493a;padding:6px 10px;background:#c0493a1a;border-radius:4px;font-size:13px;}

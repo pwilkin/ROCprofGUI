@@ -87,6 +87,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   X,
+  Zap,
 } from "lucide-react";
 import {
   cancelImport,
@@ -110,6 +111,7 @@ import { categories, colors, fmt } from "./types";
 import { Timeline, type Mark } from "./components/Plots";
 import MarkersView from "./components/MarkersView";
 import IsaReference from "./components/IsaReference";
+import LiveProfiling from "./components/LiveProfiling";
 import SummaryView from "./components/SummaryView";
 import PcSampling from "./components/PcSampling";
 import { clockModel, utilizationToken } from "./utilization";
@@ -141,6 +143,7 @@ const views = [
   { id: "markers", name: "Marker scopes", icon: Layers3 },
   { id: "counters", name: "Counters", icon: Gauge },
   { id: "evidence", name: "Capture evidence", icon: ShieldCheck },
+  { id: "live", name: "Live profiling", icon: Zap },
 ];
 const tracePanels = [
   { id: "trace-wave", name: "Target wave" },
@@ -1519,6 +1522,10 @@ export default function App() {
               {view === "reference" ? (
                 <div className="content">
                   <IsaReference lookup={isaLookup} architecture={mcpIsa?.architecture} revision={mcpIsa?.revision} />
+                </div>
+              ) : view === "live" ? (
+                <div className="content">
+                  <LiveProfiling />
                 </div>
               ) : capture ? (
                 <>

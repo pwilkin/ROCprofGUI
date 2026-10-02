@@ -184,8 +184,37 @@ struct Undelivered {
 const READ_ONLY_TOOLS: [&str; 2] = ["tuning_status", "profile_status"];
 /// How a live profile is gated: RADV RGP file triggers, or rocprofv3 attach windows.
 enum Gate {
-    Radv { trigger: PathBuf },
-    Rocprofv3 { profiler: String, window: Option<Child> },
+    Radv {
+        trigger: PathBuf,
+    },
+    Rocprofv3 {
+        profiler: String,
+        /// The attach window currently open, if any.
+        window: Option<AttachWindow>,
+        /// The collection/filter selection fixed by this process's first window.
+        /// rocprofv3 pickles each PID's attach options in `/tmp/rocprofv3_attach_<pid>.pkl`
+        /// and reattaches only with identical options, so every window must match it.
+        collection: Option<Collection>,
+    },
+}
+/// One rocprofv3 attach window.
+struct AttachWindow {
+    child: Child,
+    #[allow(dead_code)]
+    directory: PathBuf,
+    /// true when the window carries no `--attach-duration-msec` and detaches on a
+    /// newline written to rocprofv3's stdin (its `input()` returns); false for a
+    /// timed window that detaches on its own after `windowMs`.
+    triggered: bool,
+}
+/// The per-process collection signature every attach window of one process shares.
+#[derive(Clone, PartialEq)]
+struct Collection {
+    /// Normalized rocprofv3 collection and kernel-filter flags (without the
+    /// per-window `--output-*`/`--attach-*` options).
+    args: Vec<String>,
+    /// Whether windows are triggered (no duration) or timed (`windowMs`).
+    triggered: bool,
 }
 struct LiveProfile {
     id: String,
@@ -310,6 +339,37 @@ pub fn mcp_capture(
         .get(&id)
         .cloned()
         .ok_or("Capture closed".into())
+}
+
+// Desktop "Live profiling" panel commands. They share the exact core the MCP
+// arms call (profile_*_core), so the logic is not forked. The mutating ones run
+// on a blocking task because trigger/stop can wait seconds (attach confirmation,
+// detach). They are not in `block_local_invoke`'s allowlist, so they are refused
+// while an MCP action is active; only the read-only status poll is allowlisted.
+#[tauri::command]
+pub async fn live_profile_start(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
+    let control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || profile_start_core(&control, &args))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn live_profile_trigger(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
+    let control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || profile_trigger_core(&control, &args, &AtomicBool::new(false)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub fn live_profile_status(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
+    profile_status_core(&control, &args)
+}
+#[tauri::command]
+pub async fn live_profile_stop(control: tauri::State<'_, Arc<Control>>, args: Value) -> Result<Value, String> {
+    let control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || profile_stop_core(&control, &args, &AtomicBool::new(false)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn random() -> Result<String, String> {
@@ -1301,188 +1361,10 @@ impl Server {
                     Ok(data)
                 }
             }
-            "profile_start" => {
-                let argv: Vec<String> = serde_json::from_value(a["argv"].clone()).map_err(|e| e.to_string())?;
-                if argv.is_empty() {
-                    return Err("Application argv cannot be empty".into());
-                }
-                let tracer = a["tracer"].as_str().unwrap_or("radv");
-                if !["radv", "rocprofv3"].contains(&tracer) {
-                    return Err("tracer must be radv or rocprofv3".into());
-                }
-                if tracer != "rocprofv3" && a.get("profiler").is_some() {
-                    return Err("profiler applies to tracer rocprofv3 only".into());
-                }
-                let env = profile_env(a)?;
-                if tracer == "radv" && env.iter().any(|(key, _)| ["MESA_VK_TRACE", "MESA_VK_TRACE_PER_SUBMIT", "MESA_VK_TRACE_TRIGGER", "MESA_VK_TRACE_FRAME"].contains(&key.as_str())) {
-                    return Err("RADV trace control variables are managed by profile_start".into());
-                }
-                if tracer == "rocprofv3" && env.iter().any(|(key, _)| key == "ROCP_TOOL_ATTACH") {
-                    return Err("ROCP_TOOL_ATTACH is managed by profile_start".into());
-                }
-                let cwd = Path::new(text(a, "cwd")?);
-                let mut live = self.control.live_profile.lock().unwrap();
-                if live.is_some() {
-                    return Err("A live profile is already running; use profile_stop first".into());
-                }
-                let folder = job_directory()?;
-                let id = folder.file_name().unwrap().to_string_lossy().into_owned();
-                let mut vars = env;
-                let (gate, capture_mode) = if tracer == "radv" {
-                    let trigger = folder.join("radv-trigger");
-                    vars.extend([
-                        ("MESA_VK_TRACE".to_owned(), "rgp".to_owned()),
-                        ("MESA_VK_TRACE_PER_SUBMIT".to_owned(), "0".to_owned()),
-                        ("MESA_VK_TRACE_TRIGGER".to_owned(), trigger.to_string_lossy().into_owned()),
-                    ]);
-                    (Gate::Radv { trigger }, "file-trigger")
-                } else {
-                    vars.push(("ROCP_TOOL_ATTACH".to_owned(), "1".to_owned()));
-                    let profiler = a["profiler"].as_str().unwrap_or("/opt/rocm/bin/rocprofv3").to_owned();
-                    (Gate::Rocprofv3 { profiler, window: None }, "attach-window")
-                };
-                fs::write(folder.join("profile.json"), serde_json::to_vec_pretty(&json!({"tracer":tracer,"captureMode":capture_mode,"argv":argv,"cwd":cwd,"env":a.get("env").cloned().unwrap_or(json!({}))})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-                let started = SystemTime::now();
-                let child = spawn_process_env(&argv, cwd, &folder, &vars)?;
-                let pid = child.id();
-                let trigger_file = match &gate {
-                    Gate::Radv { trigger } => Some(trigger.clone()),
-                    Gate::Rocprofv3 { .. } => None,
-                };
-                *live = Some(LiveProfile { id: id.clone(), child, folder: folder.clone(), program: argv[0].clone(), started, triggers: 0, gate });
-                Ok(match trigger_file {
-                    Some(trigger) => json!({"id":id,"pid":pid,"directory":folder,"triggerFile":trigger,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"driverRequirement":"Headless compute file triggers require a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only during swapchain presentation.","next":"Wait for the server to become ready, call profile_trigger, send one inference request, wait for savedMessages, then call profile_stop to collect captures"}),
-                    None => json!({"id":id,"pid":pid,"directory":folder,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"armRequirement":"The application is started with ROCP_TOOL_ATTACH=1 so the ROCm runtime keeps an attach thread ready; rocprofv3 can attach only to processes armed this way.","next":"Wait for the application to become ready, call profile_trigger with windowMs and the streams to collect (counters, traces, att), send the workload during the window, wait for profile_status windowRunning=false, then call profile_stop to collect every window"}),
-                })
-            }
-            "profile_trigger" => {
-                let mut live = self.control.live_profile.lock().unwrap();
-                let profile = live.as_mut().ok_or("No live profile; use profile_start first")?;
-                if profile.id != text(a, "id")? {
-                    return Err("Live profile ID does not match".into());
-                }
-                if profile.child.try_wait().map_err(|e| e.to_string())?.is_some() {
-                    return Err("Profiled process has exited; use profile_stop to collect artifacts".into());
-                }
-                let pid = profile.child.id();
-                match &mut profile.gate {
-                    Gate::Radv { trigger } => {
-                        if ["windowMs", "counters", "traces", "att"].iter().any(|key| a.get(*key).is_some()) {
-                            return Err("windowMs, counters, traces and att apply to tracer rocprofv3 only".into());
-                        }
-                        fs::OpenOptions::new().write(true).create_new(true).open(trigger.as_path())
-                            .map_err(|e| format!("Cannot create RADV trigger (a previous trigger may still be pending): {e}"))?;
-                        profile.triggers += 1;
-                        Ok(json!({"id":profile.id,"triggerFile":trigger,"triggerCount":profile.triggers,"next":"Send the inference request now; RADV captures the next eligible frame or submit"}))
-                    }
-                    Gate::Rocprofv3 { profiler, window } => {
-                        if let Some(open) = window {
-                            if open.try_wait().map_err(|e| e.to_string())?.is_none() {
-                                return Err("A collection window is still open; wait for profile_status to report windowRunning=false".into());
-                            }
-                        }
-                        let ms = a["windowMs"].as_u64().unwrap_or(5000);
-                        if !(1..=600_000).contains(&ms) {
-                            return Err("windowMs must be between 1 and 600000".into());
-                        }
-                        let count = profile.triggers + 1;
-                        let directory = profile.folder.join(format!("window-{count}"));
-                        fs::create_dir(&directory).map_err(|e| e.to_string())?;
-                        let mut command = vec![
-                            profiler.clone(),
-                            "--output-format".into(),
-                            "csv".into(),
-                            "--output-directory".into(),
-                            directory.to_string_lossy().into(),
-                        ];
-                        rocprof_streams(a, &mut command)?;
-                        command.extend([
-                            "--attach".into(),
-                            pid.to_string(),
-                            "--attach-duration-msec".into(),
-                            ms.to_string(),
-                            "--attach-sync-output".into(),
-                        ]);
-                        *window = Some(spawn_process_env(&command, &directory, &directory, &[])?);
-                        profile.triggers = count;
-                        Ok(json!({"id":profile.id,"window":count,"windowMs":ms,"directory":directory,"next":"Send the workload now; rocprofv3 collects the selected streams for everything the application dispatches during the window, then detaches (detachment can lag the window end). Wait for profile_status windowRunning=false, then trigger again or call profile_stop to collect all windows"}))
-                    }
-                }
-            }
-            "profile_status" => {
-                let mut live = self.control.live_profile.lock().unwrap();
-                let profile = live.as_mut().ok_or("No live profile; use profile_stop to collect a finished run")?;
-                if profile.id != text(a, "id")? {
-                    return Err("Live profile ID does not match".into());
-                }
-                let status = profile.child.try_wait().map_err(|e| e.to_string())?;
-                match &mut profile.gate {
-                    Gate::Radv { trigger } => {
-                        let (saved, unique) = rgp_save_counts(&profile.folder);
-                        Ok(json!({"id":profile.id,"running":status.is_none(),"exitCode":status.and_then(|s| s.code()),"triggerPending":trigger.exists(),"triggerCount":profile.triggers,"savedMessages":saved,"uniqueSavePaths":unique,"directory":profile.folder,"stdout":profile.folder.join("stdout.log"),"stderr":profile.folder.join("stderr.log")}))
-                    }
-                    Gate::Rocprofv3 { window, .. } => {
-                        let window_running = match window {
-                            Some(open) => open.try_wait().map_err(|e| e.to_string())?.is_none(),
-                            None => false,
-                        };
-                        Ok(json!({"id":profile.id,"running":status.is_none(),"exitCode":status.and_then(|s| s.code()),"windowRunning":window_running,"triggerCount":profile.triggers,"directory":profile.folder,"stdout":profile.folder.join("stdout.log"),"stderr":profile.folder.join("stderr.log")}))
-                    }
-                }
-            }
-            "profile_stop" => {
-                let mut live = self.control.live_profile.lock().unwrap();
-                let profile = live.as_ref().ok_or("No live profile")?;
-                if profile.id != text(a, "id")? {
-                    return Err("Live profile ID does not match".into());
-                }
-                let LiveProfile { mut child, folder, program, started, triggers, gate, .. } = live.take().unwrap();
-                let status = child.try_wait().map_err(|e| e.to_string())?;
-                match gate {
-                    Gate::Radv { trigger } => {
-                        tuning::stop(&mut child);
-                        let _ = fs::remove_file(&trigger);
-                        let mut report = radv_artifacts(&program, started, &folder, if status.is_some() { "exited" } else { "stopped" })
-                            .map_err(|e| format!("{e}. Artifacts remain in {}", folder.display()))?;
-                        report["triggerCount"] = json!(triggers);
-                        report["exitCode"] = json!(status.and_then(|code| code.code()));
-                        if triggers > 0 && report["files"].as_array().is_some_and(|files| files.is_empty()) {
-                            report["warnings"].as_array_mut().unwrap().push(json!("No RGP file was saved after the trigger. Check stderr.log; RADV may not have seen an eligible traceable submit before the process stopped."));
-                        }
-                        Ok(report)
-                    }
-                    Gate::Rocprofv3 { window, .. } => {
-                        let mut warnings = Vec::new();
-                        if let Some(mut open) = window {
-                            // An open window detaches on its own once its duration ends;
-                            // give it time to write output, then abort it.
-                            let waited = Instant::now();
-                            while open.try_wait().map_err(|e| e.to_string())?.is_none() {
-                                if flag.load(Ordering::SeqCst) || waited.elapsed() > Duration::from_secs(180) {
-                                    tuning::stop(&mut open);
-                                    warnings.push("The open collection window was aborted before rocprofv3 detached; its files may be missing or incomplete.".to_owned());
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                        }
-                        tuning::stop(&mut child);
-                        let mut files = Vec::new();
-                        find_outputs(&folder, &mut files)?;
-                        for count in 1..=triggers {
-                            let window = folder.join(format!("window-{count}"));
-                            if !files.iter().any(|f| f.starts_with(&window)) {
-                                let log = fs::read_to_string(window.join("stderr.log")).unwrap_or_default();
-                                let detail: String = log.lines().rev().find(|l| l.contains("Error") || l.contains("error"))
-                                    .or_else(|| log.lines().rev().find(|l| !l.trim().is_empty()))
-                                    .unwrap_or("stderr.log is empty").chars().take(300).collect();
-                                warnings.push(format!("window-{count} produced no output files (rocprofv3 requires every window of one process to request the same streams; the attach may also have failed or no GPU work ran). Its stderr: {detail}"));
-                            }
-                        }
-                        Ok(json!({"status":if status.is_some() { "exited" } else { "stopped" },"directory":folder,"files":files,"triggerCount":triggers,"exitCode":status.and_then(|code| code.code()),"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"warnings":warnings,"next":"Use capture_open with a returned trace or counter CSV; open a ui_output directory or a single .att file for SQTT waves"}))
-                    }
-                }
-            }
+            "profile_start" => profile_start_core(&self.control, a),
+            "profile_trigger" => profile_trigger_core(&self.control, a, &flag),
+            "profile_status" => profile_status_core(&self.control, a),
+            "profile_stop" => profile_stop_core(&self.control, a, &flag),
             "profile_run" => {
                 if self.control.live_profile.lock().unwrap().is_some() {
                     return Err("A live profile is already running; use profile_stop first".into());
@@ -1507,8 +1389,8 @@ impl Server {
                 )
                 .map_err(|e| e.to_string())?;
                 if a["tracer"] == "radv" {
-                    if ["counters", "profiler", "traces", "att"].iter().any(|key| a.get(*key).is_some()) {
-                        return Err("counters, traces, att and profiler apply to rocprofv3 only".into());
+                    if ["counters", "profiler", "traces", "att", "kernelIncludeRegex", "kernelExcludeRegex"].iter().any(|key| a.get(*key).is_some()) {
+                        return Err("counters, traces, att, kernelIncludeRegex, kernelExcludeRegex and profiler apply to rocprofv3 only".into());
                     }
                     let started = std::time::SystemTime::now();
                     let mut vars = vec![
@@ -1532,6 +1414,7 @@ impl Server {
                     folder.to_string_lossy().into(),
                 ];
                 rocprof_streams(a, &mut command)?;
+                kernel_filters(a, &mut command)?;
                 command.push("--".into());
                 command.extend(argv);
                 let run = run_process_env(command, cwd, &folder, &flag, seconds, &env);
@@ -1595,6 +1478,437 @@ impl Server {
         }
     }
 }
+/// Keys that only mean something for the rocprofv3 attach tracer, rejected for RADV.
+const ROCPROFV3_ONLY_TRIGGER_KEYS: [&str; 7] = [
+    "windowMs",
+    "counters",
+    "traces",
+    "att",
+    "kernelIncludeRegex",
+    "kernelExcludeRegex",
+    "triggered",
+];
+
+/// Starts the long-lived application for gated live profiling. Shared by the MCP
+/// `profile_start` arm and the `live_profile_start` desktop command.
+fn profile_start_core(control: &Control, a: &Value) -> Result<Value, String> {
+    let argv: Vec<String> = serde_json::from_value(a["argv"].clone()).map_err(|e| e.to_string())?;
+    if argv.is_empty() {
+        return Err("Application argv cannot be empty".into());
+    }
+    let tracer = a["tracer"].as_str().unwrap_or("radv");
+    if !["radv", "rocprofv3"].contains(&tracer) {
+        return Err("tracer must be radv or rocprofv3".into());
+    }
+    if tracer != "rocprofv3" && a.get("profiler").is_some() {
+        return Err("profiler applies to tracer rocprofv3 only".into());
+    }
+    let env = profile_env(a)?;
+    if tracer == "radv" && env.iter().any(|(key, _)| ["MESA_VK_TRACE", "MESA_VK_TRACE_PER_SUBMIT", "MESA_VK_TRACE_TRIGGER", "MESA_VK_TRACE_FRAME"].contains(&key.as_str())) {
+        return Err("RADV trace control variables are managed by profile_start".into());
+    }
+    if tracer == "rocprofv3" && env.iter().any(|(key, _)| key == "ROCP_TOOL_ATTACH") {
+        return Err("ROCP_TOOL_ATTACH is managed by profile_start".into());
+    }
+    let cwd = Path::new(text(a, "cwd")?);
+    let mut live = control.live_profile.lock().unwrap();
+    if live.is_some() {
+        return Err("A live profile is already running; use profile_stop first".into());
+    }
+    let folder = job_directory()?;
+    let id = folder.file_name().unwrap().to_string_lossy().into_owned();
+    let mut vars = env;
+    let (gate, capture_mode) = if tracer == "radv" {
+        let trigger = folder.join("radv-trigger");
+        vars.extend([
+            ("MESA_VK_TRACE".to_owned(), "rgp".to_owned()),
+            ("MESA_VK_TRACE_PER_SUBMIT".to_owned(), "0".to_owned()),
+            ("MESA_VK_TRACE_TRIGGER".to_owned(), trigger.to_string_lossy().into_owned()),
+        ]);
+        (Gate::Radv { trigger }, "file-trigger")
+    } else {
+        vars.push(("ROCP_TOOL_ATTACH".to_owned(), "1".to_owned()));
+        let profiler = a["profiler"].as_str().unwrap_or("/opt/rocm/bin/rocprofv3").to_owned();
+        (Gate::Rocprofv3 { profiler, window: None, collection: None }, "attach-window")
+    };
+    fs::write(folder.join("profile.json"), serde_json::to_vec_pretty(&json!({"tracer":tracer,"captureMode":capture_mode,"argv":argv,"cwd":cwd,"env":a.get("env").cloned().unwrap_or(json!({}))})).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let started = SystemTime::now();
+    let child = spawn_process_env(&argv, cwd, &folder, &vars)?;
+    let pid = child.id();
+    let trigger_file = match &gate {
+        Gate::Radv { trigger } => Some(trigger.clone()),
+        Gate::Rocprofv3 { .. } => None,
+    };
+    *live = Some(LiveProfile { id: id.clone(), child, folder: folder.clone(), program: argv[0].clone(), started, triggers: 0, gate });
+    Ok(match trigger_file {
+        Some(trigger) => json!({"id":id,"pid":pid,"directory":folder,"triggerFile":trigger,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"driverRequirement":"Headless compute file triggers require a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only during swapchain presentation.","next":"Wait for the server to become ready, call profile_trigger, send one inference request, wait for savedMessages, then call profile_stop to collect captures"}),
+        None => json!({"id":id,"pid":pid,"directory":folder,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"armRequirement":"The application is started with ROCP_TOOL_ATTACH=1 so the ROCm runtime keeps an attach thread ready; rocprofv3 can attach only to processes armed this way.","next":"Wait for the application to become ready, then call profile_trigger. Give the window its collection (counters, traces, att) and, optionally, kernelIncludeRegex/kernelExcludeRegex; choose a timed window (windowMs) or a triggered window (triggered:true, which stays open until profile_trigger end:true or profile_stop). Every window of this process must request the same streams, filters and mode. Collect with profile_stop."}),
+    })
+}
+
+/// Appends `--kernel-include-regex` / `--kernel-exclude-regex` when the request
+/// supplies them. These are honoured in attach mode and, on reattachment, are
+/// among the options rocprofv3 requires to be identical across windows.
+fn kernel_filters(a: &Value, command: &mut Vec<String>) -> Result<(), String> {
+    for (key, option) in [
+        ("kernelIncludeRegex", "--kernel-include-regex"),
+        ("kernelExcludeRegex", "--kernel-exclude-regex"),
+    ] {
+        if let Some(value) = a.get(key) {
+            let regex = value
+                .as_str()
+                .filter(|s| !s.is_empty() && !s.contains('\0'))
+                .ok_or_else(|| format!("{key} must be a nonempty string"))?;
+            if regex.len() > 4096 {
+                return Err(format!("{key} is too long"));
+            }
+            command.push(option.into());
+            command.push(regex.into());
+        }
+    }
+    Ok(())
+}
+
+/// Fires one capture in a live profile. Shared by the MCP `profile_trigger` arm
+/// and the `live_profile_trigger` desktop command. For the rocprofv3 tracer this
+/// opens a timed window (`windowMs`) or a triggered window (`triggered:true`, no
+/// `--attach-duration-msec`), ends an open triggered window (`end:true`), and
+/// enforces that every window of one process requests the same collection,
+/// filters and mode — the options rocprofv3 pickles and reattaches with.
+fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Result<Value, String> {
+    let mut live = control.live_profile.lock().unwrap();
+    let profile = live.as_mut().ok_or("No live profile; use profile_start first")?;
+    if profile.id != text(a, "id")? {
+        return Err("Live profile ID does not match".into());
+    }
+    let end = a["end"].as_bool().unwrap_or(false);
+    if profile.child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Err("Profiled process has exited; use profile_stop to collect artifacts".into());
+    }
+    let pid = profile.child.id();
+    let id = profile.id.clone();
+    let folder = profile.folder.clone();
+    let mut new_triggers = profile.triggers;
+    let response = match &mut profile.gate {
+        Gate::Radv { trigger } => {
+            if end {
+                return Err("end applies to tracer rocprofv3 only".into());
+            }
+            if ROCPROFV3_ONLY_TRIGGER_KEYS.iter().any(|key| a.get(*key).is_some()) {
+                return Err(format!("{} apply to tracer rocprofv3 only", ROCPROFV3_ONLY_TRIGGER_KEYS.join(", ")));
+            }
+            fs::OpenOptions::new().write(true).create_new(true).open(trigger.as_path())
+                .map_err(|e| format!("Cannot create RADV trigger (a previous trigger may still be pending): {e}"))?;
+            new_triggers += 1;
+            json!({"id":id,"triggerFile":trigger,"triggerCount":new_triggers,"next":"Send the inference request now; RADV captures the next eligible frame or submit"})
+        }
+        Gate::Rocprofv3 { profiler, window, collection } => {
+            if end {
+                let open = window.take().ok_or("No collection window is open to end")?;
+                if !open.triggered {
+                    *window = Some(open);
+                    return Err("This window ends on its own timer (windowMs); wait for profile_status to report windowRunning=false".into());
+                }
+                let count = new_triggers;
+                let (detached, warn) = end_triggered_window(open, flag)?;
+                let warnings: Vec<String> = warn.into_iter().collect();
+                json!({"id":id,"ended":count,"detached":detached,"directory":folder.join(format!("window-{count}")),"warnings":warnings,"next":"Collect with profile_stop, or trigger again for another window with the same streams, filters and mode"})
+            } else {
+                if let Some(open) = window {
+                    if open.child.try_wait().map_err(|e| e.to_string())?.is_none() {
+                        return Err(if open.triggered {
+                            "A collection window is still open; end it with profile_trigger end:true, or call profile_stop".into()
+                        } else {
+                            "A collection window is still open; wait for profile_status to report windowRunning=false".into()
+                        });
+                    }
+                    *window = None;
+                }
+                let triggered = a["triggered"].as_bool().unwrap_or(false);
+                if triggered && a.get("windowMs").is_some() {
+                    return Err("windowMs and triggered are mutually exclusive; a triggered window has no fixed duration".into());
+                }
+                let ms = if triggered {
+                    None
+                } else {
+                    let ms = a["windowMs"].as_u64().unwrap_or(5000);
+                    if !(1..=600_000).contains(&ms) {
+                        return Err("windowMs must be between 1 and 600000".into());
+                    }
+                    Some(ms)
+                };
+                let mut collection_args = Vec::new();
+                rocprof_streams(a, &mut collection_args)?;
+                kernel_filters(a, &mut collection_args)?;
+                match collection {
+                    Some(prev) => {
+                        if prev.triggered != triggered {
+                            return Err(format!("rocprofv3 reattaches to a PID only with the options it pickled on the first window: this process started in {} mode, so every window must stay {}. Use profile_stop and a fresh profile_start to change mode.",
+                                if prev.triggered { "triggered (no fixed duration)" } else { "timed (windowMs)" },
+                                if prev.triggered { "triggered" } else { "timed" }));
+                        }
+                        if prev.args != collection_args {
+                            return Err(format!("rocprofv3 requires every window of one process to request the same streams, counters, att and kernel filters (it reattaches with the first window's pickled options). First window: [{}]; this window: [{}]. Match them, or profile_stop and start a fresh run.", prev.args.join(" "), collection_args.join(" ")));
+                        }
+                    }
+                    None => *collection = Some(Collection { args: collection_args.clone(), triggered }),
+                }
+                let count = new_triggers + 1;
+                let directory = folder.join(format!("window-{count}"));
+                fs::create_dir(&directory).map_err(|e| e.to_string())?;
+                let mut command = vec![
+                    profiler.clone(),
+                    "--output-format".into(),
+                    "csv".into(),
+                    "--output-directory".into(),
+                    directory.to_string_lossy().into(),
+                ];
+                command.extend(collection_args);
+                command.push("--attach".into());
+                command.push(pid.to_string());
+                if let Some(ms) = ms {
+                    command.push("--attach-duration-msec".into());
+                    command.push(ms.to_string());
+                }
+                command.push("--attach-sync-output".into());
+                let attach = spawn_attach_window(&command, &directory, triggered, pid, flag)?;
+                let warnings: Vec<String> = attach.diagnostic.into_iter().collect();
+                *window = Some(AttachWindow { child: attach.child, directory: directory.clone(), triggered });
+                new_triggers = count;
+                let next = if triggered {
+                    "Send the workload now; the window stays attached. End it with profile_trigger end:true (writes a newline so rocprofv3 detaches) or profile_stop when the work you want captured is done."
+                } else {
+                    "Send the workload now; rocprofv3 collects the selected streams for everything dispatched during the window, then detaches (detachment can lag the window end, 1-2 minutes under ROCm). Wait for profile_status windowRunning=false, then trigger again (same streams, filters and mode) or profile_stop."
+                };
+                json!({"id":id,"window":count,"mode":if triggered { "triggered" } else { "timed" },"windowMs":ms,"directory":directory,"attachAttempts":attach.attempts,"warnings":warnings,"next":next})
+            }
+        }
+    };
+    profile.triggers = new_triggers;
+    Ok(response)
+}
+
+/// Reports whether a live profiled process and its current window are running.
+/// Shared by the MCP `profile_status` arm and `live_profile_status`.
+fn profile_status_core(control: &Control, a: &Value) -> Result<Value, String> {
+    let mut live = control.live_profile.lock().unwrap();
+    let profile = live.as_mut().ok_or("No live profile; use profile_stop to collect a finished run")?;
+    if profile.id != text(a, "id")? {
+        return Err("Live profile ID does not match".into());
+    }
+    let status = profile.child.try_wait().map_err(|e| e.to_string())?;
+    let id = profile.id.clone();
+    let folder = profile.folder.clone();
+    let triggers = profile.triggers;
+    match &mut profile.gate {
+        Gate::Radv { trigger } => {
+            let (saved, unique) = rgp_save_counts(&folder);
+            Ok(json!({"id":id,"running":status.is_none(),"exitCode":status.and_then(|s| s.code()),"triggerPending":trigger.exists(),"triggerCount":triggers,"savedMessages":saved,"uniqueSavePaths":unique,"directory":folder,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log")}))
+        }
+        Gate::Rocprofv3 { window, .. } => {
+            let (window_running, window_triggered) = match window {
+                Some(open) => (open.child.try_wait().map_err(|e| e.to_string())?.is_none(), open.triggered),
+                None => (false, false),
+            };
+            Ok(json!({"id":id,"running":status.is_none(),"exitCode":status.and_then(|s| s.code()),"windowRunning":window_running,"windowTriggered":window_triggered,"triggerCount":triggers,"directory":folder,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log")}))
+        }
+    }
+}
+
+/// Stops a live profiled application and collects its artifacts. Shared by the
+/// MCP `profile_stop` arm and `live_profile_stop`.
+fn profile_stop_core(control: &Control, a: &Value, flag: &AtomicBool) -> Result<Value, String> {
+    let mut live = control.live_profile.lock().unwrap();
+    {
+        let profile = live.as_ref().ok_or("No live profile")?;
+        if profile.id != text(a, "id")? {
+            return Err("Live profile ID does not match".into());
+        }
+    }
+    let LiveProfile { mut child, folder, program, started, triggers, gate, .. } = live.take().unwrap();
+    let status = child.try_wait().map_err(|e| e.to_string())?;
+    match gate {
+        Gate::Radv { trigger } => {
+            tuning::stop(&mut child);
+            let _ = fs::remove_file(&trigger);
+            let mut report = radv_artifacts(&program, started, &folder, if status.is_some() { "exited" } else { "stopped" })
+                .map_err(|e| format!("{e}. Artifacts remain in {}", folder.display()))?;
+            report["triggerCount"] = json!(triggers);
+            report["exitCode"] = json!(status.and_then(|code| code.code()));
+            if triggers > 0 && report["files"].as_array().is_some_and(|files| files.is_empty()) {
+                report["warnings"].as_array_mut().unwrap().push(json!("No RGP file was saved after the trigger. Check stderr.log; RADV may not have seen an eligible traceable submit before the process stopped."));
+            }
+            Ok(report)
+        }
+        Gate::Rocprofv3 { window, .. } => {
+            let mut warnings = Vec::new();
+            if let Some(open) = window {
+                if open.triggered {
+                    // A triggered window is ended by a newline on rocprofv3's stdin.
+                    if let (_, Some(warn)) = end_triggered_window(open, flag)? {
+                        warnings.push(warn);
+                    }
+                } else {
+                    // A timed window detaches on its own once its duration ends;
+                    // give it time to write output, then abort it.
+                    let mut open_child = open.child;
+                    let waited = Instant::now();
+                    while open_child.try_wait().map_err(|e| e.to_string())?.is_none() {
+                        if flag.load(Ordering::SeqCst) || waited.elapsed() > Duration::from_secs(180) {
+                            tuning::stop(&mut open_child);
+                            warnings.push("The open collection window was aborted before rocprofv3 detached; its files may be missing or incomplete.".to_owned());
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            tuning::stop(&mut child);
+            let mut files = Vec::new();
+            find_outputs(&folder, &mut files)?;
+            for count in 1..=triggers {
+                let window = folder.join(format!("window-{count}"));
+                if !files.iter().any(|f| f.starts_with(&window)) {
+                    let log = fs::read_to_string(window.join("stderr.log")).unwrap_or_default();
+                    let detail: String = log.lines().rev().find(|l| l.contains("Error") || l.contains("error"))
+                        .or_else(|| log.lines().rev().find(|l| !l.trim().is_empty()))
+                        .unwrap_or("stderr.log is empty").chars().take(300).collect();
+                    if attach_set_agent_failure(&log) {
+                        warnings.push(format!("window-{count} produced no output files: rocprofv3 could not set the agent to be profiled (the ROCm set_profiler_active_on_queue PM4 handshake timed out while the target queue was busy — a known ROCm attach limitation, not fixed here; retry when the GPU queue is idle). Its stderr: {detail}"));
+                    } else {
+                        warnings.push(format!("window-{count} produced no output files (rocprofv3 requires every window of one process to request the same streams, counters, att and kernel filters; the attach may also have failed or no GPU work ran). Its stderr: {detail}"));
+                    }
+                }
+            }
+            Ok(json!({"status":if status.is_some() { "exited" } else { "stopped" },"directory":folder,"files":files,"triggerCount":triggers,"exitCode":status.and_then(|code| code.code()),"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"warnings":warnings,"next":"Use capture_open with a returned trace or counter CSV; open a ui_output directory or a single .att file for SQTT waves"}))
+        }
+    }
+}
+
+/// Whether a process id is still alive (used to bound attach retries).
+fn process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// The last ~400 characters of a window's rocprofv3 stderr log.
+fn stderr_tail(dir: &Path) -> String {
+    let log = fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
+    let trimmed = log.trim_end();
+    trimmed
+        .chars()
+        .rev()
+        .take(400)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// Whether rocprofv3's stderr shows the "could not set the agent to be profiled"
+/// attach failure (the `set_profiler_active_on_queue` timeout in queue.cpp).
+fn attach_set_agent_failure(log: &str) -> bool {
+    log.contains("Could not set agent to be profiled")
+        || log.contains("set_profiler_active_on_queue")
+        || log.contains("set_profiler_active")
+}
+
+enum AttachOutcome {
+    /// Still running after the confirmation window — attached.
+    Running,
+    /// Exited during confirmation for a reason other than the attach failure.
+    ExitedOther,
+    /// Exited (or is exiting) with the set-agent attach failure; carries the tail.
+    AttachFailure(String),
+}
+
+/// Watches a freshly spawned rocprofv3 attach process for up to `confirm` to tell
+/// an established attach from the `set_profiler_active_on_queue` failure.
+fn confirm_attach(child: &mut Child, dir: &Path, confirm: Duration, flag: &AtomicBool) -> Result<AttachOutcome, String> {
+    let start = Instant::now();
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            let tail = stderr_tail(dir);
+            return Ok(if attach_set_agent_failure(&tail) {
+                AttachOutcome::AttachFailure(tail)
+            } else {
+                AttachOutcome::ExitedOther
+            });
+        }
+        if attach_set_agent_failure(&stderr_tail(dir)) {
+            // The failure is logged and rocprofv3 is about to abort; stop it so the
+            // caller can retry without waiting out the rest of the confirm window.
+            let tail = stderr_tail(dir);
+            tuning::stop(child);
+            return Ok(AttachOutcome::AttachFailure(tail));
+        }
+        if flag.load(Ordering::SeqCst) || start.elapsed() > confirm {
+            return Ok(AttachOutcome::Running);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+struct AttachResult {
+    child: Child,
+    attempts: u32,
+    diagnostic: Option<String>,
+}
+
+/// Spawns a rocprofv3 attach window and, when the attach fails because the target
+/// queue was busy (`set_profiler_active_on_queue` timeout), retries with backoff
+/// while the target is alive. The retry mitigates but cannot fix the ROCm
+/// limitation; a final failure is returned as a diagnostic, not an error, so the
+/// client can decide whether to trigger again.
+fn spawn_attach_window(command: &[String], dir: &Path, triggered: bool, pid: u32, flag: &AtomicBool) -> Result<AttachResult, String> {
+    const MAX_RETRIES: u32 = 2;
+    const CONFIRM: Duration = Duration::from_secs(4);
+    let mut backoff = Duration::from_millis(500);
+    let mut attempt = 0;
+    loop {
+        let mut child = spawn_process_env_stdin(command, dir, dir, &[], triggered)?;
+        match confirm_attach(&mut child, dir, CONFIRM, flag)? {
+            AttachOutcome::Running | AttachOutcome::ExitedOther => {
+                return Ok(AttachResult { child, attempts: attempt + 1, diagnostic: None });
+            }
+            AttachOutcome::AttachFailure(tail) => {
+                if attempt >= MAX_RETRIES || flag.load(Ordering::SeqCst) || !process_alive(pid) {
+                    return Ok(AttachResult {
+                        child,
+                        attempts: attempt + 1,
+                        diagnostic: Some(format!("rocprofv3 could not set the agent to be profiled after {} attempt(s): the ROCm set_profiler_active_on_queue PM4 handshake timed out while the target queue was busy. This is a known ROCm attach limitation; retry when the GPU queue is idle. rocprofv3 stderr tail: {tail}", attempt + 1)),
+                    });
+                }
+                attempt += 1;
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+/// Ends a triggered attach window: writes a newline to rocprofv3's stdin (its
+/// `input()` returns, which detaches) and waits for a clean exit so
+/// `--attach-sync-output` can finish the files. Aborts after 180 s with a warning.
+fn end_triggered_window(mut window: AttachWindow, flag: &AtomicBool) -> Result<(bool, Option<String>), String> {
+    if let Some(mut stdin) = window.child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(b"\n");
+        let _ = stdin.flush();
+        // Dropping stdin here also closes the pipe (EOF), a second detach signal.
+    }
+    let waited = Instant::now();
+    loop {
+        if window.child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Ok((true, None));
+        }
+        if flag.load(Ordering::SeqCst) || waited.elapsed() > Duration::from_secs(180) {
+            tuning::stop(&mut window.child);
+            return Ok((false, Some("The triggered collection window was aborted before rocprofv3 detached (detachment can take 1-2 minutes under ROCm); its files may be missing or incomplete.".to_owned())));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn text<'a>(a: &'a Value, key: &str) -> Result<&'a str, String> {
     a[key]
         .as_str()
@@ -1676,10 +1990,10 @@ fn tools() -> Vec<Value> {
  ("capture_open","Import a trace, counters, ATT run, sampling data or portable capture from an explicit path.",json!({"path":str_,"samplingMethod":str_,"loadWaveStates":{"type":"boolean"}}),vec!["path"]),
  ("capture_analyze","Run the same analysis functions as the GUI: kernels, occupancy, activity, hardware, hotspots, source, markers, scalar, tensor. Scalar takes name/formula (C0 etc). Tensor takes definitions (NAME := expression) and raw named {shape:[XCC,SE,CU,Time],values:[...]}. Timeline renders dispatch or global residency HTML with the same paged exporter as the GUI. Diagnostics produces its diagnostic manifest. Optional output writes a new HTML, diagnostics JSON, or analysis JSON file. Returns paged rows otherwise. Requires Node.js.",json!({"captureId":str_,"analysis":{"enum":["kernels","occupancy","activity","hardware","hotspots","source","markers","scalar","tensor","timeline","diagnostics"]},"metric":{"enum":["latency","pcSamples","pcIssued","pcStalled"]},"se":num,"kernel":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"name":str_,"formula":str_,"definitions":str_,"raw":obj,"output":str_,"timeline":{"enum":["dispatch","global"]},"timePages":num,"lanesPerPage":num,"workspace":obj,"query":str_,"offset":num,"limit":num}),vec!["captureId","analysis"]),
  ("profile_start","Start a long-lived application for gated live profiling. tracer radv (default) runs a Vulkan server under RADV RGP file-trigger capture: headless compute needs a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only on swapchain presentation, and the capture gets the next eligible submit after each trigger. tracer rocprofv3 starts a HIP/ROCm application armed with ROCP_TOOL_ATTACH=1 so each profile_trigger attaches rocprofv3 for one bounded, time-based collection window; profiler overrides the rocprofv3 path. Returns an ID and log paths immediately. Only one live profile can run at a time; the process is stopped when rocprof-studio shuts down. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"env":obj,"tracer":{"enum":["radv","rocprofv3"]},"profiler":str_}),vec!["argv","cwd"]),
- ("profile_trigger","Fire one capture in a live profile. tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application for windowMs milliseconds (default 5000) collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) for everything dispatched during the window into a window-N directory. A window is time-based: it cannot isolate a single dispatch, only one window can be open at a time, detachment can lag the window end, and rocprofv3 requires every window of one process to request the same streams (only windowMs may differ) — a mismatched window produces no files and a profile_stop warning.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"counters":{"type":"array","items":str_},"traces":traces,"att":att}),vec!["id"]),
- ("profile_status","Check whether a live profiled process is running. tracer radv also reports whether its trigger is pending and how many RGP saves RADV has announced; tracer rocprofv3 reports whether the current attach window is still open (windowRunning). Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
- ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), or every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3; waits up to 180 s for an open window to detach before aborting it). Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
- ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
+ ("profile_trigger","Fire one capture in a live profile. tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application, collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) plus optional kernelIncludeRegex/kernelExcludeRegex (mapped to --kernel-include-regex/--kernel-exclude-regex, honoured in attach mode including for att data) into a window-N directory. Two window modes: a TIMED window (windowMs milliseconds, default 5000) that detaches on its own, or a TRIGGERED window (triggered:true, no windowMs) that stays attached until you end it with profile_trigger end:true (writes a newline to rocprofv3's stdin so it detaches) or profile_stop — use it to capture exactly one request without guessing a duration. A window is time- or trigger-based and cannot isolate a single dispatch; only one window is open at a time; detachment can lag by 1-2 minutes (ROCm); and because rocprofv3 pickles each PID's attach options and reattaches only with identical ones, every window of one process must request the same streams, counters, att, kernel filters AND mode (timed vs triggered) — a mismatch is rejected up front, and an empty window still warns at profile_stop. Attach is retried with backoff when the ROCm set_profiler_active handshake times out on a busy queue; attachAttempts and any attachWarning are reported.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"triggered":{"type":"boolean"},"end":{"type":"boolean"},"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_}),vec!["id"]),
+ ("profile_status","Check whether a live profiled process is running. tracer radv also reports whether its trigger is pending and how many RGP saves RADV has announced; tracer rocprofv3 reports whether the current attach window is still open (windowRunning) and whether it is a triggered window (windowTriggered). Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
+ ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), or every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3). An open timed window is given up to 180 s to detach on its own; an open triggered window is detached first by writing a newline to rocprofv3's stdin, then given up to 180 s — both abort with a warning past that. Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
+ ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex). tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
  ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources. Limit <=1000. Counter rows include recorded samples.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":num}),vec!["captureId","dataset"]),
  ("workspace_select","Follow a capture, view, range, wave, instruction or dispatch in the GUI. Views: reference, trace, hardware, summary, sampling, occupancy, dispatch, hotspots, flame, markers, counters, evidence.",json!({"captureId":str_,"view":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"waveId":str_,"dispatchId":str_,"instruction":num,"timeline":str_,"se":num}),vec!["captureId"]),
@@ -1713,6 +2027,7 @@ pub fn block_local_invoke(invoke: &tauri::ipc::Invoke<tauri::Wry>) -> bool {
         || command.starts_with("read_")
         || [
             "tuning_status",
+            "live_profile_status",
             "diagnostic_context",
             "begin_wave_query",
             "cancel_wave_query",
@@ -1859,6 +2174,20 @@ fn spawn_process_env(
     folder: &Path,
     env: &[(String, String)],
 ) -> Result<Child, String> {
+    spawn_process_env_stdin(argv, cwd, folder, env, false)
+}
+/// As `spawn_process_env`, but `pipe_stdin` opens a writable stdin pipe instead of
+/// `/dev/null`. A triggered rocprofv3 attach window needs this: it has no
+/// `--attach-duration-msec`, so it blocks on `input()` and detaches when a newline
+/// is written to that pipe (or the pipe closes). A null stdin would hit EOF and
+/// detach immediately.
+fn spawn_process_env_stdin(
+    argv: &[String],
+    cwd: &Path,
+    folder: &Path,
+    env: &[(String, String)],
+    pipe_stdin: bool,
+) -> Result<Child, String> {
     use std::process::{Command, Stdio};
     let mut command = Command::new(&argv[0]);
     command
@@ -1866,7 +2195,7 @@ fn spawn_process_env(
         .current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k, v)))
         .env("TMPDIR", folder)
-        .stdin(Stdio::null())
+        .stdin(if pipe_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(fs::File::create(folder.join("stdout.log")).map_err(|e| e.to_string())?)
         .stderr(fs::File::create(folder.join("stderr.log")).map_err(|e| e.to_string())?);
     for key in [
@@ -2098,7 +2427,7 @@ pub fn shutdown(control: &Control, tuning: &tuning::Tuning) {
     control.cancel(None, None);
     if let Some(mut profile) = control.live_profile.lock().unwrap().take() {
         if let Gate::Rocprofv3 { window: Some(open), .. } = &mut profile.gate {
-            tuning::stop(open);
+            tuning::stop(&mut open.child);
         }
         tuning::stop(&mut profile.child);
         if let Gate::Radv { .. } = profile.gate {

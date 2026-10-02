@@ -249,6 +249,19 @@ export async function saveDiagnostics(bytes: Uint8Array) {
 export const exportCaptureArchive = (captureId: string) =>
   invoke<boolean>("export_capture_archive", { captureId });
 
+// Live profiling: thin wrappers over the live_profile_* desktop commands, which
+// share the same core as the MCP profile_* tools. Each takes the same argument
+// object the MCP tool would, passed through verbatim.
+export type LiveProfileResult = Record<string, unknown>;
+export const liveProfileStart = (args: Record<string, unknown>) =>
+  invoke<LiveProfileResult>("live_profile_start", { args });
+export const liveProfileTrigger = (args: Record<string, unknown>) =>
+  invoke<LiveProfileResult>("live_profile_trigger", { args });
+export const liveProfileStatus = (id: string) =>
+  invoke<LiveProfileResult>("live_profile_status", { args: { id } });
+export const liveProfileStop = (id: string) =>
+  invoke<LiveProfileResult>("live_profile_stop", { args: { id } });
+
 export async function readWaveStats(
   capture: Capture,
   se: number,
