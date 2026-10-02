@@ -45,6 +45,11 @@ pub struct Capture {
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
     pub markers: Vec<crate::markers::Marker>,
+    /// Version-zero Loom compile reports: static, compile-time kernel facts kept
+    /// separate from dispatches, counters and waves so they cannot be read as
+    /// measured data. Empty for every other input format.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compile_reports: Vec<crate::loom_report::LoomCompileReport>,
     #[serde(skip)]
     pub root: PathBuf,
     #[serde(skip)]
@@ -85,6 +90,7 @@ impl Capture {
             source_paths: self.source_paths.clone(),
             metadata: self.metadata.clone(),
             markers: self.markers.clone(),
+            compile_reports: self.compile_reports.clone(),
             root: self.root.clone(),
             input_path: self.input_path.clone(),
             input_fingerprint: self.input_fingerprint.clone(),
@@ -121,6 +127,7 @@ impl Capture {
             source_paths: BTreeMap::new(),
             metadata: BTreeMap::new(),
             markers: vec![],
+            compile_reports: vec![],
             root: PathBuf::new(),
             input_path: None,
             input_fingerprint: None,

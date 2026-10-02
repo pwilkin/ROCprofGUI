@@ -49,6 +49,8 @@ Metadata VGPR counts differ from allocation granularity. More registers can impr
 
 **Design consequence:** the hardware diagram displays recorded residency separately from static register/LDS metadata. No occupancy percentages or bank-level colors are synthesized from missing hardware limits or counters.
 
+Loom compile reports extend the same separation. They are static compiler facts about a compiled kernel, imported onto a surface kept apart from dispatches, counters and waves. Their occupancy percent and scheduled register pressure are compiler evidence, not observed GPU occupancy or hardware register counts, and the importer does not convert them into either. A compile report carries no cycles or time, and a field a report does not establish is unavailable, not zero.
+
 ## Experiment identity and qualification
 
 Prior experiments found that missing library symlinks could load the same implementation in both A/B arms. Instrumented timing, concurrent compilation, thermal imbalance, partial correctness checks and full-model quality failures all invalidated otherwise attractive speedups.

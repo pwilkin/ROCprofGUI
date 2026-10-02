@@ -13,6 +13,7 @@ mod import;
 pub mod irpf;
 mod wave_stream;
 pub mod input_fingerprint;
+pub mod loom_report;
 pub mod markers;
 pub mod model;
 mod pc_sampling;

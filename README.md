@@ -64,6 +64,7 @@ This rebuilds the app, stages a copy for Tauri's bundle patching, and packages t
 - Read-only ROCPD kernel dispatch, event-associated PMC and timestamped SPM import, including UUID-partitioned ROCm SDK databases.
 - Raw ATT import through an isolated decoder V2 process, including code-object disassembly, cancellation and automatic temporary-output cleanup.
 - HRX native IRPF profile-bundle import: bounds-validated parser for the IREE HAL `IRPF` v2.0 container `libhrx` writes (`HRX_PROFILE_MODE=queue|dispatch`), resolving dispatches, function names, code-object identity and clock correlations, with elapsed-tick timing and the device-tick-unaligned limitation kept explicit. See [HRX profiling](docs/hrx-profiling.md).
+- Loom compile-report import: version-zero static compile facts from `loom-compile` (`*.compile-report.json`) and from an `iree-benchmark-loom` benchmark envelope, validated against the strict version-zero loader and surfaced as compile-time kernel facts (identity, static and dynamic instruction mix, target resources, allocation and spill facts, wait plan, workload geometry, residency and constraints, move causes, detail rows) on a surface kept separate from dispatches and measured data. See [HRX profiling](docs/hrx-profiling.md).
 - Target-wave, CU-wave, SIMD activity, global residency, and dispatch timelines with shared range, zoom, pan and cycle measurement.
 - Linked ISA/source/token navigation, selected-wave loop occurrences, complete selection history, ISA wait arrows, section folding, resizable columns, search, latency sum/mean, and bounded visible-wave aggregation.
 - Rust hidden-latency analysis, with total/nonhidden selection, optional idle contribution, and independent upstream C++ oracle validation.
@@ -97,7 +98,7 @@ All six `scripts/check-*-oracle.*` scripts compile the vendored upstream C++ in 
 
 ### Tests that do not run by default
 
-`cargo test -p profile-core` skips seventeen `#[ignore]` tests, and a green run does not cover them. Fifteen need a retained fixture or the trace decoder, named by an environment variable:
+`cargo test -p profile-core` skips eighteen `#[ignore]` tests, and a green run does not cover them. Fifteen need a retained fixture or the trace decoder, named by an environment variable:
 
 ```bash
 ROCPROF_WAVE_ARCHIVE=<archive> cargo test -p profile-core --offline -- --ignored
@@ -119,7 +120,7 @@ ROCPROF_WAVE_ARCHIVE=<archive> cargo test -p profile-core --offline -- --ignored
 | `irpf::dispatch_bundle_roundtrips_with_exact_counts` (test `irpf`) | `ROCPROF_IRPF_DISPATCH_BUNDLE` (path to an HRX dispatch-mode `trace.irpf`) |
 | `irpf::queue_bundle_roundtrips_from_command_operations` (test `irpf`) | `ROCPROF_IRPF_QUEUE_BUNDLE` (path to an HRX queue-mode `trace.irpf`) |
 
-Run with `--ignored` but without the environment variable and these fifteen fail rather than skip. The remaining two take no environment variable and are opt-in boundary qualifications that allocate at the two-million limit: `wave_stream::tests::streaming_limit_counts_discarded_rows_and_rejects_extra_before_parsing` and `import::wave_read_cancellation_tests::streamed_token_limit_accepts_boundary_and_rejects_extra_before_parsing`.
+Run with `--ignored` but without the environment variable and these fifteen fail rather than skip. The remaining three take no required environment variable: two are opt-in boundary qualifications that allocate at the two-million limit (`wave_stream::tests::streaming_limit_counts_discarded_rows_and_rejects_extra_before_parsing` and `import::wave_read_cancellation_tests::streamed_token_limit_accepts_boundary_and_rejects_extra_before_parsing`), and `loom::real_reports_validate_and_map` validates against the retained Loom compile reports in `/devel/tools/loom-reports` (override with `ROCPROF_LOOM_REPORTS_DIR`) and skips cleanly when that directory is absent.
 
 Three Playwright specs in `tests/workspace.spec.ts` also skip silently unless their bundle is supplied: `ROCPROF_SPM_BUNDLE`, `ROCPROF_SPM_PARTITIONS_BUNDLE` and `ROCPROF_LARGE_CATALOG_BUNDLE`.
 
@@ -390,6 +391,8 @@ HRX ("HIP Runtime Extended", [ROCm/hrx-system](https://github.com/ROCm/hrx-syste
 Choose a `.irpf` file using the capture-tab **+** (the format is also recognized by content when the filename differs). An IRPF ("IREE HAL profile bundle") v2.0 file is what `libhrx` writes under `HRX_PROFILE_FILE` with `HRX_PROFILE_MODE=dispatch` or `queue`. The importer reconstructs resolved dispatch and function names, grids (IRPF records workgroup counts, reported as `count × size`), code-object identity, and clock correlations. A dispatch-mode bundle carries per-dispatch device timing; a queue-mode bundle has no device timing and falls back to the static command-operation program, labelled as such.
 
 These bundles hold dispatch metadata and timing, not microarchitecture: there are no wave occupancy, ISA, PC samples or hardware counters, and register/LDS/scratch read "Not collected" rather than a guessed zero. For waves and ISA on HRX, use the rocprofv3 ATT path. Dispatch events carry raw device ticks; the importer converts elapsed ticks to nanoseconds using the device's advertised frequency, which is honest for durations and within-capture ordering, but it does not place events on a host timeline because the bundle's clock correlations are flagged device-tick-unaligned. That limitation is surfaced as a capture warning. [docs/hrx-profiling.md](docs/hrx-profiling.md) records the trace paths, the importer's full scope, the HRX kernel-name families and the collection-side limits.
+
+Loom, the source-first kernel compiler in hrx-system, can also emit a compile report. This is static compiler telemetry about a compiled kernel, not a trace or a measurement, and it contains no cycle or time data. rocprof studio opens a `.compile-report.json` file, or a benchmark envelope that embeds one, as static compile facts on a separate surface. The document is validated strictly against schema version zero and rejected with a regenerate-with-this-compiler message otherwise. Absent fields stay absent, the importer refuses to infer dynamic counts, hardware register counts, occupancy as throughput or bank-conflict freedom, and because a report carries no compiler identity the producing tool, checkout, build and invocation are recorded from the `tool-provenance.json` and `commands.json` sidecars when present. [docs/hrx-profiling.md](docs/hrx-profiling.md) has the full scope, the validation rules and the provenance handling.
 
 ## ISA reference data
 

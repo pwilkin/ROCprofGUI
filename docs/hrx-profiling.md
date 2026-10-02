@@ -16,9 +16,9 @@ gfx1151 device through native `amdgpu`, exposed to llama.cpp as an `HRX0` device
 
 **Loom** is the source-first kernel *compiler* substrate inside hrx-system
 (`loom/`, JIT to HSACO). It is a **compiler, not a trace format**: there is no
-"Loom trace" to import. Loom emits *compile reports* (telemetry about a compiled
-kernel), but see the gap at the end of this document — that tool does not ship in
-the pinned beta, so no compile-report importer exists.
+"Loom trace" to import. Loom emits compile reports, which are telemetry about a
+compiled kernel. rocprof studio imports those reports as static compile facts;
+see the Loom compile reports section below.
 
 ## Pinned beta
 
@@ -175,17 +175,101 @@ recorded so a future capture run does not relearn them the expensive way:
   the desired occurrence from a representative CSV, or use a fresh
   target/capture filter.
 
-## Gap: no Loom compile-report importer
+## Loom compile reports
 
-The hrx-b99 archive ships `libhrx`/`libloomc` and a separate Vulkan backend, but
-**does not ship** `hrx-info`, `loom-compile`, `loom-compile-report`,
-`ggml-hrx-analyze-graph`, `libhip_logging.so` or `libhip_buffer_tracer.so`. There
-is therefore **no Loom compile-report or HIP-interceptor artifact** to write an
-importer against. Per the project's producer-contract rule, no speculative
-compile-report importer is written: it would be guessing a layout nobody has
-observed. Those tools exist in other/source distributions; if a representative
-compile-report artifact arrives, that is the point at which the importer and its
-identity mechanism get decided.
+Loom can emit a compile report alongside the compiled artifact. It is compiler
+telemetry about one compiled kernel: schedule, allocation, register pressure,
+emitted code size, residency, the static and dynamic instruction mix, wait plan
+and workload geometry the compiler modelled. It is not a trace, not a dispatch
+and not a runtime measurement. There are no cycle or time counts anywhere in a
+compile report.
+
+Produce one with loom-compile:
+
+```shell
+loom-compile kernel.loom \
+  --format=amdgpu-hsaco \
+  --target=amdgpu:gfx1151 \
+  --output=kernel.hsaco \
+  --compile-report=summary \
+  --compile-report-output=kernel.summary.json
+```
+
+Use `--compile-report=details` for the detail-mode collections (pressure rows,
+schedule bands, spill rows, source-low rows and the rest). iree-benchmark-loom
+embeds the same report in a benchmark envelope under a `compile_report` key with
+run and candidate context; rocprof studio reads that envelope too.
+
+The stability contract from the producer is explicit, and rocprof studio honours
+it: "Compile reports are version-zero, same-compiler-horizon diagnostics.
+Regenerate them with the current checkout instead of treating them as durable
+records or adding compatibility paths to the consumer." The importer accepts only
+schema version zero and rejects anything else, telling the reader to regenerate
+with the current compiler checkout.
+
+### What the importer validates
+
+Validation mirrors the strict loader `loom/py/loom/reporting/compile_report.py`
+at the pinned checkout `32b86d42d96a8e3098d9a56bea201e5f83d44f85`. A report is
+rejected, with an explicit message and never a panic, when any of these hold:
+
+- the envelope kind is not `loom.compile_report` and the document is not an
+  explicit `type=compile_report` benchmark envelope;
+- `schema_version` is not zero;
+- `mode` is neither `summary` nor `details`;
+- `status` is not an object, or its code is not zero (the compiler status name is
+  surfaced in the message, because a failed compile has no meaningful facts);
+- an entries, config-bindings or residency-constraints collection has a count
+  that disagrees with its row array, or a row whose index is out of order;
+- an entry has no source or export identity, or two entries share one identity;
+- a residency summary reports a negative tier, or marks itself unavailable while
+  still claiming a current or next tier;
+- a residency constraint pairs `units` without `rounded_units`, gives a fixed
+  limit a reducible footprint, or claims a reduction without a known limiting
+  footprint.
+
+The pre-schema public sample, a benchmark result with an embedded older-shaped
+report and no version-zero envelope, is rejected on the same rule.
+
+### What it surfaces
+
+Accepted reports are mapped into a capture as static compile facts on a dedicated
+`compileReports` surface, kept apart from dispatches, counters and waves so they
+cannot be read as measured data. The capture format is labelled "Loom compile
+report (version-zero static facts)" and its unit is "static". For each report it
+records the report-level identity (function, lowered symbol, backend, target
+family, target key, target bundle and config), the decoded 30-bit detail-flag
+mask, and the version-zero stability label. For each entry it records the
+identity and display name, the flat counters under their producer names, the
+nested analysis objects preserved verbatim (target resources with SGPR and VGPR
+final counts and scheduled pressure, subgroup size, occupancy percent and
+limiting resource; the static and dynamic instruction mix; economics; wait plan;
+workload geometry; move causes; planning), the residency constraints, and in
+detail mode the row collections. Every field is optional. A field the compiler
+did not establish stays absent; it is never defaulted to zero.
+
+### What it refuses to infer
+
+The importer never synthesises evidence the report does not carry. It does not
+invent cycles or time. It does not derive dynamic execution counts from static
+counts, hardware register counts from scheduled peak-live pressure, or a
+throughput prediction from occupancy percent. An absent bank-service summary is
+not a claim that there are no bank conflicts. Reports are not comparable across
+targets or compiler horizons, and an AMDGPU report and a SPIR-V report are not
+comparable even at schema version zero. These caveats are attached to every
+imported capture as warnings.
+
+### Provenance
+
+A compile report carries no compiler identity, so provenance is recorded out of
+band. When a `tool-provenance.json` or `commands.json` sidecar sits beside the
+report or at the bundle root, the importer records the producing tool
+(loom-compile for a direct report, iree-benchmark-loom for a benchmark envelope),
+the hrx-system commit and checkout, the tool build date and SHA-256, and the
+exact invocation with its target and config. When no sidecar is present the
+importer marks provenance unavailable and says so in a warning, rather than
+guessing. The report file itself is covered by the existing SHA-256 input
+fingerprint on the desktop and MCP import paths.
 
 ## Where this is wired
 
@@ -197,3 +281,11 @@ identity mechanism get decided.
   run by default; the exact-count round-trips of the two retained bundles are
   `#[ignore]` and gated on `ROCPROF_IRPF_DISPATCH_BUNDLE` /
   `ROCPROF_IRPF_QUEUE_BUNDLE` (README, "Tests that do not run by default").
+- Loom compile-report importer: `crates/profile-core/src/loom_report.rs`, reached
+  from the same dispatchers by the `.compile-report.json` suffix or a
+  `loom.compile_report` content sniff, so a report named `.summary.json` or
+  `.details.json` still opens. Tests in `crates/profile-core/tests/loom.rs`:
+  synthetic validation and rejection, detail-flag gating, absent-stays-absent and
+  the benchmark-envelope path run by default; the validation against the retained
+  real reports is `#[ignore]` and gated on `ROCPROF_LOOM_REPORTS_DIR` (default
+  `/devel/tools/loom-reports`).

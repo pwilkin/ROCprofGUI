@@ -99,6 +99,9 @@ export async function openCapture(
       : {
           filters: [
             {
+              // Loom compile reports arrive as .json (e.g. *.compile-report.json,
+              // *.summary.json, *.details.json) and are recognised by content in
+              // the Rust import dispatcher, so the "json" entry already admits them.
               name: "ROCm and RADV captures",
               extensions: [
                 "json",

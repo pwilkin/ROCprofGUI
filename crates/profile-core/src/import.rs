@@ -137,6 +137,15 @@ pub fn load_capture_options(
     if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("irpf")) {
         return crate::irpf::load(&path);
     }
+    // A Loom compile report is a .json file, so it must be recognised before the
+    // json-to-SPM arm below. It is matched by the .compile-report.json suffix or
+    // by the version-zero loom.compile_report discriminator (which also covers a
+    // benchmark-envelope JSON named plainly .json).
+    if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"))
+        && crate::loom_report::is_loom_report(&path)
+    {
+        return crate::loom_report::load(&path);
+    }
     match path.file_name().and_then(|p|p.to_str()) {
         Some("filenames.json" | "code.json" | "occupancy.json") => load_ui(path.parent().unwrap(), load_wave_states),
         _ if path.extension().is_some_and(|x|x == "att") => crate::decoder::decode_with_wave_states(&path, &Default::default(), &std::sync::atomic::AtomicBool::new(false), load_wave_states),
