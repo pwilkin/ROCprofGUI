@@ -148,7 +148,7 @@ pub fn load_mode_cancellable(
         BTreeMap::new()
     };
     if indices.len() > crate::wave_index::MAX_AGGREGATE_WAVES {
-        return Err("Wave overview exceeds 4096 waves".into());
+        return Err(crate::wave_index::aggregate_waves_budget_error("Wave overview"));
     }
     let buckets = (MAX_GROUPS / (indices.len().max(1) * 14)).clamp(1, 512);
     let mut result = Overview {

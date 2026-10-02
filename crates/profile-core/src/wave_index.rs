@@ -8,6 +8,22 @@ pub const MAX_WINDOW_WAVES: usize = 128;
 pub const MAX_AGGREGATE_WAVES: usize = 4096;
 pub const MAX_VIEWPORT_TOKENS: usize = 500_000;
 
+/// Formats a count with ASCII thousands separators ("500,000"), matching the
+/// frontend's `Number.toLocaleString("en-US")` so the interpolated budget
+/// messages below still match `src/waveOverview.ts::isWaveDetailBudgetError`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 pub fn check_window_waves(count: usize) -> Result<(), String> {
     if count > MAX_WINDOW_WAVES {
         return Err(format!("Wave query exceeds {MAX_WINDOW_WAVES} waves"));
@@ -16,7 +32,14 @@ pub fn check_window_waves(count: usize) -> Result<(), String> {
 }
 
 pub fn visible_token_budget_error() -> String {
-    "Visible wave query exceeds 500,000 tokens. Zoom in or use Target wave. No tokens were silently dropped.".into()
+    format!("Visible wave query exceeds {} tokens. Zoom in or use Target wave. No tokens were silently dropped.", thousands(MAX_VIEWPORT_TOKENS))
+}
+
+/// The aggregate-wave (statistics / overview) budget rejection, with the
+/// MAX_AGGREGATE_WAVES constant interpolated so the number cannot drift from the
+/// bound. `what` names the query ("Wave statistics query", "Wave overview").
+pub fn aggregate_waves_budget_error(what: &str) -> String {
+    format!("{what} exceeds {MAX_AGGREGATE_WAVES} waves")
 }
 
 #[cfg(test)]
@@ -24,15 +47,34 @@ mod budget_contract {
     #[test]
     fn budget_messages_stay_in_step_with_the_frontend_matcher() {
         // src/waveOverview.ts::isWaveDetailBudgetError matches these by substring to
-        // choose the bounded overview. Update both sides together, and keep the
-        // MAX_AGGREGATE_WAVES message distinguishable from the window message.
+        // choose the bounded overview. These assert_eq! pins catch a message that
+        // drifts from the interpolated constant (e.g. a raised MAX_VIEWPORT_TOKENS
+        // that leaves the literal behind), which would silently break that matcher.
         assert_eq!(
             super::check_window_waves(super::MAX_WINDOW_WAVES + 1).unwrap_err(),
             "Wave query exceeds 128 waves"
         );
-        assert!(super::visible_token_budget_error()
-            .starts_with("Visible wave query exceeds 500,000 tokens"));
+        assert_eq!(
+            super::visible_token_budget_error(),
+            "Visible wave query exceeds 500,000 tokens. Zoom in or use Target wave. No tokens were silently dropped."
+        );
+        assert_eq!(
+            super::aggregate_waves_budget_error("Wave statistics query"),
+            "Wave statistics query exceeds 4096 waves"
+        );
+        assert_eq!(
+            super::aggregate_waves_budget_error("Wave overview"),
+            "Wave overview exceeds 4096 waves"
+        );
         assert_ne!(super::MAX_WINDOW_WAVES, super::MAX_AGGREGATE_WAVES);
+    }
+
+    #[test]
+    fn thousands_matches_en_us_grouping() {
+        assert_eq!(super::thousands(500_000), "500,000");
+        assert_eq!(super::thousands(4096), "4,096");
+        assert_eq!(super::thousands(128), "128");
+        assert_eq!(super::thousands(0), "0");
     }
 }
 #[derive(Clone, Debug)]

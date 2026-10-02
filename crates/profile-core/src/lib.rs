@@ -99,7 +99,10 @@ pub fn load_wave_indices(capture: &Capture, indices: &[usize]) -> Result<Vec<Wav
         let wave = import::load_wave_at(capture, *index)?;
         tokens += wave.tokens.len();
         if tokens > wave_index::MAX_VIEWPORT_TOKENS {
-            return Err("Selected waves exceed 500,000 tokens. This query loads whole waves; choose a range overlapping fewer waves or use Target wave. No waves were silently dropped.".into());
+            // Shared with the viewport path so the number stays interpolated from
+            // MAX_VIEWPORT_TOKENS and the string stays one the frontend matcher
+            // (src/waveOverview.ts::isWaveDetailBudgetError) recognizes.
+            return Err(wave_index::visible_token_budget_error());
         }
         waves.push(wave);
     }

@@ -78,7 +78,7 @@ pub fn load_cancellable(
         return Err("Invalid wave statistics range".into());
     }
     if indices.len() > crate::wave_index::MAX_AGGREGATE_WAVES {
-        return Err("Wave statistics query exceeds 4096 waves".into());
+        return Err(crate::wave_index::aggregate_waves_budget_error("Wave statistics query"));
     }
     let mut stats = BTreeMap::new();
     for index in indices {
