@@ -304,6 +304,44 @@ def metric(value=None, unit='', reason=None):
     return {'value': value, 'unit': unit, 'reason': reason}
 
 
+DEFAULT_CONDITIONS = {'mode': 'stateless', 'repeats': 1}
+
+
+def conditions_of(request):
+    """The conditions a HIP run's replay uses. 'stateless' (the default) restores the
+    captured inputs before every iteration and times one dispatch in isolation;
+    'sustained' restores once and dispatches back-to-back, approximating a kernel kept
+    resident on a busy queue -- valid only when the dispatch does not read what it
+    writes (kerncap calls this 'stateful', its --no-recopy path). 'repeats' replays the
+    whole capture with fresh allocations to show how much placement moves the timing.
+    Memory-pool placement (vkreplay --memory) and cache flushing (--flush-mb) are not
+    offered on the HIP path; see docs/kernel-tuning-parity.md for why."""
+    c = {**DEFAULT_CONDITIONS, **(request.get('conditions') or {})}
+    if c['mode'] not in ('stateless', 'sustained'):
+        raise ValueError('conditions.mode must be stateless or sustained')
+    c['repeats'] = int(c['repeats'])
+    if not 1 <= c['repeats'] <= 10:
+        raise ValueError('conditions.repeats must be between 1 and 10')
+    return {k: c[k] for k in DEFAULT_CONDITIONS}
+
+
+def replay_argv(cfg, capture, hsaco, iterations, conditions):
+    """The kerncap-replay command for one timed replay under the given conditions.
+    kerncap restores captured inputs on each iteration unless --no-recopy is given, so
+    'stateless' needs no flag and 'sustained' maps to --no-recopy."""
+    argv = [cfg['replay'], str(capture), '--hsaco', str(hsaco),
+            '--iterations', str(iterations), '--json', '--hip-launch']
+    if conditions['mode'] == 'sustained':
+        argv.append('--no-recopy')
+    return argv
+
+
+def expected_replay_mode(conditions):
+    """kerncap-replay echoes 'stateless' for its default (recopy) path and 'stateful'
+    for --no-recopy; map the condition name onto the string the replay reports."""
+    return 'stateful' if conditions['mode'] == 'sustained' else 'stateless'
+
+
 def metrics_for(replay, resources, isa, options):
     us = replay.get('timing', {}).get('average')
     if not isinstance(us, (float, int)) or not math.isfinite(us) or us <= 0:
@@ -498,19 +536,31 @@ def main(root, request):
                 raise
             except Exception as error:
                 state['calibrationError'] = str(error)
-        phase('Timing isolated kernel')
-        argv = [cfg['replay'], str(capture), '--hsaco', str(hsaco), '--iterations', str(iterations), '--json', '--hip-launch']
-        output = run / 'replay.json'
-        with output.open('wb') as stdout, log.open('ab') as stderr:
-            p = calibration.run_tree(argv, 540, stdout=stdout, stderr=stderr)
-        if p.returncode:
-            hint = ''
-            if state.get('captureScope') == 'reachable':
-                hint = '. The capture kept only the allocations reachable from the kernel\'s arguments; if the kernel reaches memory another way, open a new session and capture with config.captureScope "all"'
-            raise RuntimeError('Isolated replay failed; see job.log' + hint)
-        replay = json.loads(output.read_text())
-        if replay['execution']['mode'] != 'stateless': raise ValueError('Replay must restore captured inputs on each iteration')
+        conditions = conditions_of(request)
+        expected_mode = expected_replay_mode(conditions)
+        replays = []
+        for attempt in range(conditions['repeats']):
+            phase('Timing isolated kernel' + (f" (replay {attempt + 1} of {conditions['repeats']}, fresh allocations)" if conditions['repeats'] > 1 else ''))
+            argv = replay_argv(cfg, capture, hsaco, iterations, conditions)
+            output = run / ('replay.json' if attempt == 0 else f'replay-{attempt + 1}.json')
+            with output.open('wb') as stdout, log.open('ab') as stderr:
+                p = calibration.run_tree(argv, 540, stdout=stdout, stderr=stderr)
+            if p.returncode:
+                hint = ''
+                if state.get('captureScope') == 'reachable':
+                    hint = '. The capture kept only the allocations reachable from the kernel\'s arguments; if the kernel reaches memory another way, open a new session and capture with config.captureScope "all"'
+                raise RuntimeError('Isolated replay failed; see job.log' + hint)
+            attempt_replay = json.loads(output.read_text())
+            if attempt_replay['execution']['mode'] != expected_mode:
+                raise ValueError(f"Replay ran in {attempt_replay['execution']['mode']!r} mode, not the requested {conditions['mode']!r}; the kernel-tuning runtime may predate replay conditions (rerun scripts/setup-kernel-tuning.py)")
+            replays.append(attempt_replay)
+        # The representative replay is the fastest average across fresh-allocation
+        # repeats -- the isolated best case; the spread below shows placement sensitivity.
+        replay = min(replays, key=lambda r: r.get('timing', {}).get('average', math.inf))
         metrics = metrics_for(replay, resources, isa, request.get('work', {}))
+        if conditions['repeats'] > 1:
+            averages = [r['timing']['average'] for r in replays]
+            metrics['Replay spread'] = metric(max(averages) - min(averages), 'µs', f"Range of per-replay average GPU duration across {conditions['repeats']} fresh-allocation replays")
         characterization = None
         if calibrated:
             try:
@@ -580,13 +630,14 @@ def main(root, request):
             actual = replay_output_hashes(capture, hsaco, cfg, run / 'variant-validation', log)
             mismatches = [name for name, sha in reference.items() if actual.get(name) != sha]
             validation = {'status': 'bitwise match' if not mismatches else 'output differs', 'mismatchedRegions': mismatches, 'outputHashes': actual, 'referenceHashes': reference}
-        previous = state.get('runs', [])[-1] if state.get('runs') else None
+        # Deltas only against the latest earlier run made under the same replay conditions.
+        previous = next((r for r in reversed(state.get('runs', [])) if r.get('conditions', DEFAULT_CONDITIONS) == conditions), None)
         for label, value in metrics.items():
             old = (previous or {}).get('metrics', {}).get(label, {})
             if value['value'] is not None and old.get('value') is not None and old.get('unit') == value['unit'] and old.get('reason') == value.get('reason') and old.get('basis') == value.get('basis') and (previous or {}).get('work', {}) == request.get('work', {}) and ((previous or {}).get('calibration') or {}).get('fingerprint') == (calibrated or {}).get('fingerprint'):
                 value['delta'] = value['value'] - old['value']
                 value['deltaPercent'] = 100 * value['delta'] / abs(old['value']) if old['value'] else None
-        record = {'calibration': calibrated, 'characterization': characterization, 'validation': validation, 'work': request.get('work', {}), 'number': number, 'variant': variant, 'codeHash': digest(code.encode()) if variant else 'captured', 'hsacoHash': digest(hsaco.read_bytes()), 'iterations': iterations, 'replay': replay, 'metrics': metrics, 'profiles': profiles, 'directory': str(run)}
+        record = {'calibration': calibrated, 'characterization': characterization, 'validation': validation, 'work': request.get('work', {}), 'number': number, 'variant': variant, 'codeHash': digest(code.encode()) if variant else 'captured', 'hsacoHash': digest(hsaco.read_bytes()), 'iterations': iterations, 'conditions': conditions, 'replay': replay, 'replays': replays, 'metrics': metrics, 'profiles': profiles, 'directory': str(run)}
         atomic(run / 'result.json', json.dumps(record, indent=2).encode())
         state.setdefault('runs', []).append(record); state['isa'] = isa; state['code'] = code; state['config'] = cfg
     elif op == 'save':

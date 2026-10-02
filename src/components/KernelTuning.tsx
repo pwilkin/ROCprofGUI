@@ -60,6 +60,7 @@ type Run = {
   number: number;
   variant: boolean;
   iterations: number;
+  conditions?: KernelConditions;
   codeHash: string;
   metrics: Record<string, Metric>;
   directory: string;
@@ -100,6 +101,20 @@ type Status = {
   error: string | null;
   log: string;
 };
+// The replay conditions the HIP (Kerncap) path honours. Memory placement and
+// cache flush are Vulkan-only; see docs/kernel-tuning-parity.md.
+type KernelConditions = { mode: "stateless" | "sustained"; repeats: number };
+const BEST_CASE: KernelConditions = { mode: "stateless", repeats: 1 };
+function describeConditions(c: KernelConditions = BEST_CASE) {
+  return [
+    c.mode === "sustained"
+      ? "dispatched back to back after one restore"
+      : "inputs restored before every iteration",
+    c.repeats > 1 ? `${c.repeats} replays with fresh allocations` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
 const defaults: Config = {
   sourceTree: "",
   cwd: "",
@@ -139,6 +154,7 @@ export function KernelTuning({ id }: { id: string }) {
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [iterations, setIterations] = useState(20),
+    [conditions, setConditions] = useState<KernelConditions>(BEST_CASE),
     [work, setWork] = useState<Record<string, string>>({}),
     [counters, setCounters] = useState("[]"),
     [runIndex, setRunIndex] = useState(-1),
@@ -613,12 +629,52 @@ export function KernelTuning({ id }: { id: string }) {
                   onChange={(e) => setIterations(Number(e.target.value))}
                 />
               </label>
+              <fieldset className="tuning-conditions">
+                <legend>Replay conditions</legend>
+                <label>
+                  Mode
+                  <select
+                    aria-label="Replay mode"
+                    value={conditions.mode}
+                    onChange={(e) =>
+                      setConditions((c) => ({
+                        ...c,
+                        mode: e.target.value as KernelConditions["mode"],
+                      }))
+                    }
+                  >
+                    <option value="stateless">
+                      Stateless (restore inputs each iteration)
+                    </option>
+                    <option value="sustained">
+                      Sustained (back to back after one restore)
+                    </option>
+                  </select>
+                </label>
+                <label>
+                  Replays
+                  <input
+                    aria-label="Replays with fresh allocations"
+                    type="number"
+                    min="1"
+                    max="10"
+                    value={conditions.repeats}
+                    onChange={(e) =>
+                      setConditions((c) => ({
+                        ...c,
+                        repeats: Number(e.target.value),
+                      }))
+                    }
+                  />
+                </label>
+              </fieldset>
               <button
                 disabled={busy || !session.captured}
                 onClick={() =>
                   void action("run", {
                     variant: false,
                     iterations,
+                    conditions,
                     work,
                     counters: [],
                   })
@@ -633,6 +689,7 @@ export function KernelTuning({ id }: { id: string }) {
                     variant: true,
                     code,
                     iterations,
+                    conditions,
                     work,
                     counters: [],
                   })
@@ -686,9 +743,9 @@ export function KernelTuning({ id }: { id: string }) {
         {selected ? (
           <>
             <p>
-              Run {selected.number} · {selected.iterations} iterations · inputs
-              restored for every iteration · deltas against run{" "}
-              {selected.number - 1}
+              Run {selected.number} · {selected.iterations} iterations ·{" "}
+              {describeConditions(selected.conditions)} · deltas against the last
+              earlier run under the same conditions
             </p>
             <p role="status">
               Output validation: {selected.validation?.status || "not checked"}

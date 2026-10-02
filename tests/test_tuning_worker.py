@@ -97,6 +97,35 @@ class TuningTests(unittest.TestCase):
         self.assertIsNone(m['Occupancy']['value'])
         self.assertEqual(m['WMMA / MFMA instructions']['value'], 1)
 
+    def test_replay_conditions_default_to_isolated_stateless(self):
+        self.assertEqual(w.conditions_of({}), {'mode': 'stateless', 'repeats': 1})
+        self.assertEqual(w.conditions_of({'conditions': None}), {'mode': 'stateless', 'repeats': 1})
+        c = w.conditions_of({})
+        argv = w.replay_argv({'replay': '/r/kerncap-replay'}, '/cap', '/k.hsaco', 5, c)
+        self.assertEqual(argv, ['/r/kerncap-replay', '/cap', '--hsaco', '/k.hsaco', '--iterations', '5', '--json', '--hip-launch'])
+        self.assertNotIn('--no-recopy', argv)
+        self.assertEqual(w.expected_replay_mode(c), 'stateless')
+
+    def test_sustained_condition_maps_to_kerncap_no_recopy(self):
+        c = w.conditions_of({'conditions': {'mode': 'sustained', 'repeats': 3}})
+        self.assertEqual(c, {'mode': 'sustained', 'repeats': 3})
+        argv = w.replay_argv({'replay': '/r/kerncap-replay'}, '/cap', '/k.hsaco', 20, c)
+        self.assertEqual(argv[-1], '--no-recopy')
+        # kerncap reports its back-to-back path as 'stateful'; the run op verifies this.
+        self.assertEqual(w.expected_replay_mode(c), 'stateful')
+
+    def test_invalid_replay_conditions_rejected(self):
+        for bad in [{'mode': 'turbo'}, {'repeats': 0}, {'repeats': 11}]:
+            with self.assertRaises(ValueError):
+                w.conditions_of({'conditions': bad})
+
+    def test_vulkan_only_conditions_do_not_leak_into_hip(self):
+        # Memory placement and cache flush are Vulkan-only; stray keys must be dropped,
+        # never silently forwarded as if the HIP replay honored them.
+        c = w.conditions_of({'conditions': {'mode': 'stateless', 'memory': 'gtt', 'flushMb': 64}})
+        self.assertEqual(set(c), {'mode', 'repeats'})
+        self.assertNotIn('--memory', w.replay_argv({'replay': '/r'}, '/c', '/k', 1, c))
+
     def session(self):
         original = 'int before;\n__global__ void k(float* p) { p[0]=1; }\nint after;\n'
         path = self.root / 'kernel.cu'; path.write_text(original)
