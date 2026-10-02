@@ -90,21 +90,26 @@ impl<'de, F: FnMut(Token) -> Result<(), String>> Visitor<'de> for TokensSeed<'_,
         Ok(())
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        for _ in 0..crate::caps::max_records() {
+        let cap = crate::caps::max_records();
+        for _ in 0..cap {
             let Some(row) = seq.next_element::<Value>()? else {
                 return Ok(());
             };
             (self.0)(crate::import::parse_wave_token(&row).map_err(A::Error::custom)?)
                 .map_err(A::Error::custom)?;
         }
-        seq.next_element::<ExcessToken>()?;
+        // A seed that errors on sight rejects an over-cap input BEFORE parsing the
+        // extra element, and carries the effective cap into the message (rather
+        // than a hard-coded "two million" a raised/lowered cap would belie).
+        seq.next_element_seed(ExcessToken(cap))?;
         Ok(())
     }
 }
-struct ExcessToken;
-impl<'de> serde::Deserialize<'de> for ExcessToken {
-    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-        Err(D::Error::custom("Input exceeds two million rows"))
+struct ExcessToken(usize);
+impl<'de> DeserializeSeed<'de> for ExcessToken {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
+        Err(D::Error::custom(format!("Input exceeds the {} row limit", self.0)))
     }
 }
 
@@ -173,6 +178,6 @@ mod tests {
         source.truncate(source.len() - 3);
         source.push_str(",[");
         let error = read(source.as_bytes(), &AtomicBool::new(false), |_| Ok(())).unwrap_err();
-        assert!(error.contains("two million rows"), "{error}");
+        assert!(error.contains(&format!("{} row limit", crate::import::MAX_ROWS)), "{error}");
     }
 }

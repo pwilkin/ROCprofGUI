@@ -237,6 +237,8 @@ fn load_ui(root: &Path, load_wave_states: bool) -> Result<Capture, String> {
         c.name = "LDS transpose · example capture".into();
     }
     if let Some(ses) = names["wave_filenames"].as_object() {
+        // Resolve the cap once; the per-wave check below runs in the hot loop.
+        let cap = crate::caps::max_records();
         for (se, simds) in ses {
             for (simd, slots) in simds.as_object().ok_or("Invalid SIMD hierarchy")? {
                 for (slot, wids) in slots.as_object().ok_or("Invalid slot hierarchy")? {
@@ -255,7 +257,7 @@ fn load_ui(root: &Path, load_wave_states: bool) -> Result<Capture, String> {
                             start,
                             end,
                         });
-                        check_rows(c.waves.len())?;
+                        check_rows_cap(c.waves.len(), cap)?;
                     }
                 }
             }
@@ -751,11 +753,14 @@ fn deserialize_wave_tokens<'de, D: serde::Deserializer<'de>>(
             self,
             mut seq: A,
         ) -> Result<Self::Value, A::Error> {
-            use serde::de::Error;
-            struct ExcessToken;
-            impl<'de> serde::Deserialize<'de> for ExcessToken {
-                fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
-                    Err(serde::de::Error::custom("Input exceeds two million rows"))
+            use serde::de::{DeserializeSeed, Error};
+            // A seed that errors on sight rejects an over-cap input BEFORE parsing
+            // the extra element, carrying the effective cap into the message.
+            struct ExcessToken(usize);
+            impl<'de> DeserializeSeed<'de> for ExcessToken {
+                type Value = ();
+                fn deserialize<D: serde::Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
+                    Err(D::Error::custom(format!("Input exceeds the {} row limit", self.0)))
                 }
             }
             let mut tokens = Vec::new();
@@ -766,7 +771,7 @@ fn deserialize_wave_tokens<'de, D: serde::Deserializer<'de>>(
                 };
                 tokens.push(parse_wave_token(&row).map_err(A::Error::custom)?);
             }
-            seq.next_element::<ExcessToken>()?;
+            seq.next_element_seed(ExcessToken(cap))?;
             Ok(tokens)
         }
     }
@@ -876,17 +881,19 @@ fn load_wave_using(
         time += duration;
     }
     if !w["waitcnt"].is_null() {
+        // Resolve the cap once for the per-wait / per-source checks in this loop.
+        let cap = crate::caps::max_records();
         let waits = w["waitcnt"]
             .as_array()
             .ok_or("Invalid wait dependency list")?;
-        check_rows(waits.len())?;
+        check_rows_cap(waits.len(), cap)?;
         for wait in waits {
             check_wave_cancelled(cancelled)?;
             if wait.as_array().map(|a| a.len()) != Some(2) || wait[0].as_i64().is_none() {
                 return Err("Invalid wait ISA identity".into());
             }
             let sources = wait[1].as_array().ok_or("Invalid wait sources")?;
-            check_rows(sources.len())?;
+            check_rows_cap(sources.len(), cap)?;
             for source in sources {
                 check_wave_cancelled(cancelled)?;
                 if source.as_array().map(|a| a.len()) != Some(2)
@@ -971,6 +978,9 @@ fn load_csv_reader(
     );
     let mut rows = vec![];
     let mut origin = u64::MAX;
+    // Resolve the cap once; the check runs on every CSV row below (712 k rows on
+    // the campaign capture — one getenv per row otherwise).
+    let cap = crate::caps::max_records();
     for row in reader.records() {
         crate::cancellable_read::check(cancelled)?;
         let row = row.map_err(err)?;
@@ -986,7 +996,7 @@ fn load_csv_reader(
         }
         origin = origin.min(start);
         rows.push((row, start, end));
-        check_rows(rows.len())?;
+        check_rows_cap(rows.len(), cap)?;
     }
     if rows.is_empty() {
         return Err("Kernel trace CSV contains no dispatches".into());
@@ -1551,7 +1561,7 @@ mod wave_read_cancellation_tests {
         let error =
             read_wave_json::<super::WaveDocument>(source.as_bytes(), &AtomicBool::new(false))
                 .unwrap_err();
-        assert!(error.contains("Input exceeds two million rows"), "{error}");
+        assert!(error.contains(&format!("Input exceeds the {} row limit", super::MAX_ROWS)), "{error}");
         source.truncate(rows_end - row.len());
         source.push_str("[0,6,-1,1,7]]}}");
         let error =
