@@ -1389,8 +1389,8 @@ impl Server {
                 )
                 .map_err(|e| e.to_string())?;
                 if a["tracer"] == "radv" {
-                    if ["counters", "profiler", "traces", "att", "kernelIncludeRegex", "kernelExcludeRegex"].iter().any(|key| a.get(*key).is_some()) {
-                        return Err("counters, traces, att, kernelIncludeRegex, kernelExcludeRegex and profiler apply to rocprofv3 only".into());
+                    if ["counters", "profiler", "traces", "att", "kernelIncludeRegex", "kernelExcludeRegex", "kernelIterationRange"].iter().any(|key| a.get(*key).is_some()) {
+                        return Err("counters, traces, att, kernelIncludeRegex, kernelExcludeRegex, kernelIterationRange and profiler apply to rocprofv3 only".into());
                     }
                     let started = std::time::SystemTime::now();
                     let mut vars = vec![
@@ -1479,13 +1479,14 @@ impl Server {
     }
 }
 /// Keys that only mean something for the rocprofv3 attach tracer, rejected for RADV.
-const ROCPROFV3_ONLY_TRIGGER_KEYS: [&str; 7] = [
+const ROCPROFV3_ONLY_TRIGGER_KEYS: [&str; 8] = [
     "windowMs",
     "counters",
     "traces",
     "att",
     "kernelIncludeRegex",
     "kernelExcludeRegex",
+    "kernelIterationRange",
     "triggered",
 ];
 
@@ -1546,9 +1547,14 @@ fn profile_start_core(control: &Control, a: &Value) -> Result<Value, String> {
     })
 }
 
-/// Appends `--kernel-include-regex` / `--kernel-exclude-regex` when the request
-/// supplies them. These are honoured in attach mode and, on reattachment, are
-/// among the options rocprofv3 requires to be identical across windows.
+/// Appends `--kernel-include-regex` / `--kernel-exclude-regex` /
+/// `--kernel-iteration-range` when the request supplies them. All three are
+/// honoured in attach mode and, on reattachment, are among the options
+/// rocprofv3 requires to be identical across windows (SDK filter
+/// `^kernel_(include_regex|exclude_regex|iteration_range)$`), so they are built
+/// into the same `collection_args` the same-collection guard compares. A name
+/// regex cannot discriminate different grids under one kernel name; the
+/// iteration range selects a later occurrence instead (campaign finding).
 fn kernel_filters(a: &Value, command: &mut Vec<String>) -> Result<(), String> {
     for (key, option) in [
         ("kernelIncludeRegex", "--kernel-include-regex"),
@@ -1565,6 +1571,17 @@ fn kernel_filters(a: &Value, command: &mut Vec<String>) -> Result<(), String> {
             command.push(option.into());
             command.push(regex.into());
         }
+    }
+    if let Some(value) = a.get("kernelIterationRange") {
+        let range = value
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("kernelIterationRange must be a nonempty string")?;
+        if !range.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b'-') {
+            return Err("kernelIterationRange must contain only ASCII digits, commas and hyphens (e.g. \"64\" or \"0-3\")".into());
+        }
+        command.push("--kernel-iteration-range".into());
+        command.push(range.into());
     }
     Ok(())
 }
@@ -1990,10 +2007,10 @@ fn tools() -> Vec<Value> {
  ("capture_open","Import a trace, counters, ATT run, sampling data or portable capture from an explicit path.",json!({"path":str_,"samplingMethod":str_,"loadWaveStates":{"type":"boolean"}}),vec!["path"]),
  ("capture_analyze","Run the same analysis functions as the GUI: kernels, occupancy, activity, hardware, hotspots, source, markers, scalar, tensor. Scalar takes name/formula (C0 etc). Tensor takes definitions (NAME := expression) and raw named {shape:[XCC,SE,CU,Time],values:[...]}. Timeline renders dispatch or global residency HTML with the same paged exporter as the GUI. Diagnostics produces its diagnostic manifest. Optional output writes a new HTML, diagnostics JSON, or analysis JSON file. Returns paged rows otherwise. Requires Node.js.",json!({"captureId":str_,"analysis":{"enum":["kernels","occupancy","activity","hardware","hotspots","source","markers","scalar","tensor","timeline","diagnostics"]},"metric":{"enum":["latency","pcSamples","pcIssued","pcStalled"]},"se":num,"kernel":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"name":str_,"formula":str_,"definitions":str_,"raw":obj,"output":str_,"timeline":{"enum":["dispatch","global"]},"timePages":num,"lanesPerPage":num,"workspace":obj,"query":str_,"offset":num,"limit":num}),vec!["captureId","analysis"]),
  ("profile_start","Start a long-lived application for gated live profiling. tracer radv (default) runs a Vulkan server under RADV RGP file-trigger capture: headless compute needs a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only on swapchain presentation, and the capture gets the next eligible submit after each trigger. tracer rocprofv3 starts a HIP/ROCm application armed with ROCP_TOOL_ATTACH=1 so each profile_trigger attaches rocprofv3 for one bounded, time-based collection window; profiler overrides the rocprofv3 path. Returns an ID and log paths immediately. Only one live profile can run at a time; the process is stopped when rocprof-studio shuts down. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"env":obj,"tracer":{"enum":["radv","rocprofv3"]},"profiler":str_}),vec!["argv","cwd"]),
- ("profile_trigger","Fire one capture in a live profile. tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application, collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) plus optional kernelIncludeRegex/kernelExcludeRegex (mapped to --kernel-include-regex/--kernel-exclude-regex, honoured in attach mode including for att data) into a window-N directory. Two window modes: a TIMED window (windowMs milliseconds, default 5000) that detaches on its own, or a TRIGGERED window (triggered:true, no windowMs) that stays attached until you end it with profile_trigger end:true (writes a newline to rocprofv3's stdin so it detaches) or profile_stop — use it to capture exactly one request without guessing a duration. A window is time- or trigger-based and cannot isolate a single dispatch; only one window is open at a time; detachment can lag by 1-2 minutes (ROCm); and because rocprofv3 pickles each PID's attach options and reattaches only with identical ones, every window of one process must request the same streams, counters, att, kernel filters AND mode (timed vs triggered) — a mismatch is rejected up front, and an empty window still warns at profile_stop. Attach is retried with backoff when the ROCm set_profiler_active handshake times out on a busy queue; attachAttempts and any attachWarning are reported.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"triggered":{"type":"boolean"},"end":{"type":"boolean"},"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_}),vec!["id"]),
+ ("profile_trigger","Fire one capture in a live profile. tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application, collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) plus optional kernelIncludeRegex/kernelExcludeRegex (mapped to --kernel-include-regex/--kernel-exclude-regex, honoured in attach mode including for att data) and optional kernelIterationRange (mapped to --kernel-iteration-range, e.g. \"64\" or \"0-3\": ATT otherwise samples the FIRST occurrence of each kernel name and a name regex cannot discriminate grids that share a name, so an iteration range is the only way to target a later dispatch) into a window-N directory. Two window modes: a TIMED window (windowMs milliseconds, default 5000) that detaches on its own, or a TRIGGERED window (triggered:true, no windowMs) that stays attached until you end it with profile_trigger end:true (writes a newline to rocprofv3's stdin so it detaches) or profile_stop — use it to capture exactly one request without guessing a duration. A window is time- or trigger-based and cannot isolate a single dispatch; only one window is open at a time; detachment can lag by 1-2 minutes (ROCm); and because rocprofv3 pickles each PID's attach options and reattaches only with identical ones, every window of one process must request the same streams, counters, att, kernel filters AND mode (timed vs triggered) — a mismatch is rejected up front, and an empty window still warns at profile_stop. Attach is retried with backoff when the ROCm set_profiler_active handshake times out on a busy queue; attachAttempts and any attachWarning are reported.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"triggered":{"type":"boolean"},"end":{"type":"boolean"},"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_}),vec!["id"]),
  ("profile_status","Check whether a live profiled process is running. tracer radv also reports whether its trigger is pending and how many RGP saves RADV has announced; tracer rocprofv3 reports whether the current attach window is still open (windowRunning) and whether it is a triggered window (windowTriggered). Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
  ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), or every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3). An open timed window is given up to 180 s to detach on its own; an open triggered window is detached first by writing a newline to rocprofv3's stdin, then given up to 180 s — both abort with a warning past that. Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
- ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex). tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
+ ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex); kernelIterationRange (--kernel-iteration-range, e.g. \"64\" or \"0-3\") selects which occurrences are sampled, the only way to target a dispatch other than the first under a given kernel name. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_,"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
  ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources. Limit <=1000. Counter rows include recorded samples.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":num}),vec!["captureId","dataset"]),
  ("workspace_select","Follow a capture, view, range, wave, instruction or dispatch in the GUI. Views: reference, trace, hardware, summary, sampling, occupancy, dispatch, hotspots, flame, markers, counters, evidence.",json!({"captureId":str_,"view":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"waveId":str_,"dispatchId":str_,"instruction":num,"timeline":str_,"se":num}),vec!["captureId"]),
@@ -2516,6 +2533,39 @@ mod tests {
         let start = &catalog.iter().find(|t| t["name"] == "profile_start").unwrap()["inputSchema"];
         assert!(validate(&json!({"argv":["app"],"cwd":"/","tracer":"rocprofv3","profiler":"/opt/rocm/bin/rocprofv3"}), start).is_ok());
         assert!(validate(&json!({"argv":["app"],"cwd":"/","tracer":"rgp"}), start).is_err());
+    }
+    #[test]
+    fn kernel_filters_pass_through_and_validate() {
+        let build = |a: Value| {
+            let mut command = Vec::new();
+            kernel_filters(&a, &mut command).map(|_| command)
+        };
+        assert!(build(json!({})).unwrap().is_empty());
+        // Iteration range passes through verbatim after light validation; the
+        // SDK reattach set treats it like the name regexes, so it joins the
+        // same collection_args the same-collection guard compares.
+        assert_eq!(
+            build(json!({"kernelIterationRange":"64"})).unwrap(),
+            ["--kernel-iteration-range", "64"]
+        );
+        assert_eq!(
+            build(json!({"kernelIterationRange":"0-3"})).unwrap(),
+            ["--kernel-iteration-range", "0-3"]
+        );
+        assert_eq!(
+            build(json!({"kernelIncludeRegex":"mul_mat","kernelIterationRange":"2,5-7"})).unwrap(),
+            ["--kernel-include-regex", "mul_mat", "--kernel-iteration-range", "2,5-7"]
+        );
+        for bad in [
+            json!({"kernelIterationRange":""}),
+            json!({"kernelIterationRange":"64 "}),
+            json!({"kernelIterationRange":"first"}),
+            json!({"kernelIterationRange":"0..3"}),
+            json!({"kernelIterationRange":64}),
+            json!({"kernelIterationRange":["64"]}),
+        ] {
+            assert!(build(bad.clone()).is_err(), "{bad}");
+        }
     }
     #[test]
     fn attach_requires_a_display_and_only_expected_environment() {

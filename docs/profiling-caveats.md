@@ -24,6 +24,12 @@ The Q8 investigation documented extra waves in some selected counter windows. Sa
 
 **Design consequence:** raw series retain names/scopes and no architecture-derived normalization is guessed. Scalar counter arithmetic requires matching scope and exact sample timestamps. The full dimension/unit-aware expression engine remains a parity milestone.
 
+## ATT samples the first occurrence of each kernel name
+
+The 2026-10-02 live-profiling campaign (`/devel/tools/rocprofgui-campaign-2026-10-02/`) established that rocprofv3 SDK 1.3.5 default per-dispatch ATT captures the **first** occurrence of each kernel identity in the target, and that reattach windows on the same already-sampled kernels produce no new `.att` files. A name regex (`kernelIncludeRegex`) narrows ATT to a name but still takes its first occurrence; it cannot discriminate different grids that share a kernel name. `--kernel-iteration-range` is the only way to target a later dispatch — on a fresh target, iteration 64 selected dispatch 7139. The MCP surfaces this as `kernelIterationRange` on `profile_run`/`profile_trigger`, and because rocprofv3 pickles it into the reattach option set alongside the name regexes, it is part of the same same-collection-per-process guard.
+
+**Design consequence:** to profile a specific dispatch other than the first under a kernel name, select it by iteration range on a fresh target; do not expect a name filter alone to move the ATT sample.
+
 ## Tool compatibility and failure
 
 Historical failures included:

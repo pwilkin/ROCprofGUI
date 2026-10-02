@@ -97,16 +97,30 @@ with tempfile.TemporaryDirectory(prefix="rocprof-attach-test-") as temporary:
             def start():
                 return client.tool("profile_start", {"cwd": str(root), "argv": [str(target)], "tracer": "rocprofv3", "profiler": str(profiler)})
 
-            # --- Session A: timed window, kernel filter, same-collection guard. ---
+            # --- Session A: timed window, kernel filter + iteration range, same-collection guard. ---
             a = start()
             assert "pid" in a and a["pid"], a
-            win = client.tool("profile_trigger", {"id": a["id"], "windowMs": 300, "traces": ["kernel"], "kernelIncludeRegex": "mul_mat"})
+            win = client.tool("profile_trigger", {"id": a["id"], "windowMs": 300, "traces": ["kernel"], "kernelIncludeRegex": "mul_mat", "kernelIterationRange": "64"})
             assert win["mode"] == "timed" and win["window"] == 1, win
             argv = (Path(win["directory"]) / "argv.txt").read_text().splitlines()
             assert "--kernel-include-regex" in argv and argv[argv.index("--kernel-include-regex") + 1] == "mul_mat", argv
+            # kernelIterationRange passes through verbatim to --kernel-iteration-range (campaign: iteration 64 selected dispatch 7139).
+            assert "--kernel-iteration-range" in argv and argv[argv.index("--kernel-iteration-range") + 1] == "64", argv
             assert "--kernel-trace" in argv and "--attach-sync-output" in argv, argv
             assert "--attach-duration-msec" in argv and "--kernel-exclude-regex" not in argv, argv
             wait_window_closed(client, a["id"])
+            # An invalid iteration range is rejected up front, before any attach.
+            try:
+                client.tool("profile_trigger", {"id": a["id"], "windowMs": 300, "traces": ["kernel"], "kernelIncludeRegex": "mul_mat", "kernelIterationRange": "0..3"})
+                raise AssertionError("invalid kernelIterationRange should have been rejected")
+            except RuntimeError as e:
+                assert "kernelIterationRange" in str(e), e
+            # A different iteration range is a collection mismatch, like any other filter (rocprofv3's reattach set).
+            try:
+                client.tool("profile_trigger", {"id": a["id"], "windowMs": 300, "traces": ["kernel"], "kernelIncludeRegex": "mul_mat", "kernelIterationRange": "0-3"})
+                raise AssertionError("mismatched iteration range should have been rejected")
+            except RuntimeError as e:
+                assert "same" in str(e) and "--kernel-iteration-range" in str(e), e
             try:
                 client.tool("profile_trigger", {"id": a["id"], "windowMs": 300, "traces": ["hip"]})
                 raise AssertionError("mismatched streams should have been rejected")
