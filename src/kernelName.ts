@@ -19,6 +19,8 @@ export type KernelFamily =
   | "radv-internal" // "… (RADV internal)": a driver-internal Vulkan command shader
   | "radv-pipeline" // "pipeline <hex>": a RADV pipeline named only by its PSO hash
   | "radv-code-object" // "code object N": a RADV code object with no PSO name
+  | "hrx-ggml" // "ggml_…": a compute kernel from the HRX/loom ggml backend
+  | "hrx-runtime" // "iree_hal_amdgpu_device_…": an HRX runtime device-library kernel
   | "mangled" // an Itanium-mangled C++ symbol ("_Z…"); demangle in the tuning worker
   | "plain" // a plain or already-demangled name
   | "unknown"; // empty or unrecognised
@@ -125,3 +127,38 @@ export function classifyKernelName(name: string): KernelNameInfo {
 export function isInternalKernel(name: string): boolean {
   return classifyKernelName(name).internal;
 }
+
+/** HRX / loom backend kernel families, keyed on the producer-observed name prefixes
+ *  in the hrx-b99 native profiles and rocprofv3 traces (decoded-dispatches.json and
+ *  the kernel/counter CSVs):
+ *  - `ggml_*` — compute kernels from the HRX/loom ggml backend, e.g.
+ *    `ggml_rope_f32`, `ggml_mul_mat_swiglu_q4_q8_1_x4_lowtoken_dot_q8_output`.
+ *  - `iree_hal_amdgpu_device_*` — IREE HAL AMDGPU device-library runtime kernels,
+ *    e.g. `iree_hal_amdgpu_device_buffer_copy_block_x16`. These are runtime
+ *    internals (like RADV's internal command shaders), not independently tunable.
+ *
+ *  Model-specific fused kernels (observed `qwen*`, `llm_attention_*`) are left as
+ *  plain names on purpose: they carry no stable backend prefix to key a family on,
+ *  and classifying by a single workload's model name would over-fit. This matcher
+ *  is registered globally below; it defers (returns null) on every other name, so
+ *  RADV/rocprofv3/ROCPD classification is unchanged. It never rewrites the stored
+ *  identity string — only describes it. */
+export function hrxKernelFamily(name: string): KernelNameInfo | null {
+  if (name.startsWith("iree_hal_amdgpu_device_"))
+    return {
+      family: "hrx-runtime",
+      base: kernelBase(name),
+      mangled: false,
+      internal: true,
+    };
+  if (name.startsWith("ggml_"))
+    return {
+      family: "hrx-ggml",
+      base: kernelBase(name),
+      mangled: false,
+      internal: false,
+    };
+  return null;
+}
+
+registerKernelFamily(hrxKernelFamily);

@@ -55,6 +55,36 @@ it("distinguishes mangled, plain and empty names", () => {
   expect([empty.family, empty.base]).toEqual(["unknown", "Unknown kernel"]);
 });
 
+it("classifies the HRX/loom kernel families from their observed name prefixes", () => {
+  // ggml compute kernels (decoded-dispatches.json / HRX kernel+counter CSVs).
+  for (const name of [
+    "ggml_rope_f32",
+    "ggml_mul_mat_swiglu_q4_q8_1_x4_lowtoken_dot_q8_output",
+    "ggml_flash_attention_decode_split_f32_f16_wmma_next_q8",
+    "ggml_rmsnorm_binary_q8_1_x4",
+  ]) {
+    const info = classifyKernelName(name);
+    expect(info.family).toBe("hrx-ggml");
+    expect(info.mangled).toBe(false);
+    expect(info.base).toBe(name);
+    // ggml compute kernels are user kernels, so not gated as internal.
+    expect(isInternalKernel(name)).toBe(false);
+  }
+  // IREE HAL AMDGPU device-library kernels are HRX runtime internals.
+  const runtime = classifyKernelName("iree_hal_amdgpu_device_buffer_copy_block_x16");
+  expect(runtime.family).toBe("hrx-runtime");
+  expect(runtime.internal).toBe(true);
+  expect(isInternalKernel("iree_hal_amdgpu_device_buffer_copy_block_x16")).toBe(true);
+  // Model-specific fused kernels carry no stable backend prefix and stay plain.
+  for (const name of [
+    "qwen_attention_metadata",
+    "qwen3_moe_attention_postprocess_f32_f16",
+    "llm_attention_v_matmul_set_rows_legacy_f32_f32",
+  ]) {
+    expect(classifyKernelName(name).family).toBe("plain");
+  }
+});
+
 it("lets a new backend family register a matcher that takes precedence", () => {
   const hrx: KernelNameInfo = {
     family: "plain",
