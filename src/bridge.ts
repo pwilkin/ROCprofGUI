@@ -82,6 +82,14 @@ export async function openCapturePath(
     if (catalogImport === controller) catalogImport = null;
   }
 }
+// The third copy of the ATT filename grammar (with att_runs.rs's SE_MARKER /
+// split_stem and decode.py's regex — keep the three in step). A bare single
+// `.att` file that is NOT a decoded `<prefix>_shader_engine_<SE>_<RUN>.att` run
+// member needs the raw-ATT decoder setup; a shader-engine run member imports
+// directly. The two trailing fields are all-ASCII-digit, `_`-separated.
+export function isRawAttSetupPath(path: string): boolean {
+  return /\.att$/i.test(path) && !/_shader_engine_\d+_\d+\.att$/i.test(path);
+}
 export async function openCapture(
   directory: boolean,
 ): Promise<
@@ -121,12 +129,7 @@ export async function openCapture(
         }),
   });
   if (typeof path !== "string") return null;
-  if (
-    !directory &&
-    /\.att$/i.test(path) &&
-    !/_shader_engine_\d+_\d+\.att$/i.test(path)
-  )
-    return { attSetup: path };
+  if (!directory && isRawAttSetupPath(path)) return { attSetup: path };
   if (directory) {
     const runs = await invoke<AttRun[]>("discover_att_runs", { path });
     if (runs.length > 1) return { runs };
