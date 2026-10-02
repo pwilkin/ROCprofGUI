@@ -1643,8 +1643,20 @@ fn kernel_filters(a: &Value, command: &mut Vec<String>) -> Result<(), String> {
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or("kernelIterationRange must be a nonempty string")?;
-        if !range.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b'-') {
-            return Err("kernelIterationRange must contain only ASCII digits, commas and hyphens (e.g. \"64\" or \"0-3\")".into());
+        // Comma-separated indices or A-B ranges, each part nonempty and numeric.
+        // The old charset-only check let degenerate values ("-", ",", "0-3,,")
+        // through for rocprofv3 to reject later.
+        let well_formed = range.split(',').all(|part| match part.split_once('-') {
+            Some((lo, hi)) => {
+                !lo.is_empty()
+                    && !hi.is_empty()
+                    && lo.bytes().all(|b| b.is_ascii_digit())
+                    && hi.bytes().all(|b| b.is_ascii_digit())
+            }
+            None => !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()),
+        });
+        if !well_formed {
+            return Err("kernelIterationRange must be comma-separated iteration indices or A-B ranges, e.g. \"64\" or \"0-3,5\"".into());
         }
         command.push("--kernel-iteration-range".into());
         command.push(range.into());
@@ -2896,6 +2908,12 @@ mod tests {
             json!({"kernelIterationRange":"0..3"}),
             json!({"kernelIterationRange":64}),
             json!({"kernelIterationRange":["64"]}),
+            // Degenerate values the charset-only check used to accept.
+            json!({"kernelIterationRange":"-"}),
+            json!({"kernelIterationRange":","}),
+            json!({"kernelIterationRange":"0-3,,"}),
+            json!({"kernelIterationRange":"0-"}),
+            json!({"kernelIterationRange":"-3"}),
         ] {
             assert!(build(bad.clone()).is_err(), "{bad}");
         }

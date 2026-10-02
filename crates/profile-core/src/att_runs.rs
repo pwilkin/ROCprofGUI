@@ -86,12 +86,18 @@ pub fn discover(path: &Path) -> Result<Vec<AttRun>, String> {
             let bytes = files.values().try_fold(0u64, |sum, (_, n)| {
                 sum.checked_add(*n).ok_or("ATT size overflow")
             })?;
+            let path = files
+                .values()
+                .next()
+                .ok_or("ATT run has no files")?
+                .0
+                .clone();
             Ok(AttRun {
                 prefix,
                 run,
                 shader_engines: files.keys().copied().collect(),
                 bytes,
-                path: files.values().next().unwrap().0.clone(),
+                path,
             })
         })
         .collect()
