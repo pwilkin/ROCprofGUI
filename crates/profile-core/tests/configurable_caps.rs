@@ -149,6 +149,34 @@ fn record_cap_override_rejects_irpf_dispatches_without_sampling() {
 }
 
 #[test]
+fn record_cap_override_rejects_loom_rows_without_sampling() {
+    let _g = ENV_LOCK.lock().unwrap();
+    clear();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k.compile-report.json");
+    let report = serde_json::json!({
+        "kind": "loom.compile_report",
+        "schema_version": 0,
+        "mode": "summary",
+        "status": {"code": 0, "name": "OK"},
+        "entries": {"count": 2, "rows": [
+            {"index": 0, "function": "k0"},
+            {"index": 1, "function": "k1"}
+        ]}
+    });
+    std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
+    // Default cap: both entries import.
+    let capture = profile_core::load_capture(&path).unwrap();
+    assert_eq!(capture.compile_reports[0].entries.len(), 2);
+    // A one-record cap rejects the collection BEFORE Vec::with_capacity / row
+    // clones (the former only-after-full-materialization check could OOM first).
+    std::env::set_var("ROCPROF_MAX_RECORDS", "1");
+    let err = profile_core::load_capture(&path).unwrap_err();
+    assert!(err.contains("record limit"), "{err}");
+    clear();
+}
+
+#[test]
 fn file_cap_override_rejects_a_large_csv_on_size() {
     let _g = ENV_LOCK.lock().unwrap();
     clear();

@@ -239,7 +239,11 @@ rejected, with an explicit message and never a panic, when any of these hold:
   still claiming a current or next tier;
 - a residency constraint pairs `units` without `rounded_units`, gives a fixed
   limit a reducible footprint, or claims a reduction without a known limiting
-  footprint.
+  footprint;
+- a `wait_reason_summary_rows` inventory (validation ported from the loader's
+  `compile_report_wait_reasons.py` at the same checkout) breaks a stable
+  counter/reason name↔id mapping, duplicates a `(function, counter_id, reason_id)`,
+  violates a summary count invariant, or references a function no entry defines.
 
 The pre-schema public sample, a benchmark result with an embedded older-shaped
 report and no version-zero envelope, is rejected on the same rule. The rejection

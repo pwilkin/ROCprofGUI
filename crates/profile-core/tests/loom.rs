@@ -657,6 +657,66 @@ fn real_reports_validate_and_map() {
     }
 }
 
+fn wait_reason_counts() -> Value {
+    // Minimal counts satisfying every _parse_counts invariant.
+    json!({
+        "action_count": 1, "explicit_action_count": 1, "planned_action_count": 0,
+        "full_drain_count": 1, "partial_wait_count": 0, "drained_count": 0,
+        "max_drained_count": 0, "max_outstanding_before": 0, "max_full_drain_outstanding_before": 0
+    })
+}
+fn report_with_wait_reasons(rows: Value) -> Value {
+    let mut report = summary_report();
+    report.as_object_mut().unwrap().insert("wait_reason_summary_rows".into(), rows);
+    report
+}
+
+#[test]
+fn wait_reason_inventory_is_validated_like_the_strict_loader() {
+    // A well-formed inventory (its function matches the single entry "k").
+    let good = report_with_wait_reasons(json!({
+        "count": 1,
+        "rows": [{
+            "index": 0, "function": "k", "counter": "vmcnt", "counter_id": 0,
+            "reason": "load", "reason_id": 0, "summary": wait_reason_counts()
+        }]
+    }));
+    let parsed = loom_report::parse(&good, "<test>").expect("valid wait reasons should pass");
+    assert!(parsed.detail_rows.contains_key("wait_reason_summary_rows"));
+
+    // A wait reason referencing a function no entry defines is rejected.
+    let unknown = report_with_wait_reasons(json!({
+        "count": 1,
+        "rows": [{
+            "index": 0, "function": "ghost", "counter": "vmcnt", "counter_id": 0,
+            "reason": "load", "reason_id": 0, "summary": wait_reason_counts()
+        }]
+    }));
+    assert!(loom_report::parse(&unknown, "<test>").unwrap_err().contains("unknown function"));
+
+    // An inconsistent counter name↔id mapping across rows is rejected.
+    let inconsistent = report_with_wait_reasons(json!({
+        "count": 2,
+        "rows": [
+            {"index": 0, "function": "k", "counter": "vmcnt", "counter_id": 0, "reason": "load", "reason_id": 0, "summary": wait_reason_counts()},
+            {"index": 1, "function": "k", "counter": "vmcnt", "counter_id": 7, "reason": "store", "reason_id": 1, "summary": wait_reason_counts()}
+        ]
+    }));
+    assert!(loom_report::parse(&inconsistent, "<test>").unwrap_err().contains("inconsistent stable name/id"));
+
+    // A summary whose action_count != explicit + planned is rejected.
+    let mut bad_counts = wait_reason_counts();
+    bad_counts["explicit_action_count"] = json!(5);
+    let bad = report_with_wait_reasons(json!({
+        "count": 1,
+        "rows": [{
+            "index": 0, "function": "k", "counter": "vmcnt", "counter_id": 0,
+            "reason": "load", "reason_id": 0, "summary": bad_counts
+        }]
+    }));
+    assert!(loom_report::parse(&bad, "<test>").unwrap_err().contains("explicit plus planned"));
+}
+
 /// Collects producer-written compile-report envelope files (`*_compile_report.json`)
 /// recursively beneath a directory.
 fn collect_envelopes(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

@@ -17,10 +17,13 @@
 //!
 //! The validation mirrors `loom/py/loom/reporting/compile_report.py` at the
 //! pinned checkout (the strict loader): envelope shape, indexed-row invariants,
-//! entry identity, the residency summary invariants and the residency-constraint
-//! invariants. On top of the loader this importer also refuses a non-successful
-//! compilation (`status.code != 0`), because a failed compile has no meaningful
-//! static facts to surface.
+//! entry identity, the residency summary invariants, the residency-constraint
+//! invariants, and the wait-reason inventory invariants ported from
+//! `compile_report_wait_reasons.py` (stable counter/reason name↔id mappings,
+//! duplicate rejection, the summary count invariants, and the entry-function
+//! cross-reference). On top of the loader this importer also refuses a
+//! non-successful compilation (`status.code != 0`), because a failed compile has
+//! no meaningful static facts to surface.
 //!
 //! What this importer refuses to infer (enforced by never synthesising it):
 //! there are no cycle or time counts anywhere in a compile report; dynamic
@@ -41,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Required envelope `kind` for a direct report.
 pub const KIND: &str = "loom.compile_report";
@@ -323,6 +327,12 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// The over-the-record-cap rejection, shared by every row-count check so the
+/// message is identical whether the cap trips on one collection or the total.
+fn over_cap(cap: usize) -> String {
+    format!("Loom compile report exceeds the {cap} record limit; regenerate a smaller report")
+}
+
 /// The only producer of each container kind: a direct report comes from
 /// loom-compile, a benchmark envelope from iree-benchmark-loom.
 fn implied_tool(container_kind: &str) -> &'static str {
@@ -348,15 +358,23 @@ pub fn is_loom_report(path: &Path) -> bool {
         return true;
     }
     use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut head = vec![0u8; 64 * 1024];
-    let Ok(read) = file.read(&mut head) else {
+    // A single Read::read may return fewer bytes than requested even when more
+    // are available, truncating the sniff window; take + read_to_end fills it.
+    let mut head = Vec::new();
+    if file.take(64 * 1024).read_to_end(&mut head).is_err() {
         return false;
-    };
+    }
+    sniff_loom_kind(&head)
+}
+
+/// Content sniff for the `loom.compile_report` discriminator over an already-read
+/// head buffer, so a caller holding the bytes need not reopen the file.
+fn sniff_loom_kind(head: &[u8]) -> bool {
     let needle = KIND.as_bytes();
-    head[..read].windows(needle.len()).any(|w| w == needle)
+    head.windows(needle.len()).any(|w| w == needle)
 }
 
 /// True when a decoded document is shaped like a Loom compile report even if it
@@ -408,6 +426,17 @@ fn is_report_shaped(value: &Value) -> bool {
 /// Loads and validates a Loom compile report file into a [`Capture`] of static
 /// compile facts.
 pub fn load(path: &Path) -> Result<Capture, String> {
+    load_cancellable(path, &AtomicBool::new(false))
+}
+
+/// As [`load`], but cancellable — threaded through the import dispatcher like the
+/// irpf/rgp/csv/rocpd loaders so a `.json`/Loom import can be interrupted before
+/// (and after) the file is read rather than being the one importer that ignores
+/// the cancellation flag.
+pub fn load_cancellable(path: &Path, cancelled: &AtomicBool) -> Result<Capture, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Import cancelled".into());
+    }
     let size = std::fs::metadata(path).map_err(err)?.len();
     if size > crate::caps::max_file_bytes() {
         return Err(format!(
@@ -416,6 +445,9 @@ pub fn load(path: &Path) -> Result<Capture, String> {
         ));
     }
     let bytes = std::fs::read(path).map_err(err)?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Import cancelled".into());
+    }
     let value: Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let source = path.display().to_string();
@@ -502,13 +534,15 @@ pub fn parse(value: &Value, source: &str) -> Result<LoomCompileReport, String> {
         ));
     }
 
+    // Resolved once per import (not per row); every row-count check below uses it.
+    let cap = crate::caps::max_records();
     let mut total_rows = 0usize;
 
     let entries_obj = require_object(
         report.get("entries").unwrap_or(&Value::Null),
         &format!("{source}.entries"),
     )?;
-    let entry_rows = validate_indexed_rows(entries_obj, &format!("{source}.entries"))?;
+    let entry_rows = validate_indexed_rows(entries_obj, &format!("{source}.entries"), cap)?;
     total_rows += entry_rows.len();
     let mut seen_identities: HashSet<[Option<String>; 4]> = HashSet::new();
     let mut entries = Vec::with_capacity(entry_rows.len());
@@ -537,8 +571,11 @@ pub fn parse(value: &Value, source: &str) -> Result<LoomCompileReport, String> {
     let mut config_bindings = Vec::new();
     if let Some(cb) = report.get("config_bindings") {
         let obj = require_object(cb, &format!("{source}.config_bindings"))?;
-        let rows = validate_indexed_rows(obj, &format!("{source}.config_bindings"))?;
+        let rows = validate_indexed_rows(obj, &format!("{source}.config_bindings"), cap)?;
         total_rows += rows.len();
+        if total_rows > cap {
+            return Err(over_cap(cap));
+        }
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         for (index, row) in rows.iter().enumerate() {
             let key = require_string(
@@ -567,8 +604,11 @@ pub fn parse(value: &Value, source: &str) -> Result<LoomCompileReport, String> {
     let mut residency_constraints = Vec::new();
     if let Some(rc) = report.get("residency_constraints") {
         let (rows, parsed) =
-            index_residency_constraints(rc, &format!("{source}.residency_constraints"))?;
+            index_residency_constraints(rc, &format!("{source}.residency_constraints"), cap)?;
         total_rows += rows;
+        if total_rows > cap {
+            return Err(over_cap(cap));
+        }
         residency_constraints = parsed;
     }
 
@@ -610,7 +650,13 @@ pub fn parse(value: &Value, source: &str) -> Result<LoomCompileReport, String> {
                         .get("count")
                         .and_then(Value::as_u64)
                         .or_else(|| obj.get("row_count").and_then(Value::as_u64));
+                    // Check the running total BEFORE the clone below — a single
+                    // detail collection can be arbitrarily large, and cloning it
+                    // is what blows memory past the file size.
                     total_rows += rows.len();
+                    if total_rows > cap {
+                        return Err(over_cap(cap));
+                    }
                     detail_rows.insert(
                         key.clone(),
                         LoomRowCollection {
@@ -625,11 +671,14 @@ pub fn parse(value: &Value, source: &str) -> Result<LoomCompileReport, String> {
         sections.insert(key.clone(), v.clone());
     }
 
-    let cap = crate::caps::max_records();
+    // Parity with the strict loader: the detail loop above stores
+    // wait_reason_summary_rows verbatim (and cap-counts them), but the loader
+    // also validates them. Run that validation here (rows are already cap-bounded)
+    // so a report the loader rejects is rejected by this importer too.
+    validate_wait_reasons(report, &entry_rows, source)?;
+
     if total_rows > cap {
-        return Err(format!(
-            "Loom compile report exceeds the {cap} record limit; regenerate a smaller report"
-        ));
+        return Err(over_cap(cap));
     }
 
     Ok(LoomCompileReport {
@@ -700,7 +749,12 @@ fn entry_identity(entry: &Map<String, Value>, source: &str) -> Result<[Option<St
     for (i, field) in ENTRY_IDENTITY_FIELDS.iter().enumerate() {
         values[i] = match entry.get(*field) {
             None => None,
-            Some(v) => optional_string(v, &format!("{source}.{field}"))?.map(str::to_string),
+            // Treat an empty string as absent, matching the strict loader's Python
+            // `or` semantics ("" is falsy and falls through to the next field),
+            // so display_name and the all-absent identity check agree with it.
+            Some(v) => optional_string(v, &format!("{source}.{field}"))?
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
     }
     if values.iter().all(Option::is_none) {
@@ -768,9 +822,10 @@ fn validate_residency_summary(entry: &Map<String, Value>, source: &str) -> Resul
 fn index_residency_constraints(
     value: &Value,
     source: &str,
+    cap: usize,
 ) -> Result<(usize, Vec<LoomResidencyConstraint>), String> {
     let obj = require_object(value, source)?;
-    let rows = validate_indexed_rows(obj, source)?;
+    let rows = validate_indexed_rows(obj, source, cap)?;
     let mut identities: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
@@ -889,12 +944,20 @@ fn index_residency_constraints(
 fn validate_indexed_rows<'a>(
     obj: &'a Map<String, Value>,
     source: &str,
+    cap: usize,
 ) -> Result<Vec<&'a Map<String, Value>>, String> {
     let count = require_integer(obj.get("count").unwrap_or(&Value::Null), &format!("{source}.count"))?;
     let rows = obj
         .get("rows")
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{source}.rows: expected an array"))?;
+    // Reject an over-cap collection BEFORE the Vec::with_capacity below. The
+    // aggregate cap was only checked after every row had been materialised and
+    // deep-cloned, so a single ≤256 MiB report could force multi-GB allocation
+    // and OOM before the check ran.
+    if rows.len() > cap {
+        return Err(over_cap(cap));
+    }
     if count != rows.len() as i64 {
         return Err(format!(
             "{source}: count is {count}, but rows has {} entries",
@@ -916,6 +979,168 @@ fn validate_indexed_rows<'a>(
         out.push(row);
     }
     Ok(out)
+}
+
+/// The nine per-row `summary` count fields of a wait-reason row, in the loader's
+/// order (`compile_report_wait_reasons.py::_COUNT_FIELDS`).
+const WAIT_REASON_COUNT_FIELDS: [&str; 9] = [
+    "action_count",
+    "explicit_action_count",
+    "planned_action_count",
+    "full_drain_count",
+    "partial_wait_count",
+    "drained_count",
+    "max_drained_count",
+    "max_outstanding_before",
+    "max_full_drain_outstanding_before",
+];
+
+fn require_count(value: Option<&Value>, source: &str) -> Result<u64, String> {
+    // as_u64 rejects booleans, negatives and non-integers, matching the loader's
+    // `_require_count` (non-negative int, bool excluded).
+    value
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{source}: expected non-negative integer"))
+}
+
+fn require_nonempty_string(value: Option<&Value>, source: &str) -> Result<String, String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{source}: expected non-empty string"))
+}
+
+/// A counter/reason name and its numeric id must map 1:1 across all rows.
+fn record_stable_identity(
+    name: &str,
+    id: u64,
+    names_by_id: &mut BTreeMap<u64, String>,
+    ids_by_name: &mut BTreeMap<String, u64>,
+    source: &str,
+) -> Result<(), String> {
+    let previous_name = names_by_id.entry(id).or_insert_with(|| name.to_string());
+    let previous_id = *ids_by_name.entry(name.to_string()).or_insert(id);
+    if previous_name != name || previous_id != id {
+        return Err(format!("{source}: inconsistent stable name/id mapping"));
+    }
+    Ok(())
+}
+
+/// The summary count invariants of one wait-reason row
+/// (`compile_report_wait_reasons.py::_parse_counts`).
+fn validate_wait_reason_counts(value: Option<&Value>, source: &str) -> Result<(), String> {
+    let summary = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{source}: expected an object"))?;
+    let mut v = BTreeMap::new();
+    for field in WAIT_REASON_COUNT_FIELDS {
+        v.insert(field, require_count(summary.get(field), &format!("{source}.{field}"))?);
+    }
+    let g = |k: &str| v[k];
+    if g("action_count") == 0 {
+        return Err(format!("{source}.action_count: expected a positive count"));
+    }
+    if g("action_count") != g("explicit_action_count") + g("planned_action_count") {
+        return Err(format!("{source}: action count must equal explicit plus planned actions"));
+    }
+    if g("action_count") != g("full_drain_count") + g("partial_wait_count") {
+        return Err(format!("{source}: action count must equal full drains plus partial waits"));
+    }
+    if g("max_drained_count") > g("drained_count") {
+        return Err(format!("{source}.max_drained_count: exceeds total drained count"));
+    }
+    if g("max_drained_count") > g("max_outstanding_before") {
+        return Err(format!("{source}.max_drained_count: exceeds maximum outstanding count"));
+    }
+    if g("max_full_drain_outstanding_before") > g("max_outstanding_before") {
+        return Err(format!("{source}.max_full_drain_outstanding_before: exceeds maximum outstanding count"));
+    }
+    if g("full_drain_count") == 0 && g("max_full_drain_outstanding_before") != 0 {
+        return Err(format!("{source}.max_full_drain_outstanding_before: requires a full drain"));
+    }
+    Ok(())
+}
+
+/// Ports the strict loader's `parse_compile_report_wait_reasons` (pinned
+/// 32b86d42, loom/py/loom/reporting/compile_report_wait_reasons.py): validates the
+/// optional `wait_reason_summary_rows` collection — indexed rows, non-empty
+/// function/counter/reason strings, stable counter/reason name↔id mappings, no
+/// duplicate (function, counter_id, reason_id), the summary count invariants, and
+/// that every referenced function exists exactly once among the entries. The rows
+/// are already stored and cap-counted as a detail collection; this only adds the
+/// loader's validation so a report the loader rejects is rejected here too.
+fn validate_wait_reasons(
+    report: &Map<String, Value>,
+    entry_rows: &[&Map<String, Value>],
+    source: &str,
+) -> Result<(), String> {
+    let Some(value) = report.get("wait_reason_summary_rows") else {
+        return Ok(());
+    };
+    let src = format!("{source}.wait_reason_summary_rows");
+    let collection = require_object(value, &src)?;
+    let count = require_count(collection.get("count"), &format!("{src}.count"))? as usize;
+    let rows: &[Value] = match collection.get("rows") {
+        None => {
+            if count != 0 {
+                return Err(format!("{src}.rows: missing {count} rows"));
+            }
+            &[]
+        }
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| format!("{src}.rows: expected an array"))?;
+            if count != arr.len() {
+                return Err(format!("{src}.count: expected {}, got {count}", arr.len()));
+            }
+            arr.as_slice()
+        }
+    };
+    let mut counter_names_by_id: BTreeMap<u64, String> = BTreeMap::new();
+    let mut counter_ids_by_name: BTreeMap<String, u64> = BTreeMap::new();
+    let mut reason_names_by_id: BTreeMap<u64, String> = BTreeMap::new();
+    let mut reason_ids_by_name: BTreeMap<String, u64> = BTreeMap::new();
+    let mut seen: HashSet<(String, u64, u64)> = HashSet::new();
+    let mut referenced: HashSet<String> = HashSet::new();
+    for (position, row_value) in rows.iter().enumerate() {
+        let rsrc = format!("{src}.rows[{position}]");
+        let row = require_object(row_value, &rsrc)?;
+        let index = require_count(row.get("index"), &format!("{rsrc}.index"))? as usize;
+        if index != position {
+            return Err(format!("{rsrc}.index: expected {position}, got {index}"));
+        }
+        let function = require_nonempty_string(row.get("function"), &format!("{rsrc}.function"))?;
+        let counter = require_nonempty_string(row.get("counter"), &format!("{rsrc}.counter"))?;
+        let counter_id = require_count(row.get("counter_id"), &format!("{rsrc}.counter_id"))?;
+        let reason = require_nonempty_string(row.get("reason"), &format!("{rsrc}.reason"))?;
+        let reason_id = require_count(row.get("reason_id"), &format!("{rsrc}.reason_id"))?;
+        record_stable_identity(&counter, counter_id, &mut counter_names_by_id, &mut counter_ids_by_name, &format!("{rsrc}.counter"))?;
+        record_stable_identity(&reason, reason_id, &mut reason_names_by_id, &mut reason_ids_by_name, &format!("{rsrc}.reason"))?;
+        if !seen.insert((function.clone(), counter_id, reason_id)) {
+            return Err(format!("{rsrc}: duplicate wait reason '{counter}'/'{reason}' for function '{function}'"));
+        }
+        validate_wait_reason_counts(row.get("summary"), &format!("{rsrc}.summary"))?;
+        referenced.insert(function);
+    }
+    // Every referenced function must appear exactly once among the entries.
+    let mut entry_functions: HashSet<String> = HashSet::new();
+    let mut duplicated: HashSet<String> = HashSet::new();
+    for entry in entry_rows {
+        if let Some(f) = entry.get("function").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            if !entry_functions.insert(f.to_string()) {
+                duplicated.insert(f.to_string());
+            }
+        }
+    }
+    for function in &referenced {
+        if duplicated.contains(function) {
+            return Err(format!("{src}: wait reasons cannot select duplicate function '{function}'"));
+        }
+        if !entry_functions.contains(function) {
+            return Err(format!("{src}: wait reasons reference unknown function '{function}'"));
+        }
+    }
+    Ok(())
 }
 
 fn require_object<'a>(value: &'a Value, source: &str) -> Result<&'a Map<String, Value>, String> {
