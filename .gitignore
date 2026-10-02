@@ -15,3 +15,5 @@
 /.synagent/
 
 __pycache__/
+
+/.claude/
