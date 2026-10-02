@@ -1644,15 +1644,29 @@ fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Resu
         }
         Gate::Rocprofv3 { profiler, window, collection } => {
             if end {
-                let mut open = window.take().ok_or("No collection window is open to end")?;
-                if !open.triggered {
-                    *window = Some(open);
-                    return Err("This window ends on its own timer (windowMs); wait for profile_status to report windowRunning=false".into());
+                // end only closes the open window; combining it with collection
+                // options silently dropped them before, so reject that up front.
+                if let Some(key) = ROCPROFV3_ONLY_TRIGGER_KEYS.iter().find(|key| a.get(**key).is_some()) {
+                    return Err(format!("end only closes the open window and cannot be combined with collection options ({key} given); open a new window to change the collection"));
                 }
+                let mut open = window.take().ok_or("No collection window is open to end")?;
                 let count = new_triggers;
-                let (detached, warn) = detach(&mut open.child, true, flag)?;
-                let warnings: Vec<String> = warn.into_iter().collect();
-                json!({"id":id,"ended":count,"detached":detached,"directory":folder.join(format!("window-{count}")),"warnings":warnings,"next":"Collect with profile_stop, or trigger again for another window with the same streams, filters and mode"})
+                if !open.triggered {
+                    // A timed window detaches on its own timer, not on end:true. If
+                    // it has already exited there is nothing left to end, so report
+                    // it detached rather than tell the client to keep waiting for
+                    // something that already happened.
+                    if open.child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                        json!({"id":id,"ended":count,"detached":true,"directory":folder.join(format!("window-{count}")),"warnings":[],"next":"Collect with profile_stop, or trigger again for another window with the same streams, filters and mode"})
+                    } else {
+                        *window = Some(open);
+                        return Err("This window ends on its own timer (windowMs); wait for profile_status to report windowRunning=false".into());
+                    }
+                } else {
+                    let (detached, warn) = detach(&mut open.child, true, flag)?;
+                    let warnings: Vec<String> = warn.into_iter().collect();
+                    json!({"id":id,"ended":count,"detached":detached,"directory":folder.join(format!("window-{count}")),"warnings":warnings,"next":"Collect with profile_stop, or trigger again for another window with the same streams, filters and mode"})
+                }
             } else {
                 if let Some(open) = window {
                     if open.child.try_wait().map_err(|e| e.to_string())?.is_none() {
@@ -1680,6 +1694,9 @@ fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Resu
                 let mut collection_args = Vec::new();
                 rocprof_streams(a, &mut collection_args)?;
                 kernel_filters(a, &mut collection_args)?;
+                // Whether this call is the window that fixes the per-process
+                // collection, so a failed launch can roll it back (see below).
+                let first_window = collection.is_none();
                 match collection {
                     Some(prev) => {
                         if prev.triggered != triggered {
@@ -1711,7 +1728,20 @@ fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Resu
                     command.push(ms.to_string());
                 }
                 command.push("--attach-sync-output".into());
-                let attach = spawn_attach_window(&command, &directory, triggered, pid, flag)?;
+                // If the launch fails, remove the window directory and roll back the
+                // collection this call just committed; otherwise the directory and a
+                // committed collection would poison every later trigger with a stale
+                // "File exists" while triggers stayed at its old value.
+                let attach = match spawn_attach_window(&command, &directory, triggered, pid, flag) {
+                    Ok(attach) => attach,
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&directory);
+                        if first_window {
+                            *collection = None;
+                        }
+                        return Err(e);
+                    }
+                };
                 let warnings: Vec<String> = attach.diagnostic.into_iter().collect();
                 *window = Some(AttachWindow { child: attach.child, directory: directory.clone(), triggered });
                 new_triggers = count;
@@ -1795,6 +1825,11 @@ fn profile_stop_core(control: &Control, a: &Value, flag: &AtomicBool) -> Result<
                 }
             }
             tuning::stop(&mut child);
+            // rocprofv3 pickles each PID's attach options in this file and never
+            // removes it; a later session (or a manual rocprofv3 --attach) on a
+            // reused PID would load these and fatal-error on any mismatch. Remove
+            // it best-effort now that the target is stopped.
+            let _ = fs::remove_file(format!("/tmp/rocprofv3_attach_{}.pkl", child.id()));
             let mut files = Vec::new();
             find_outputs(&folder, &mut files)?;
             for count in 1..=triggers {
@@ -1898,8 +1933,21 @@ fn spawn_attach_window(command: &[String], dir: &Path, triggered: bool, pid: u32
     loop {
         let mut child = spawn_process_env_stdin(command, dir, dir, &[], triggered)?;
         match confirm_attach(&mut child, dir, CONFIRM, flag)? {
-            AttachOutcome::Running | AttachOutcome::ExitedOther => {
+            AttachOutcome::Running => {
                 return Ok(AttachResult { child, attempts: attempt + 1, diagnostic: None });
+            }
+            AttachOutcome::ExitedOther => {
+                // rocprofv3 exited during confirmation for a reason other than the
+                // set-agent failure. A short timed window that completed with output
+                // is fine; an early exit that produced nothing is not (e.g. a
+                // pickled-options mismatch from an earlier session on this PID), so
+                // surface it as a diagnostic instead of reporting a silent success.
+                let mut produced = Vec::new();
+                let _ = find_outputs(dir, &mut produced);
+                let diagnostic = produced.is_empty().then(|| {
+                    format!("rocprofv3 exited during attach confirmation with no output files and without the set-agent failure; the attach may not have taken (for example a pickled-options mismatch from an earlier session on this PID, cleared on profile_stop). rocprofv3 stderr tail: {}", stderr_tail(dir))
+                });
+                return Ok(AttachResult { child, attempts: attempt + 1, diagnostic });
             }
             AttachOutcome::AttachFailure(tail) => {
                 if attempt >= MAX_RETRIES || flag.load(Ordering::SeqCst) || !process_alive(pid) {
@@ -2636,12 +2684,20 @@ pub fn shutdown(control: &Control, tuning: &tuning::Tuning) {
     control.shutting_down.store(true, Ordering::SeqCst);
     control.cancel(None, None);
     if let Some(mut profile) = control.live_profile.lock().unwrap().take() {
+        let pid = profile.child.id();
         if let Gate::Rocprofv3 { window: Some(open), .. } = &mut profile.gate {
             tuning::stop(&mut open.child);
         }
         tuning::stop(&mut profile.child);
-        if let Gate::Radv { .. } = profile.gate {
-            let _ = radv_artifacts(&profile.program, profile.started, &profile.folder, "stopped");
+        match &profile.gate {
+            Gate::Radv { trigger } => {
+                // Match profile_stop_core: leave no per-job trigger/pickle debris.
+                let _ = fs::remove_file(trigger);
+                let _ = radv_artifacts(&profile.program, profile.started, &profile.folder, "stopped");
+            }
+            Gate::Rocprofv3 { .. } => {
+                let _ = fs::remove_file(format!("/tmp/rocprofv3_attach_{pid}.pkl"));
+            }
         }
     }
     tuning::stop_all(tuning);
