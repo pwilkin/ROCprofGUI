@@ -29,7 +29,7 @@ The table below is generated from a live server, not transcribed from prose. An 
 ROCPROFGUI_HOME=/tmp/rps-home rocprof-studio --headless --mcp-port 8791
 ```
 
-Then `initialize` → `notifications/initialized` → `tools/list` were sent over the legacy SSE transport and the returned JSON schemas turned into the table. The live server reported `serverInfo` `{name: "rocprof-studio", version: "0.1.0"}` and 31 tools.
+Then `initialize` → `notifications/initialized` → `tools/list` were sent over the legacy SSE transport and the returned JSON schemas turned into the table. The live server reported `serverInfo` `{name: "rocprof-studio", version: "0.2.0"}` and 31 tools.
 
 ::: tip Count check
 Live `tools/list` returns 31 tools. Some internal notes say 27; that count predates the four staged-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`). Trust 31.
@@ -80,10 +80,10 @@ Required arguments are marked `*`.
 
 | Tool | Purpose | Key arguments |
 | --- | --- | --- |
-| `profile_run` | Run an argv under a profiler and return output files to import. `tracer` `rocprofv3` (default) collects, combinable in one run, `counters` (`--pmc`), `traces` (stream names `kernel`, `hip`, `marker`, `memoryCopy`, `memoryAllocation`, `scratchMemory`, `hsa`, `rccl`, `runtime`, `sys`) and `att` (SQTT thread trace; options `targetCu`, `simdSelect`, `bufferSize`, `shaderEngineMask`); with none of the three it collects a kernel trace. `tracer` `radv` is per-submit Vulkan capture (experimental). | `argv*`, `cwd*`, `profiler`, `tracer`, `counters`, `traces`, `att`, `env`, `timeoutSeconds` |
+| `profile_run` | Run an argv under a profiler and return output files to import. `tracer` `rocprofv3` (default) collects, combinable in one run, `counters` (`--pmc`), `traces` (stream names `kernel`, `hip`, `marker`, `memoryCopy`, `memoryAllocation`, `scratchMemory`, `hsa`, `rccl`, `runtime`, `sys`) and `att` (SQTT thread trace; options `targetCu`, `simdSelect`, `bufferSize`, `shaderEngineMask`); with none of the three it collects a kernel trace. Kernel filters (`kernelIncludeRegex`, `kernelExcludeRegex`) and `kernelIterationRange` (`--kernel-iteration-range`, e.g. `64` or `0-3`) narrow collection to specific dispatches. `tracer` `radv` is per-submit Vulkan capture (experimental). | `argv*`, `cwd*`, `profiler`, `tracer`, `counters`, `traces`, `att`, `kernelIncludeRegex`, `kernelExcludeRegex`, `kernelIterationRange`, `env`, `timeoutSeconds` |
 | `profile_start` | Start a long-lived application for gated live profiling. `tracer` `radv` (default): a Vulkan server under RADV RGP **file-trigger** capture. `tracer` `rocprofv3`: a HIP/ROCm application armed with `ROCP_TOOL_ATTACH=1`, so each trigger attaches rocprofv3 for one bounded time window (`profiler` overrides the rocprofv3 path). Returns an ID and log paths immediately. | `argv*`, `cwd*`, `env`, `tracer`, `profiler` |
-| `profile_trigger` | Fire one capture in a live profile. RADV: creates the file that arms one RGP capture. rocprofv3: attaches for `windowMs` ms (default 5000), collecting the selected streams (same `counters`/`traces`/`att` as `profile_run`) into a `window-N/` directory. | `id*`, `windowMs`, `counters`, `traces`, `att` |
-| `profile_status` | Whether the profiled process is running. RADV: also whether its trigger is pending and how many RGP saves RADV announced. rocprofv3: also `windowRunning` for the current attach window. | `id*` |
+| `profile_trigger` | Fire one capture in a live profile. RADV: creates the file that arms one RGP capture. rocprofv3: attaches and collects the selected streams (same `counters`/`traces`/`att`/kernel filters/`kernelIterationRange` as `profile_run`) into a `window-N/` directory. A window is **timed** (`windowMs`, default 5000, detaches on its own) or **triggered** (`triggered: true`, no `windowMs`, stays attached until `{"end": true}` writes a newline to rocprofv3's stdin, or `profile_stop`). On a busy-queue attach abort it retries with backoff and reports `attachAttempts`. | `id*`, `windowMs`, `triggered`, `end`, `counters`, `traces`, `att`, `kernelIncludeRegex`, `kernelExcludeRegex`, `kernelIterationRange` |
+| `profile_status` | Whether the profiled process is running. RADV: also whether its trigger is pending and how many RGP saves RADV announced. rocprofv3: also `windowRunning` and, for a triggered window, `windowTriggered`. | `id*` |
 | `profile_stop` | Stop a live profiled application and collect artifacts: `.rgp` files (RADV), or every window's trace/counter CSVs, `.att` files and decoded output (rocprofv3; waits up to 180 s for an open window to detach). Warns on overwrites and on windows that produced no files. | `id*` |
 
 ### Tuning (compiles candidates; can write source) {#tuning}
@@ -96,6 +96,10 @@ Required arguments are marked `*`.
 | `tuning_close` | Stop and close a session; its captured inputs and validation dumps are deleted (results, logs, source backups remain). | `id*` |
 
 The raw `tools/list` JSON — the full schema for every argument of every tool — was saved as the evidence this table was generated from.
+
+::: tip Desktop Live profiling panel
+The four live-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`) also back a compact **Live profiling** panel in the desktop sidebar. It calls the same core through `live_profile_*` Tauri commands, so the launch, windowing and collection logic is shared, not forked: pick the tracer, enter the argv and working directory, start, trigger timed or triggered windows with streams and kernel filters, watch windows and attach attempts, then stop to collect.
+:::
 
 ## Profiling examples {#profiling-examples}
 
@@ -133,9 +137,11 @@ The returned `files` list holds `counter_collection.csv`, the `*_kernel_trace.cs
 ```
 
 ::: warning rocprofv3 window caveats
-- **Every window of one process must request the same streams**; only `windowMs` may differ. rocprofv3 enforces this. A mismatched window produces no files, and `profile_stop` warns about it.
-- **Windows are time-based.** A window collects everything the application dispatches while it is open; it cannot isolate a single dispatch the way a RADV file trigger captures a single submit.
-- **Detachment can lag** the end of the window. `profile_status` reports `windowRunning` until rocprofv3 has detached; `profile_stop` waits up to 180 s for an open window before aborting it.
+- **Every window of one process must request the same collection:** the same streams, counters, att, kernel filters, iteration range and mode (timed vs triggered). rocprofv3 pickles each PID's attach options and reattaches only with identical ones, so a mismatch is rejected up front, and an empty window still warns at `profile_stop`. Within timed windows, only `windowMs` may differ.
+- **Timed or triggered.** A timed window (`windowMs`) detaches on its own; a triggered window (`triggered: true`, no `windowMs`) stays attached until `profile_trigger` `{"end": true}` or `profile_stop`, so you can capture exactly one request without guessing a duration. Either way a window collects everything the application dispatches while it is open; it cannot isolate a single dispatch the way a RADV file trigger captures a single submit.
+- **A default per-dispatch ATT trace samples each kernel name once.** A name regex still takes the first matching dispatch; use `kernelIterationRange` to reach a specific later launch.
+- **Attach can fail on a busy queue** (the ROCm `set_profiler_active_on_queue` handshake). `profile_trigger` retries with backoff while the target is alive and reports `attachAttempts`; a persistent failure is surfaced as an `attachWarning`, with a per-window warning at `profile_stop` carrying rocprofv3's stderr tail. This is a known ROCm limitation, not fixed here.
+- **Detachment can lag** the end of the window. `profile_status` reports `windowRunning` (and `windowTriggered` for a triggered window) until rocprofv3 has detached; `profile_stop` waits up to 180 s for an open window before aborting it.
 :::
 
 ## Safety & boundaries
@@ -213,7 +219,7 @@ curl -s --max-time 10 -D - http://127.0.0.1:8765/mcp \
        "params":{"protocolVersion":"2024-11-05","capabilities":{},
                  "clientInfo":{"name":"demo","version":"1.0"}}}'
 # → Mcp-Session-Id: <id>
-# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.1.0"},...}}
+# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.2.0"},...}}
 ```
 
 ::: warning The handshake is per-connection

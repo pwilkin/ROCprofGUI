@@ -73,6 +73,8 @@ Instruction-cost histograms with an independent mean-latency axis: which instruc
 
 A source-to-ISA latency flamegraph: cost rolled up through the source hierarchy. The viewport is sampled for responsiveness, and above its budget it refuses rather than silently downsampling.
 
+A **Group by** control groups the flamegraph by source location (the default) or by **code object** — the compiled kernel unit, which is a pipeline/kernel label for RADV captures and the ELF code-object id for HIP/ATT captures. Code-object grouping is the honest per-kernel dimension this summed aggregate supports: each instruction carries exactly one code object, and an empty one is shown as `Unknown code object` rather than guessed. It is not a per-dispatch cost split; for true per-dispatch source cost on RADV captures, use the **Marker scopes** hierarchy. Both groupings remain source-to-ISA aggregation, not a call stack or a time axis. The choice is saved per capture, each grouping keeps its own viewport, and the SVG export caption records which produced it.
+
 ## Marker scopes
 
 ![Marker scopes view](/img/view-markers.png)

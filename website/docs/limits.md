@@ -11,6 +11,20 @@ This project's credibility rests on being honest about limits. The figures below
 | Open native captures | **6** (+ the bundled example) | |
 | Raw-ATT import timeout | **300 s** (5 min) | Plus a Cancel button; also aborts if the decoder log exceeds 16 MiB. |
 
+::: tip Several caps are environment-configurable
+`crates/profile-core/src/caps.rs` resolves these from `ROCPROF_MAX_*` variables, each defaulting to the shipped value (a blank, non-numeric or zero value falls back to the default). Raising one only moves the point of explicit rejection — nothing is silently sampled — and the message interpolates the effective value. They apply to desktop, headless CLI and MCP alike.
+
+| Variable | Cap it moves | Default |
+| --- | --- | --- |
+| `ROCPROF_MAX_RECORDS` | main record arrays (and the streamed wave-token limit) | 2,000,000 |
+| `ROCPROF_MAX_FILE_MIB` | per-file size for sidecar/JSON/CSV inputs | 256 |
+| `ROCPROF_MAX_HIDDEN_TOKENS` | tokens hidden-latency analysis will load | 4,000,000 |
+| `ROCPROF_MAX_ATT_TRACES` | trace files in one ATT manifest | 256 |
+| `ROCPROF_MAX_ATT_CODE_OBJECTS` | code-object files in one ATT manifest | 256 |
+
+The six-open-capture limit and the wave-query budgets below (128-wave / 500,000-token viewport, 4,096-wave statistics) are **not** configurable: that path is not yet paged and its numbers are mirrored in the frontend.
+:::
+
 ## View / analysis caps (the UI refuses or clamps — it does not silently sample)
 
 | Area | Cap |

@@ -13,7 +13,7 @@ The window has three regions: the **top bar** (project/capture actions on the ri
 
 Capture tabs hold up to six native captures plus the bundled example. The **+** button beside the tabs ("Open capture file") opens the native picker; the top-bar **Open capture** does the same. The picker filter and directory mode are covered in [Input formats](/input-formats). The top bar also has **ATT setup**, **Save project**, **Open project**, **Archive capture**, **Export selection** and **Attach SPM…**, plus a **Load wave-state sidecars** import toggle in the sidebar.
 
-There is no "run profiling" button in the UI; importing is read-only. Launching a profiler happens only through the [MCP](/mcp) `profile_run`/`profile_start` tools.
+Importing is read-only; nothing in the import path launches a profiler. Profiling runs only when you start it, either through the [MCP](/mcp) `profile_run`/`profile_start` tools or from the desktop **Live profiling** sidebar panel, which drives the same core (see [MCP mode](/mcp#profiling)).
 
 ![Importing a ROCPD database (desktop application)](/img/native-rocpd-import.png)
 *Importing a ROCPD/SQLite database in the desktop app (real recorded data from the `sdk-3.0.4` fixture). ROCPD support is "Partial".*

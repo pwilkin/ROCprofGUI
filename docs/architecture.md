@@ -41,7 +41,7 @@ A headless launch starts MCP without creating a Tauri runtime. A later GUI launc
 
 Commands and ownership:
 
-The host registers 46 Tauri commands (39 in `main.rs`, 3 in `mcp.rs`, 4 in `tuning.rs`). Only the few below are given in full here; the rest are covered by the same paged-transfer and cancellation conventions.
+The host registers 50 Tauri commands (39 in `main.rs`, 7 in `mcp.rs`, 4 in `tuning.rs`). Only the few below are given in full here; the rest are covered by the same paged-transfer and cancellation conventions.
 
 - `open_capture(path, sampling_method, load_wave_states, instruction_pages, transfer_id)` runs parsing on a blocking worker. Desktop callers supply a known request identity and request a bounded catalog header; legacy callers may still receive a complete capture.
 - `read_catalog_page` transfers instructions in order, at most 4,096 records and 4 MiB per page. Only the last page may be retried. `finish_catalog_transfer` commits a complete catalog; `abort_catalog_transfer` disposes staging using its request identity.

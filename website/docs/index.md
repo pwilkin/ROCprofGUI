@@ -115,7 +115,7 @@ Most screenshots on this site were captured from `public/demo.json`, a synthetic
 
 ## Read this first
 
-rocprof studio (package `rocprof-studio`, version 0.1.0, badged PREVIEW in the app) says no more than it can back up. Three things first:
+rocprof studio (package `rocprof-studio`, version 0.2.0, badged PREVIEW in the app) says no more than it can back up. Three things first:
 
 - **Importing a capture is read-only.** The import path never writes into your capture directories or databases.
 - **Two surfaces are not read-only, and only run when you invoke them.** The MCP tool `profile_run` (and `profile_start`) launches a program under a profiler; the kernel- and shader-tuning workers compile candidate variants and can write replacement source back to disk. See [MCP mode](/mcp), [Kernel tuning](/kernel-tuning) and [Shader tuning](/shader-tuning).

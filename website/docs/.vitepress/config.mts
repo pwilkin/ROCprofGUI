@@ -73,6 +73,7 @@ export default defineConfig({
           { text: "Architecture", link: "/architecture" },
           { text: "Validation & parity", link: "/validation" },
           { text: "Troubleshooting / FAQ", link: "/troubleshooting" },
+          { text: "Changelog", link: "/changelog" },
         ],
       },
     ],

@@ -22,6 +22,17 @@ Selecting a dispatch and clicking **"Tune this kernel"** (or calling the MCP `tu
 - A GPU, `hipcc` and `rocprofv3`.
 - The Kerncap runtime, built by `scripts/setup-kernel-tuning.py`. That script clones `AMDResearch/intellikit` pinned at `c5b2098` and applies two patches: `scripts/kerncap-replay.patch` (replay timing) and `scripts/kerncap-capture-scope.patch` (the `reachable` capture scope). Re-running it applies whichever patch is missing. It installs into `~/.rocprofgui/kernel-tuning/runtime` (honours `ROCPROFGUI_HOME`), which is where the app looks.
 
+## Replay conditions
+
+By default every timed iteration restores the captured inputs from pristine copies and GPU events bracket a single dispatch — the isolated best case. Two conditions change that:
+
+- **Sustained** dispatches back to back after one restore (Kerncap's `--no-recopy` path), approximating a kernel kept resident on a busy queue. It is only meaningful when the dispatch does not read what it writes.
+- **Replays** runs the whole capture several times (a `repeats` count) with fresh allocations and reports the spread of the per-replay average, showing how much placement moves the timing.
+
+The replay reports which mode it actually ran, and a session refuses a result whose mode does not match the request, so an un-rebuilt runtime cannot silently ignore a condition. Deltas compare only against the latest earlier run made under the same conditions.
+
+The Vulkan [shader-tuning](/shader-tuning) path additionally offers memory-pool placement (`--memory`) and a per-dispatch cache flush (`--flush-mb`); those are **not** implemented for HIP, because Kerncap restores each region at its exact captured virtual address and, on the unified-memory APU qualified here, the device/GTT distinction changes allocation grain rather than physical placement. The full HIP/Vulkan asymmetry and its evidence are in [`kernel-tuning-parity.md`](https://github.com/pwilkin/ROCprofGUI/blob/main/docs/kernel-tuning-parity.md).
+
 ## Honest limits
 
 - **A reported timing delta is not a claimed speedup.** No counterbalanced A/B or clock-stability experiment is run.
