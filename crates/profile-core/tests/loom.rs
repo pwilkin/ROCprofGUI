@@ -717,6 +717,85 @@ fn wait_reason_inventory_is_validated_like_the_strict_loader() {
     assert!(loom_report::parse(&bad, "<test>").unwrap_err().contains("explicit plus planned"));
 }
 
+#[test]
+fn decode_flags_reports_unknown_high_bits_without_dropping_them() {
+    let names = loom_report::decode_flags((1u64 << 13) | (1u64 << 30) | (1u64 << 63));
+    assert!(names.contains(&"TARGET_RESOURCES".to_string()));
+    // Bits 30..64 with no known name are surfaced as UNKNOWN_BIT_n, not dropped.
+    assert!(names.contains(&"UNKNOWN_BIT_30".to_string()));
+    assert!(names.contains(&"UNKNOWN_BIT_63".to_string()));
+    // A known low bit is named, never reported as unknown.
+    assert!(!names.iter().any(|n| n == "UNKNOWN_BIT_13"));
+}
+
+#[test]
+fn compile_report_capture_survives_an_archive_round_trip() {
+    use std::sync::atomic::AtomicBool;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("k.compile-report.json");
+    std::fs::write(&path, serde_json::to_vec(&summary_report()).unwrap()).unwrap();
+    let capture = load_capture(&path).unwrap();
+    assert_eq!(capture.compile_reports.len(), 1);
+
+    let archive = dir.path().join("k.rocprof-capture");
+    let flag = AtomicBool::new(false);
+    profile_core::capture_archive::write(&archive, &capture, &flag).unwrap();
+    let restored = profile_core::capture_archive::read(&archive, &flag).unwrap();
+
+    // The static-facts surface survives write -> read intact, and nothing leaked
+    // onto the measured surfaces.
+    assert_eq!(restored.unit, "static");
+    assert!(restored.dispatches.is_empty() && restored.counters.is_empty() && restored.waves.is_empty());
+    assert_eq!(restored.compile_reports.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&capture.compile_reports[0]).unwrap(),
+        serde_json::to_value(&restored.compile_reports[0]).unwrap()
+    );
+}
+
+#[test]
+fn provenance_is_recovered_from_synthetic_sidecars() {
+    // The real-report provenance recovery is only exercised in the #[ignore]d
+    // sweep; this drives load_provenance / find_sidecar / command_names_report
+    // with synthetic sidecars so a default `cargo test` covers them.
+    let dir = tempfile::tempdir().unwrap();
+    let reports = dir.path().join("reports");
+    std::fs::create_dir(&reports).unwrap();
+    let path = reports.join("k.compile-report.json");
+    std::fs::write(&path, serde_json::to_vec(&summary_report()).unwrap()).unwrap();
+    // Sidecars sit one directory up from the report (reports/ subdir), as the
+    // retained bundles keep them.
+    std::fs::write(
+        dir.path().join("tool-provenance.json"),
+        serde_json::to_vec(&json!({
+            "source_commit": "abc123",
+            "checkout": "/hrx",
+            "tools": [{"tool": "loom-compile", "sha256": "deadbeef", "build_completed_at": "2026-10-02"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("commands.json"),
+        serde_json::to_vec(&json!([{
+            "argv": ["loom-compile", "--output=reports/k.compile-report.json"],
+            "target": "gfx1151",
+            "config": {"artifact_bundle_policy": "all"}
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let capture = load_capture(&path).unwrap();
+    let p = &capture.compile_reports[0].provenance;
+    assert!(p.available);
+    assert_eq!(p.source_commit.as_deref(), Some("abc123"));
+    assert_eq!(p.tool_sha256.as_deref(), Some("deadbeef"));
+    assert_eq!(p.target.as_deref(), Some("gfx1151"));
+    assert_eq!(p.bundle_policy.as_deref(), Some("all"));
+    assert!(p.invocation.iter().any(|a| a.contains("k.compile-report.json")));
+}
+
 /// Collects producer-written compile-report envelope files (`*_compile_report.json`)
 /// recursively beneath a directory.
 fn collect_envelopes(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
