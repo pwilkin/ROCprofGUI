@@ -711,6 +711,8 @@ fn load_input_checked(
         crate::rocpd::load_cancellable(&path, cancelled.clone())
     } else if path.extension().is_some_and(|e| e == "csv") {
         crate::import::load_csv_cancellable(&path, &cancelled)
+    } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("irpf")) {
+        crate::irpf::load_cancellable(&path, &cancelled)
     } else {
         crate::load_capture_options(&path, load_wave_states, sampling_method)
     }?;

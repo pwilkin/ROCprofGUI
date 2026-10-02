@@ -88,6 +88,66 @@ fn record_cap_override_rejects_more_rows_without_sampling() {
     clear();
 }
 
+/// Minimal valid IRPF v2.0 bundle carrying a two-record dispatch-events chunk, so
+/// a one-record cap must reject it during the sub-record walk. Byte layout follows
+/// the pinned producer schema (24-byte file header, 104-byte record headers,
+/// 88-byte dispatch-event records).
+fn irpf_two_dispatch_bundle() -> Vec<u8> {
+    const PREFIX: &str = "application/vnd.iree.hal.profile.";
+    fn dispatch_event(event_id: u64) -> Vec<u8> {
+        let mut r = vec![0u8; 88];
+        r[0..4].copy_from_slice(&88u32.to_le_bytes());
+        r[8..16].copy_from_slice(&event_id.to_le_bytes());
+        r[72..80].copy_from_slice(&1000u64.to_le_bytes());
+        r[80..88].copy_from_slice(&1100u64.to_le_bytes());
+        r
+    }
+    let mut events = dispatch_event(1);
+    events.extend(dispatch_event(2));
+    let mut body = Vec::new();
+    let mut push = |rtype: u16, family: &str, payload: &[u8]| {
+        let ct = format!("{PREFIX}{family}");
+        let total = 104u64 + ct.len() as u64 + payload.len() as u64;
+        let mut h = vec![0u8; 104];
+        h[0..8].copy_from_slice(&total.to_le_bytes());
+        h[8..16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        h[56..60].copy_from_slice(&104u32.to_le_bytes());
+        h[60..64].copy_from_slice(&(ct.len() as u32).to_le_bytes());
+        h[100..102].copy_from_slice(&rtype.to_le_bytes());
+        body.extend_from_slice(&h);
+        body.extend_from_slice(ct.as_bytes());
+        body.extend_from_slice(payload);
+    };
+    push(1, "session", &[]);
+    push(2, "dispatch-events", &events);
+    push(3, "session", &[]);
+    let mut out = vec![0u8; 24];
+    out[0..4].copy_from_slice(&0x4650_5249u32.to_le_bytes());
+    out[4..6].copy_from_slice(&2u16.to_le_bytes());
+    out[8..12].copy_from_slice(&24u32.to_le_bytes());
+    out.extend_from_slice(&body);
+    let len = out.len() as u64;
+    out[16..24].copy_from_slice(&len.to_le_bytes());
+    out
+}
+
+#[test]
+fn record_cap_override_rejects_irpf_dispatches_without_sampling() {
+    let _g = ENV_LOCK.lock().unwrap();
+    clear();
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("trace.irpf");
+    std::fs::write(&bundle, irpf_two_dispatch_bundle()).unwrap();
+    // Default cap: both IRPF dispatch events import.
+    let capture = profile_core::load_capture(&bundle).unwrap();
+    assert_eq!(capture.dispatches.len(), 2);
+    // A one-record cap rejects the second dispatch explicitly, not by sampling.
+    std::env::set_var("ROCPROF_MAX_RECORDS", "1");
+    let err = profile_core::load_capture(&bundle).unwrap_err();
+    assert!(err.contains("record limit"), "{err}");
+    clear();
+}
+
 #[test]
 fn file_cap_override_rejects_a_large_csv_on_size() {
     let _g = ENV_LOCK.lock().unwrap();

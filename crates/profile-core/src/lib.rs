@@ -10,6 +10,7 @@ pub mod definition_files;
 pub mod diagnostics;
 pub mod hidden;
 mod import;
+pub mod irpf;
 mod wave_stream;
 pub mod input_fingerprint;
 pub mod markers;

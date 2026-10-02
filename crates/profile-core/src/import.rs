@@ -134,13 +134,32 @@ pub fn load_capture_options(
     if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("rgp")) {
         return crate::rgp::load(&path);
     }
+    if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("irpf")) {
+        return crate::irpf::load(&path);
+    }
     match path.file_name().and_then(|p|p.to_str()) {
         Some("filenames.json" | "code.json" | "occupancy.json") => load_ui(path.parent().unwrap(), load_wave_states),
         _ if path.extension().is_some_and(|x|x == "att") => crate::decoder::decode_with_wave_states(&path, &Default::default(), &std::sync::atomic::AtomicBool::new(false), load_wave_states),
         _ if path.extension().is_some_and(|x|x == "csv") => load_csv(&path),
         _ if path.extension().is_some_and(|x|x == "json") => load_spm(&path, sampling_method),
-        _ => Err("Open a decoded ui_output directory, rocprofv3 kernel trace CSV, SPM results JSON, a ROCm SDK ROCPD database, or a RADV Vulkan .rgp capture. Raw ATT requires the decoder Python package and V2 library.".into()),
+        // An IRPF bundle (HRX native profile) carries its own magic, so a
+        // differently-named file is still recognised rather than rejected.
+        _ if is_irpf_file(&path) => crate::irpf::load(&path),
+        _ => Err("Open a decoded ui_output directory, rocprofv3 kernel trace CSV, SPM results JSON, a ROCm SDK ROCPD database, an HRX IRPF profile bundle, or a RADV Vulkan .rgp capture. Raw ATT requires the decoder Python package and V2 library.".into()),
     }
+}
+/// Sniffs the four-byte IRPF magic so an HRX native profile bundle is recognised
+/// by content even when its filename lacks the conventional `.irpf` extension.
+fn is_irpf_file(path: &Path) -> bool {
+    use std::io::Read;
+    if !path.is_file() {
+        return false;
+    }
+    let mut magic = [0u8; 4];
+    fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && u32::from_le_bytes(magic) == 0x4650_5249
 }
 fn att_selection(name: &str) -> Option<AttCounterSelection> {
     let (counter, mask, explicit) = if let Some((counter, suffix)) = name.split_once(':') {
@@ -951,6 +970,15 @@ fn load_csv_reader(
         return Err("Kernel trace CSV contains no dispatches".into());
     }
     c.origin = origin.to_string();
+    // Grid/workgroup columns differ by rocprofv3 stream: a kernel trace splits them
+    // into Grid_Size_X/Y/Z + Workgroup_Size_X/Y/Z, while a counter-collection CSV
+    // carries a single scalar Grid_Size + Workgroup_Size (observed in HRX rocprofv3
+    // SQ_WAVES captures). Pick the layout once from the header so counter CSVs keep
+    // the dimensions instead of rendering an empty " × × ".
+    let grid_xyz = col("Grid_Size_X").is_some();
+    let grid_single = col("Grid_Size").is_some();
+    let workgroup_xyz = col("Workgroup_Size_X").is_some();
+    let workgroup_single = col("Workgroup_Size").is_some();
     let mut seen = BTreeSet::new();
     let mut duplicates = 0;
     let mut counter_points: BTreeMap<String, Vec<[f64; 2]>> = BTreeMap::new();
@@ -1003,18 +1031,30 @@ fn load_csv_reader(
             sgpr: parse("SGPR_Count"),
             lds: parse("LDS_Block_Size"),
             scratch: parse("Scratch_Size"),
-            grid: format!(
-                "{} × {} × {}",
-                get("Grid_Size_X"),
-                get("Grid_Size_Y"),
-                get("Grid_Size_Z")
-            ),
-            workgroup: format!(
-                "{} × {} × {}",
-                get("Workgroup_Size_X"),
-                get("Workgroup_Size_Y"),
-                get("Workgroup_Size_Z")
-            ),
+            grid: if grid_xyz {
+                format!(
+                    "{} × {} × {}",
+                    get("Grid_Size_X"),
+                    get("Grid_Size_Y"),
+                    get("Grid_Size_Z")
+                )
+            } else if grid_single {
+                get("Grid_Size").to_owned()
+            } else {
+                "Not recorded".into()
+            },
+            workgroup: if workgroup_xyz {
+                format!(
+                    "{} × {} × {}",
+                    get("Workgroup_Size_X"),
+                    get("Workgroup_Size_Y"),
+                    get("Workgroup_Size_Z")
+                )
+            } else if workgroup_single {
+                get("Workgroup_Size").to_owned()
+            } else {
+                "Not recorded".into()
+            },
         };
         c.end = c.end.max(d.end);
         c.dispatches.push(d);

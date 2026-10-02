@@ -60,6 +60,42 @@ fn rocprofv3_counter_csv_keeps_per_dispatch_values() {
     assert!(c.warnings.iter().any(|w| w.contains("per-dispatch measurements")));
 }
 
+// Regression for the HRX counter-CSV grid/workgroup defect: a rocprofv3
+// counter-collection CSV carries single scalar `Grid_Size`/`Workgroup_Size`
+// columns, unlike the kernel-trace CSV's XYZ triples. Header and values are the
+// exact layout observed in the hrx-b99 SQ_WAVES capture
+// (phase2/direct-counters/920619_counter_collection.csv): ggml_rope_f32,
+// Grid_Size 1024, Workgroup_Size 32.
+#[test]
+fn counter_csv_keeps_scalar_grid_and_workgroup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("counter_collection.csv");
+    fs::write(&path, "Correlation_Id,Dispatch_Id,Agent_Id,Queue_Id,Process_Id,Thread_Id,Grid_Size,Kernel_Id,Kernel_Name,Workgroup_Size,LDS_Block_Size,Scratch_Size,VGPR_Count,Accum_VGPR_Count,SGPR_Count,Counter_Name,Counter_Value,Start_Timestamp,End_Timestamp\n1223,2488,\"Agent 1\",2,920619,920635,1024,63,ggml_rope_f32,32,0,0,16,0,128,SQ_WAVES,32.0,391981784635018,391981784640618\n").unwrap();
+    let c = load_capture(&path).unwrap();
+    assert_eq!(c.format, "rocprofv3 dispatch counter CSV");
+    assert_eq!(c.dispatches.len(), 1);
+    assert_eq!(c.dispatches[0].kernel, "ggml_rope_f32");
+    assert_eq!(c.dispatches[0].grid, "1024");
+    assert_eq!(c.dispatches[0].workgroup, "32");
+    assert_eq!(c.dispatches[0].lds, Some(0));
+    assert_eq!(c.dispatches[0].vgpr, Some(16));
+}
+
+// The HRX kernel-trace CSV keeps the XYZ triples. Header matches the hrx-b99
+// attach capture (phase2/attach/877545_kernel_trace.csv).
+#[test]
+fn hrx_kernel_trace_csv_keeps_xyz_grid_and_workgroup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kernel_trace.csv");
+    fs::write(&path, "Kind,Agent_Id,Queue_Id,Stream_Id,Thread_Id,Dispatch_Id,Kernel_Id,Kernel_Name,Correlation_Id,Start_Timestamp,End_Timestamp,LDS_Block_Size,Scratch_Size,VGPR_Count,Accum_VGPR_Count,SGPR_Count,Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,Grid_Size_X,Grid_Size_Y,Grid_Size_Z\nKERNEL_DISPATCH,\"Agent 1\",2,0,920635,2488,63,ggml_rope_f32,1223,391981784635018,391981784640618,0,0,16,0,128,32,1,1,1024,1,1\n").unwrap();
+    let c = load_capture(&path).unwrap();
+    assert_eq!(c.format, "rocprofv3 dispatch CSV");
+    assert_eq!(c.dispatches.len(), 1);
+    assert_eq!(c.dispatches[0].kernel, "ggml_rope_f32");
+    assert_eq!(c.dispatches[0].grid, "1024 × 1 × 1");
+    assert_eq!(c.dispatches[0].workgroup, "32 × 1 × 1");
+}
+
 #[test]
 fn csv_rejects_negative_duration_and_missing_headers() {
     let dir = tempfile::tempdir().unwrap();
