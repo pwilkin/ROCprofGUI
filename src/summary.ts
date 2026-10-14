@@ -1,7 +1,7 @@
 import type { Instruction, Series } from "./types";
 
 export type SummarySeries = Pick<Series, "name" | "scope" | "unit"> & {
-  points: Iterable<[number, number]> & {readonly length: number};
+  points: Iterable<[number, number]> & { readonly length: number };
 };
 
 export interface ActivityCost {
@@ -36,8 +36,9 @@ function* activityCostSteps(
     : null;
 }
 
-
-export function activityCost(instructions: readonly Pick<Instruction, "idle" | "stall" | "latency">[]): ActivityCost | null {
+export function activityCost(
+  instructions: readonly Pick<Instruction, "idle" | "stall" | "latency">[],
+): ActivityCost | null {
   const steps = activityCostSteps(instructions);
   for (;;) {
     const step = steps.next();
@@ -115,21 +116,22 @@ const ratio = (
 // RCV keeps each CU's latest sample, inserts gap zeros, and coalesces within four clocks.
 function aggregatePeak(counter: SampledCounter, delta: number): number | null {
   if (counter.error) return null;
-  type Event = {time: number; cu: string; value: number};
+  type Event = { time: number; cu: string; value: number };
   function* events(cu: string, series: SummarySeries): Generator<Event> {
     let next: number | undefined;
     for (const [time, value] of series.points) {
-      if (next !== undefined && time > next) yield {time: next, cu, value: 0};
-      yield {time, cu, value};
+      if (next !== undefined && time > next) yield { time: next, cu, value: 0 };
+      yield { time, cu, value };
       next = time + delta;
     }
   }
-  const heap: {stream: Generator<Event>; event: Event}[] = [];
-  const compare = (a: typeof heap[number], b: typeof heap[number]) =>
+  const heap: { stream: Generator<Event>; event: Event }[] = [];
+  const compare = (a: (typeof heap)[number], b: (typeof heap)[number]) =>
     a.event.time - b.event.time || coordinateOrder(a.event.cu, b.event.cu);
   for (const [cu, series] of counter.byCu) {
-    const stream = events(cu, series), first = stream.next();
-    if (!first.done) heap.push({stream, event:first.value});
+    const stream = events(cu, series),
+      first = stream.next();
+    if (!first.done) heap.push({ stream, event: first.value });
   }
   heap.sort(compare);
   const last = new Map<string, number>();
@@ -151,7 +153,8 @@ function aggregatePeak(counter: SampledCounter, delta: number): number | null {
     let root = 0;
     while (root * 2 + 1 < heap.length) {
       let child = root * 2 + 1;
-      if (child + 1 < heap.length && compare(heap[child + 1], heap[child]) < 0) child++;
+      if (child + 1 < heap.length && compare(heap[child + 1], heap[child]) < 0)
+        child++;
       if (compare(heap[root], heap[child]) <= 0) break;
       [heap[root], heap[child]] = [heap[child], heap[root]];
       root = child;
@@ -160,7 +163,10 @@ function aggregatePeak(counter: SampledCounter, delta: number): number | null {
   return Math.max(peak, sum) * scaleFor(counter.name);
 }
 
-export function hardwareSummaryUnavailable(architecture: string, series: SummarySeries[]): string | undefined {
+export function hardwareSummaryUnavailable(
+  architecture: string,
+  series: SummarySeries[],
+): string | undefined {
   if (!/^gfx(90a|94[012])(?::|$)/i.test(architecture)) {
     return `The upstream activity model applies to MI200 (gfx90a) and MI300 (gfx940/941/942). ${architecture || "Unknown architecture"} has no validated summary model.`;
   }
@@ -189,8 +195,13 @@ export function hardwareSummary(
     delta: 4096,
   };
   const unavailable = hardwareSummaryUnavailable(architecture, series);
-  if (unavailable) { result.unavailable = unavailable; return result; }
-  const input = series.filter(s => /^SE \d+ · CU \d+ · bank \d+$/.test(s.scope));
+  if (unavailable) {
+    result.unavailable = unavailable;
+    return result;
+  }
+  const input = series.filter((s) =>
+    /^SE \d+ · CU \d+ · bank \d+$/.test(s.scope),
+  );
   const counters = new Map<string, SampledCounter>();
   const bankDeltas = new Map<number, Map<number, number>>();
   for (const s of input) {

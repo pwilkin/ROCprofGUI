@@ -39,7 +39,16 @@ export function occupancy(
  * records are points, so for thread traces only the occupancy figures are nonzero.
  */
 export type KernelSample = { kernel: string; start: number; end: number };
-export type KernelRow = { name: string; count: number; total: number; min: number; max: number; waves: number; waveTime: number; activeTime: number };
+export type KernelRow = {
+  name: string;
+  count: number;
+  total: number;
+  min: number;
+  max: number;
+  waves: number;
+  waveTime: number;
+  activeTime: number;
+};
 export function createKernelStatsAccumulator(guard?: {
   beforeKernel(name: string, nextGroups: number): void;
   beforeInterval(nextPairs: number): void;
@@ -52,7 +61,16 @@ export function createKernelStatsAccumulator(guard?: {
       let v = m.get(d.kernel);
       if (!v) {
         guard?.beforeKernel(d.kernel, m.size + 1);
-        v = { name: d.kernel, count: 0, total: 0, min: Infinity, max: 0, waves: 0, waveTime: 0, activeTime: 0 };
+        v = {
+          name: d.kernel,
+          count: 0,
+          total: 0,
+          min: Infinity,
+          max: 0,
+          waves: 0,
+          waveTime: 0,
+          activeTime: 0,
+        };
       }
       const duration = d.end - d.start;
       v.count++;
@@ -73,8 +91,11 @@ export function createKernelStatsAccumulator(guard?: {
       lifetimes.set(i.kernel, ranges);
     },
     finish(): KernelRow[] {
-      for (const [kernel, ranges] of lifetimes) m.get(kernel)!.activeTime = union(ranges);
-      return [...m.values()].sort((a, b) => b.total - a.total || b.activeTime - a.activeTime);
+      for (const [kernel, ranges] of lifetimes)
+        m.get(kernel)!.activeTime = union(ranges);
+      return [...m.values()].sort(
+        (a, b) => b.total - a.total || b.activeTime - a.activeTime,
+      );
     },
   };
 }

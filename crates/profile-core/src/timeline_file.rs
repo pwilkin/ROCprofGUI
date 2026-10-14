@@ -15,9 +15,13 @@ pub struct TimelineFile {
 }
 impl TimelineFile {
     pub fn new(target: &Path) -> Result<Self, String> {
-        let file =
-            tempfile::NamedTempFile::new_in(target.parent().ok_or("Missing export directory")?)
-                .map_err(|e| e.to_string())?;
+        let file = tempfile::NamedTempFile::new_in(
+            target
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self {
             file,
             target: target.into(),
@@ -53,12 +57,30 @@ impl TimelineFile {
     pub fn target(&self) -> &Path {
         &self.target
     }
-    pub fn finish(self, chunks: u64) -> Result<u64, String> {
+    fn validate_and_sync(&self, chunks: u64) -> Result<(), String> {
         if chunks != self.sequence || self.bytes == 0 || !self.tail.ends_with(b"</body></html>") {
             return Err("Incomplete timeline HTML export".into());
         }
-        self.file.as_file().sync_all().map_err(|e| e.to_string())?;
+        self.file.as_file().sync_all().map_err(|e| e.to_string())
+    }
+    pub fn finish(self, chunks: u64) -> Result<u64, String> {
+        self.validate_and_sync(chunks)?;
         self.file.persist(&self.target).map_err(|e| e.to_string())?;
+        Ok(self.bytes)
+    }
+    pub fn finish_new(self, chunks: u64) -> Result<u64, String> {
+        self.finish_new_checked(chunks, || Ok(()))
+    }
+    pub fn finish_new_checked(
+        self,
+        chunks: u64,
+        before_commit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<u64, String> {
+        self.validate_and_sync(chunks)?;
+        before_commit()?;
+        self.file
+            .persist_noclobber(&self.target)
+            .map_err(|e| e.to_string())?;
         Ok(self.bytes)
     }
 }
@@ -158,5 +180,51 @@ mod receipt_tests {
         }
         assert!(!receipts.contains("first"));
         assert_eq!(receipts.lookup("31", 1).unwrap(), Some(10));
+    }
+}
+
+#[cfg(test)]
+mod new_file_tests {
+    use super::*;
+    #[test]
+    fn no_clobber_race_symlink_and_precommit_cancel_preserve_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.html");
+        let mut export = TimelineFile::new(&path).unwrap();
+        export
+            .append(0, "<!doctype html><html><body></body></html>")
+            .unwrap();
+        std::fs::write(&path, b"raced").unwrap();
+        assert!(export.finish_new(1).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"raced");
+        std::fs::remove_file(&path).unwrap();
+        let mut export = TimelineFile::new(&path).unwrap();
+        export
+            .append(0, "<!doctype html><html><body></body></html>")
+            .unwrap();
+        assert!(export
+            .finish_new_checked(1, || Err("Cancelled".into()))
+            .is_err());
+        assert!(!path.exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("missing"), &path).unwrap();
+            let mut export = TimelineFile::new(&path).unwrap();
+            export
+                .append(0, "<!doctype html><html><body></body></html>")
+                .unwrap();
+            assert!(export.finish_new(1).is_err());
+            assert!(std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            std::fs::remove_file(&path).unwrap();
+        }
+        let mut export = TimelineFile::new(&path).unwrap();
+        export
+            .append(0, "<!doctype html><html><body></body></html>")
+            .unwrap();
+        assert!(export.finish_new(1).is_ok());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

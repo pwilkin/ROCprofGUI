@@ -21,7 +21,10 @@ export function timelineGlyphs(
   const glyphs: TimelineGlyph[] = [],
     selected: TimelineGlyph[] = [];
   const buckets = new Map<string, TimelineGlyph>();
-  const admit = () => { if (glyphs.length + selected.length >= maxGlyphs) throw drawnRecordBudgetError(maxGlyphs); };
+  const admit = () => {
+    if (glyphs.length + selected.length >= maxGlyphs)
+      throw drawnRecordBudgetError(maxGlyphs);
+  };
   for (const mark of marks) {
     const row = rows.get(mark.lane);
     if (row === undefined) continue;

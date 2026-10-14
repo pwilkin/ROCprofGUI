@@ -3,10 +3,25 @@ import type { Range } from "./types";
 import { timelineGlyphs } from "./timelineDetail";
 import { timelineOverlays } from "./timelineOverlays";
 import { isWaveDetailBudgetError } from "./waveOverview";
-import { isTimelineWindowBudgetError, drawnRecordBudgetError } from "./timelineExportBudget";
+import {
+  isTimelineWindowBudgetError,
+  drawnRecordBudgetError,
+} from "./timelineExportBudget";
 import protocol from "./mcpAnalysisProtocol.json";
 export const timelineExportMaxima = protocol.budgets;
-export interface TimelineExportStats { bytes: number; pages: number; segments: number; glyphs: number; budgets: { maxBytes: number; maxGlyphs: number; chunkBytes: number; pages: number; segments: number } }
+export interface TimelineExportStats {
+  bytes: number;
+  pages: number;
+  segments: number;
+  glyphs: number;
+  budgets: {
+    maxBytes: number;
+    maxGlyphs: number;
+    chunkBytes: number;
+    pages: number;
+    segments: number;
+  };
+}
 const escape = (value: unknown) =>
   String(value).replace(
     /[&<>"']/g,
@@ -22,9 +37,11 @@ export function exportWindows(bounds: Range, count: number): Range[] {
     bounds[1] <= bounds[0] ||
     !Number.isInteger(count) ||
     count < 1 ||
-    count > 64
+    count > protocol.budgets.timePages
   )
-    throw Error("Choose 1–64 time pages and a finite positive range");
+    throw Error(
+      `Choose 1–${protocol.budgets.timePages} time pages and a finite positive range`,
+    );
   const windows = Array.from(
     { length: count },
     (_, i) =>
@@ -66,8 +83,12 @@ export async function timelineDocument(options: {
     progress,
     writeChunk,
   } = options;
-  if (!Number.isInteger(lanesPerPage) || lanesPerPage < 1 || lanesPerPage > 24)
-    throw Error("Choose 1–24 lanes per page");
+  if (
+    !Number.isInteger(lanesPerPage) ||
+    lanesPerPage < 1 ||
+    lanesPerPage > protocol.budgets.lanesPerPage
+  )
+    throw Error(`Choose 1–${protocol.budgets.lanesPerPage} lanes per page`);
   const chunks: string[] = [];
   const encoder = new TextEncoder();
   let bufferedBytes = 0;
@@ -76,8 +97,19 @@ export async function timelineDocument(options: {
   const glyphCeiling = writeChunk ? maxima.fileGlyphs : maxima.inlineGlyphs;
   const maxBytes = options.limits?.maxBytes ?? byteCeiling;
   const maxGlyphs = options.limits?.maxGlyphs ?? glyphCeiling;
-  const byteDescription = options.limits?.maxBytes === undefined ? `${writeChunk ? 512 : 16} MiB` : `${maxBytes} bytes`;
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > byteCeiling || !Number.isSafeInteger(maxGlyphs) || maxGlyphs < 1 || maxGlyphs > glyphCeiling) throw Error("Timeline limits may only lower the output mode maxima");
+  const byteDescription =
+    options.limits?.maxBytes === undefined
+      ? `${writeChunk ? 512 : 16} MiB`
+      : `${maxBytes} bytes`;
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    maxBytes > byteCeiling ||
+    !Number.isSafeInteger(maxGlyphs) ||
+    maxGlyphs < 1 ||
+    maxGlyphs > glyphCeiling
+  )
+    throw Error("Timeline limits may only lower the output mode maxima");
   const flush = async () => {
     if (writeChunk && chunks.length) {
       check();
@@ -92,10 +124,14 @@ export async function timelineDocument(options: {
     glyphCount = 0;
   const append = (text: string) => {
     const size = encoder.encode(text).length;
-    if (bytes + size > maxBytes) throw Error(`Timeline export exceeds ${byteDescription}; export a smaller time range`);
+    if (bytes + size > maxBytes)
+      throw Error(
+        `Timeline export exceeds ${byteDescription}; export a smaller time range`,
+      );
     bytes += size;
     bufferedBytes += size;
-    if (writeChunk && bufferedBytes > 1024 * 1024) throw Error("Timeline export chunk exceeds 1 MiB; shorten event labels");
+    if (writeChunk && bufferedBytes > maxima.chunkBytes)
+      throw Error("Timeline export chunk exceeds 1 MiB; shorten event labels");
     if (bytes > maxBytes)
       throw Error(
         `Timeline export exceeds ${byteDescription}; export a smaller time range`,
@@ -115,15 +151,29 @@ export async function timelineDocument(options: {
     const window = windows[t];
     const split = () => {
       const mid = window[0] + (window[1] - window[0]) / 2;
-      if (windows.length >= 256 || mid <= window[0] || mid >= window[1]) throw Error("Exact timeline export cannot subdivide further; select a smaller range");
+      if (
+        windows.length >= maxima.segments ||
+        mid <= window[0] ||
+        mid >= window[1]
+      )
+        throw Error(
+          "Exact timeline export cannot subdivide further; select a smaller range",
+        );
       windows.splice(t, 1, [window[0], mid], [mid, window[1]]);
       t--;
     };
     let input: Mark[];
-    try { input = await load(window, signal); }
-    catch (error) {
+    try {
+      input = await load(window, signal);
+    } catch (error) {
       check();
-      if (writeChunk && (isWaveDetailBudgetError(error) || isTimelineWindowBudgetError(error))) { split(); continue; }
+      if (
+        writeChunk &&
+        (isWaveDetailBudgetError(error) || isTimelineWindowBudgetError(error))
+      ) {
+        split();
+        continue;
+      }
       throw error;
     }
     check();
@@ -139,8 +189,14 @@ export async function timelineDocument(options: {
     const marks = input.filter(
       (m) => m.end >= window[0] && m.start <= window[1],
     );
-    if (marks.some(mark => mark.aggregateCount !== undefined)) throw Error("Exact timeline export requires event records, not overview groups");
-    if (marks.length > 500000 && writeChunk) { split(); continue; }
+    if (marks.some((mark) => mark.aggregateCount !== undefined))
+      throw Error(
+        "Exact timeline export requires event records, not overview groups",
+      );
+    if (marks.length > 500000 && writeChunk) {
+      split();
+      continue;
+    }
     if (marks.length > 500000)
       throw Error(
         "Timeline export exceeds 500,000 records in one time segment; increase time pages",
@@ -148,18 +204,36 @@ export async function timelineDocument(options: {
     const lanes = [...new Set(marks.map((m) => m.lane))];
     for (let row = 0; row < Math.max(1, lanes.length); row += lanesPerPage) {
       check();
-      if (++pages > 512)
+      if (++pages > maxima.pages)
         throw Error(
-          "Timeline export exceeds 512 pages; reduce the range or increase lanes per page",
+          `Timeline export exceeds ${maxima.pages} pages; reduce the range or increase lanes per page`,
         );
       const group = lanes.slice(row, row + lanesPerPage),
         height = 42 + Math.max(1, group.length) * 28;
       let glyphs, overlays;
       try {
-        glyphs = timelineGlyphs(marks, group, window, 1100, 28, stacked, 0, undefined, maxGlyphs - glyphCount);
-        overlays = timelineOverlays(marks, group, window, 1100, 28, maxGlyphs - glyphCount - glyphs.length);
+        glyphs = timelineGlyphs(
+          marks,
+          group,
+          window,
+          1100,
+          28,
+          stacked,
+          0,
+          undefined,
+          maxGlyphs - glyphCount,
+        );
+        overlays = timelineOverlays(
+          marks,
+          group,
+          window,
+          1100,
+          28,
+          maxGlyphs - glyphCount - glyphs.length,
+        );
       } catch (error) {
-        if (error instanceof Error && error.message.includes("drawn records")) throw drawnRecordBudgetError(maxGlyphs);
+        if (error instanceof Error && error.message.includes("drawn records"))
+          throw drawnRecordBudgetError(maxGlyphs);
         throw error;
       }
       glyphCount += glyphs.length + overlays.length;
@@ -179,15 +253,17 @@ export async function timelineDocument(options: {
         );
       }
       await flush();
-      for (const array of [glyphs, overlays]) for (const { mark, rect } of array) {
-        const color = /^#[0-9a-f]{3,8}$/i.test(mark.color)
-          ? mark.color
-          : "#538aad";
-        append(
-          `<rect data-key="${escape(mark.key)}" x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" fill="${color}"><title>${escape(mark.label)} · ${mark.start}–${mark.end} ${escape(unit)}</title></rect>`,
-        );
-        if (writeChunk && bufferedBytes >= 512 * 1024) await flush();
-      }
+      for (const array of [glyphs, overlays])
+        for (const { mark, rect } of array) {
+          const color = /^#[0-9a-f]{3,8}$/i.test(mark.color)
+            ? mark.color
+            : "#538aad";
+          append(
+            `<rect data-key="${escape(mark.key)}" x="${rect.x}" y="${rect.y}" width="${rect.width}" height="${rect.height}" fill="${color}"><title>${escape(mark.label)} · ${mark.start}–${mark.end} ${escape(unit)}</title></rect>`,
+          );
+          if (writeChunk && bufferedBytes >= maxima.chunkBytes / 2)
+            await flush();
+        }
       append(
         "</svg><p>Export covers this timeline’s selected hardware scope and filters. It does not establish unrecorded trace coverage. Events crossing page boundaries may appear on adjacent pages.</p></section>",
       );
@@ -200,6 +276,18 @@ export async function timelineDocument(options: {
   if (options.contextNote) append(`<p>${escape(options.contextNote)}</p>`);
   append("</body></html>");
   await flush();
-  options.onComplete?.({ bytes, pages, segments: windows.length, glyphs: glyphCount, budgets: { maxBytes, maxGlyphs, chunkBytes: maxima.chunkBytes, pages: maxima.pages, segments: maxima.segments } });
+  options.onComplete?.({
+    bytes,
+    pages,
+    segments: windows.length,
+    glyphs: glyphCount,
+    budgets: {
+      maxBytes,
+      maxGlyphs,
+      chunkBytes: maxima.chunkBytes,
+      pages: maxima.pages,
+      segments: maxima.segments,
+    },
+  });
   return new Blob(chunks, { type: "text/html;charset=utf-8" });
 }

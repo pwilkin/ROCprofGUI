@@ -16,6 +16,11 @@ use std::{
 };
 use tauri::Manager;
 
+#[cfg(test)]
+thread_local! {
+    static ANALYSIS_TEST_FOLDER: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static AFTER_TOOL_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 const PROTOCOLS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const VIEWS: &[&str] = &[
     "reference",
@@ -1000,8 +1005,11 @@ impl Server {
                     self.tool(name, &args, flag.clone())
                 }))
                 .unwrap_or_else(|_| Err("Internal MCP execution failure".into()));
+                #[cfg(test)]
+                AFTER_TOOL_TEST_HOOK.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
                 let mut active = self.control.active.lock().unwrap();
-                let response = if flag.load(Ordering::SeqCst) {
+                let published = completed_analysis_publication(name, &args, &outcome);
+                let response = if flag.load(Ordering::SeqCst) && !published {
                     let detail = match outcome {
                         Err(message) if name == "profile_run" => format!("MCP execution cancelled; worker stopped. {message}"),
                         _ => "MCP execution cancelled; worker stopped. Completed artifacts are retained.".into(),
@@ -1334,7 +1342,7 @@ impl Server {
             "capture_analyze" => {
                 let c = self.capture(a)?;
                 mcp_analysis::validate_analysis(&c, a, &flag)?;
-                let folder = job_directory()?;
+                let folder = analysis_job_directory()?;
                 let job = mcp_analysis::prepare_analysis(&c, a, &flag, &folder)?;
                 fs::write(folder.join("analysis.cjs"), include_str!(concat!(env!("OUT_DIR"), "/mcp-analysis.cjs"))).map_err(|e| e.to_string())?;
                 let analysis = text(a, "analysis")?;
@@ -1353,7 +1361,7 @@ impl Server {
                 let result = if job.mode == "kernel-stream" {
                     mcp_analysis::kernel_result(&c, a, &job, &flag)
                 } else if job.mode == "timeline-stream" {
-                    Err("Timeline result publication is not yet connected".into())
+                    mcp_analysis::timeline_result(&c, a, &job, &flag)
                 } else {
                     let stdout = fs::read(folder.join("stdout.log")).map_err(|e| e.to_string())?;
                     let data: Value = serde_json::from_slice(&stdout).map_err(|e| e.to_string())?;
@@ -1364,7 +1372,7 @@ impl Server {
                         if analysis == "diagnostics" {
                             profile_core::diagnostics::write(path, &serde_json::to_vec_pretty(&data).map_err(|e|e.to_string())?)?;
                         } else {
-                            let mut temp = tempfile::NamedTempFile::new_in(path.parent().ok_or("Missing output directory")?).map_err(|e|e.to_string())?;
+                            let mut temp = tempfile::NamedTempFile::new_in(path.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or(Path::new("."))).map_err(|e|e.to_string())?;
                             serde_json::to_writer_pretty(&mut temp, &data).map_err(|e|e.to_string())?;
                             temp.as_file().sync_all().map_err(|e|e.to_string())?;
                             Control::check(&flag)?;
@@ -2053,6 +2061,9 @@ fn range(v: &Value) -> Result<[f64; 2], String> {
     }
     Ok(r)
 }
+fn completed_analysis_publication(name: &str, args: &Value, outcome: &Result<Value, String>) -> bool {
+    name == "capture_analyze" && args["output"].as_str().is_some_and(|output| outcome.as_ref().is_ok_and(|v| v["path"].as_str() == Some(output)))
+}
 pub(crate) fn new_target(p: &Path) -> Result<(), String> {
     if p.exists() {
         Err("Output already exists; choose a new path".into())
@@ -2316,6 +2327,14 @@ pub fn block_local_invoke(invoke: &tauri::ipc::Invoke<tauri::Wry>) -> bool {
             .lock()
             .unwrap()
             .is_some()
+}
+fn analysis_job_directory() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(folder) = ANALYSIS_TEST_FOLDER.with(|f| f.borrow_mut().take()) {
+        fs::create_dir_all(&folder).map_err(|e|e.to_string())?;
+        return Ok(folder);
+    }
+    job_directory()
 }
 fn job_directory() -> Result<PathBuf, String> {
     let root = crate::appdir::subdir("mcp/jobs")?.join(random()?);
@@ -2769,6 +2788,58 @@ mod tests {
         let last = page(json!(rows), &json!({"limit":2000,"offset":1000}), &flag).unwrap();
         assert_eq!(last["rows"], json!([1000]));
         assert!(last["nextOffset"].is_null());
+    }
+    #[test]
+    fn rpc_late_cancel_preserves_published_analysis_and_cached_success() {
+        let dir=tempfile::tempdir().unwrap();let output=dir.path().join("timeline.html");let job=dir.path().join("job");
+        let store=Arc::new(Store::default());let mut capture=Capture::empty("synthetic.csv".into(),"CSV","ns");capture.id="c".into();
+        store.captures.lock().unwrap().insert("c".into(),Arc::new(capture));
+        let control=Arc::new(Control::default());
+        let server=Server{store,tuning:Arc::new(tuning::Tuning::default()),control:control.clone(),token:String::new(),port:0,clients:Mutex::new(BTreeMap::from([("owner".into(),Client{initialized:true,ready:true,version:PROTOCOLS.last().unwrap().to_string(),sender:None,touched:Instant::now()})])),connections:AtomicU64::new(0)};
+        ANALYSIS_TEST_FOLDER.with(|f|*f.borrow_mut()=Some(job.clone()));
+        let cancel=control.clone();AFTER_TOOL_TEST_HOOK.with(|hook|*hook.borrow_mut()=Some(Box::new(move ||cancel.cancel(Some("owner"),Some(&json!(7))))));
+        let request=json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"capture_analyze","arguments":{"captureId":"c","analysis":"timeline","output":output}}});
+        let response=server.rpc("owner",&request);assert_eq!(response["result"]["isError"],false,"{response}");assert!(output.exists());assert!(!job.exists());
+        let data:Value=serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();assert_eq!(data["path"],output.to_str().unwrap());
+        let mut retry=request;retry["id"]=json!(8);assert_eq!(server.rpc("owner",&retry)["result"],response["result"]);
+        assert!(!completed_analysis_publication("capture_query",&json!({"output":"x"}),&Ok(json!({"path":"x"}))));
+        assert!(!completed_analysis_publication("capture_analyze",&json!({"output":"x"}),&Ok(json!({"html":"x"}))));
+        assert!(!completed_analysis_publication("capture_analyze",&json!({"output":"x"}),&Err("Cancelled".into())));
+    }
+    #[test]
+    fn analysis_worker_wait_cancel_reaps_child_and_cleans_payload() {
+        let dir=tempfile::tempdir().unwrap();let c=Capture::empty("synthetic.csv".into(),"CSV","ns");let flag=Arc::new(AtomicBool::new(false));
+        let job=mcp_analysis::prepare_analysis(&c,&json!({"analysis":"activity"}),&flag,dir.path()).unwrap();
+        let script=dir.path().join("wait.cjs");
+        fs::write(&script,"require('fs').writeFileSync('ready',String(process.pid));setInterval(()=>{},1000)").unwrap();
+        let cancel=flag.clone();let ready=dir.path().join("ready");let waiter=std::thread::spawn(move || {
+            let start=Instant::now();while !ready.exists() && start.elapsed()<Duration::from_secs(5){std::thread::sleep(Duration::from_millis(10));}
+            assert!(ready.exists());let pid=fs::read_to_string(ready).unwrap();cancel.store(true,Ordering::SeqCst);pid
+        });
+        assert!(run_analysis_process(vec!["node".into(),script.to_string_lossy().into()],&job,&flag).is_err());
+        let pid=waiter.join().unwrap();assert!(!Path::new(&format!("/proc/{pid}")).exists());drop(job);assert!(!dir.path().join("payload.json").exists());
+    }
+    #[test]
+    fn every_typed_dataset_matches_legacy_rows_and_real_loom_fixture() {
+        let demo:Value=serde_json::from_str(include_str!("../../public/demo.json")).unwrap();
+        let mut base=serde_json::to_value(Capture::empty("demo.json".into(),"demo","cycles")).unwrap();
+        for (k,v) in demo["capture"].as_object().unwrap(){base[k]=v.clone();}
+        base["hostCalls"]=json!([{"id":"h","pid":"1","tid":"2","name":"call","arguments":null,"start":0,"end":1,"operations":["x"]}]);
+        base["codeObjects"]=json!([{"id":"c","objectId":"7","scope":"agent","agent":null,"uri":null,"storage":null,"loadBase":null,"loadSize":null,"loadDelta":null}]);
+        base["decoderEvents"]=json!([{"id":"e","se":0,"time":1,"kind":"event","fields":{"type":"6","λ":"<&"}}]);
+        base["eventCounters"]=json!([{"id":"e","counterId":"c","event":null,"dispatches":["d"],"name":"n","unit":"count","scope":"SE0","value":null}]);
+        base["monitorIntervals"]=json!([{"id":"m","deviceType":"GPU","deviceId":"0","name":"n","start":0,"end":1,"value":null,"unit":"ns"}]);
+        base["otherSimd"]=json!([{"se":0,"wgp":null,"source":"s","start":0,"duration":1,"category":null}]);
+        let mut c:Capture=serde_json::from_value(base).unwrap();c.id="c".into();
+        let fixture:Value=serde_json::from_str(include_str!("../../fixtures/loom/shared_memory_vector_tile.benchmark-envelope.compile-report.json")).unwrap();
+        c.compile_reports.push(profile_core::loom_report::parse(&fixture,"<fixture>").unwrap());
+        let expected=serde_json::to_value(&c).unwrap();let loom=compile_report_rows(&c);
+        let store=Arc::new(Store::default());store.captures.lock().unwrap().insert("c".into(),Arc::new(c));
+        let server=Server{store,tuning:Arc::new(tuning::Tuning::default()),control:Arc::new(Control::default()),token:String::new(),port:0,clients:Mutex::new(BTreeMap::new()),connections:AtomicU64::new(0)};
+        for (dataset,field) in [("dispatches","dispatches"),("instructions","instructions"),("waves","waves"),("counters","counters"),("markers","markers"),("hostCalls","hostCalls"),("codeObjects","codeObjects"),("intervals","intervals"),("events","decoderEvents"),("eventCounters","eventCounters"),("monitorIntervals","monitorIntervals"),("otherSimd","otherSimd")] {
+            let result=server.tool("capture_query",&json!({"captureId":"c","dataset":dataset,"limit":1000}),Arc::new(AtomicBool::new(false))).unwrap();assert_eq!(result["rows"],expected[field],"{dataset}");
+        }
+        let result=server.tool("capture_query",&json!({"captureId":"c","dataset":"compileReports"}),Arc::new(AtomicBool::new(false))).unwrap();assert_eq!(result["rows"],json!(loom));
     }
     #[test]
     fn schemas_and_argument_validation() {
