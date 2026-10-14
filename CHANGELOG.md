@@ -4,6 +4,19 @@ All notable changes to rocprof studio are recorded here. The format follows [Kee
 
 This project is not yet published or tagged. 0.2.1 is the current state of `main`.
 
+## [Unreleased]
+
+### Fixed
+
+- A1: MCP queries select typed rows before JSON allocation, preserving nested row shapes, serialized-JSON search, the 1000-row clamp and `nextOffset`. Additive `effectiveLimit` makes the clamp visible; zero remains count-only. New 4 MiB row / 16 MiB page and unpaged-response guards refuse explicitly.
+- A1: kernel analysis streams name/start/end records into the GUI's shared incremental reducer, preserving exact arithmetic, union semantics and stable ordering. Timeline analysis selects the requested range, retains bounded windows and streams HTML with pre-insertion glyph/overlay admission. Kernel metadata and timeline export receipts add clock, coverage, denominator/availability and effective-budget labels.
+- A1: timeline points use half-open segment ownership so lower-bound and split-midpoint events are retained once. Positive-interval boundary duplication is unchanged. New-path MCP publication validates the footer/receipt and commits without replacement; late cancellation preserves a completed publication.
+
+### Limits and compatibility
+
+- Import `ROCPROF_MAX_*` overrides remain separate from MCP transport budgets. Optimized kernel/timeline jobs admit at most 2 GiB of projected input; kernel state retains explicit group/name/interval limits. Timeline defaults are 16 MiB / 100,000 glyphs inline and 512 MiB / two million glyphs with `output`; optional `maxOutputBytes` can only lower the applicable byte ceiling.
+- Other analyses still materialize their complete relevant projection under a 256 MiB encoded input preflight; diagnostics retains full-capture compatibility and activity retains its historical nullable result. Production Node remains at 1024 MiB with the existing 120-second deadline. These changes do not make capture storage out-of-core or establish an RSS ceiling.
+
 ## [0.2.1] - 2026-10-02
 
 A review-hardening release that applies the findings of an adversarial code review of the 0.2.0 remediation arc. There are no new features; the changes below make the live-profiling, import and tuning paths safer and more honest.

@@ -61,6 +61,12 @@ it("incremental kernels preserve every arithmetic edge and reject before inserti
     const c = edgeCapture();
     if (nonfinite)
       c.intervals.push({ ...c.intervals[0], start: NaN, end: Infinity });
+    c.dispatches = c.dispatches.map((d, i) => ({
+      ...d,
+      queue: String(i % 2),
+      grid: String(64 + i),
+      workgroup: String(32 + i),
+    }));
     for (let split = 0; split <= c.dispatches.length; split++) {
       const a = createKernelStatsAccumulator();
       for (const chunk of [
@@ -70,6 +76,16 @@ it("incremental kernels preserve every arithmetic edge and reject before inserti
         for (const d of chunk) a.dispatch(d);
       for (const i of c.intervals) a.interval(i);
       expect(a.finish()).toEqual(goldenKernelStats(c));
+      for (let boundary = 0; boundary <= c.intervals.length; boundary++) {
+        const b = createKernelStatsAccumulator();
+        for (const d of c.dispatches) b.dispatch(d);
+        for (const chunk of [
+          c.intervals.slice(0, boundary),
+          c.intervals.slice(boundary),
+        ])
+          for (const i of chunk) b.interval(i);
+        expect(b.finish()).toEqual(goldenKernelStats(c));
+      }
     }
   }
   const a = createKernelStatsAccumulator({

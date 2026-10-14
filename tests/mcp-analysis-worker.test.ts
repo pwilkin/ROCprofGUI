@@ -45,17 +45,63 @@ function manifest(folder: string, rows: number, intervals = 0) {
       start: -10,
       end: 527878,
     },
-    args: {},
+    args: { query: "", offset: 0, limit: 100 },
     streams,
   };
 }
+function objectMode(input: unknown) {
+  return (input as { mode: string }).mode;
+}
 function run(folder: string, input: unknown, heap = 256) {
   writeFileSync(join(folder, "input.json"), JSON.stringify(input));
-  return spawnSync(
-    process.execPath,
-    [`--max-old-space-size=${heap}`, bundle, join(folder, "input.json")],
+  const args = [
+    `--max-old-space-size=${heap}`,
+    bundle,
+    join(folder, "input.json"),
+  ];
+  const time = fs.existsSync("/usr/bin/time");
+  const result = spawnSync(
+    time ? "/usr/bin/time" : process.execPath,
+    time
+      ? [
+          "-f",
+          "%M",
+          "-o",
+          join(folder, "peak-rss.txt"),
+          process.execPath,
+          ...args,
+        ]
+      : args,
     { encoding: "utf8", timeout: 120000 },
   );
+  if (process.env.A1_CPU_REPORT)
+    appendFileSync(
+      process.env.A1_CPU_REPORT,
+      JSON.stringify({
+        mode: objectMode(input),
+        heapMiB: heap,
+        peakRssKiB: time
+          ? Number(
+              readFileSync(join(folder, "peak-rss.txt"), "utf8")
+                .trim()
+                .split("\n")
+                .at(-1),
+            )
+          : null,
+        status: result.status,
+      }) + "\n",
+    );
+  return {
+    ...result,
+    peakRssKiB: time
+      ? Number(
+          readFileSync(join(folder, "peak-rss.txt"), "utf8")
+            .trim()
+            .split("\n")
+            .at(-1),
+        )
+      : undefined,
+  };
 }
 it("bundled worker aggregates 527878 dispatches exactly with a test-only 256 MiB heap", () => {
   const folder = mkdtempSync(join(root, "large-"));
@@ -75,6 +121,9 @@ it("bundled worker aggregates 527878 dispatches exactly with a test-only 256 MiB
   appendFileSync(join(folder, "dispatches.ndjson"), buffer);
   const result = run(folder, manifest(folder, 527878));
   expect(result.status, result.stderr).toBe(0);
+  console.info(
+    `A1 dispatch-only Node peak RSS: ${result.peakRssKiB} KiB (256 MiB heap)`,
+  );
   const receipt = JSON.parse(result.stdout);
   expect(receipt.rows).toBe(3);
   expect(receipt.bytes).toBe(statSync(join(folder, "result.ndjson")).size);
@@ -183,6 +232,9 @@ it("maximal retained interval state succeeds with the unchanged production 1024 
     1024,
   );
   expect(result.status, result.stderr).toBe(0);
+  console.info(
+    `A1 maximal interval Node peak RSS: ${result.peakRssKiB} KiB (1024 MiB heap)`,
+  );
   expect(
     JSON.parse(readFileSync(join(folder, "result.ndjson"), "utf8")),
   ).toEqual({

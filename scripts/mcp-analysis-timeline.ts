@@ -116,6 +116,10 @@ export async function timelineAnalysis(folder: string, manifest: Manifest) {
     if (!complete || complete.bytes !== bytes)
       throw Error("Timeline footer/receipt byte mismatch");
   } catch (error) {
+    if (error instanceof Error && error.message.includes("chunk exceeds"))
+      throw Error(
+        `MCP_ANALYSIS_RECORD_BUDGET: rendered HTML fragment exceeds ${budgets.chunkBytes} bytes; use capture_export for offline inspection. No labels were truncated and no output was published.`,
+      );
     if (
       error instanceof Error &&
       /cannot subdivide|Timeline export exceeds/.test(error.message)

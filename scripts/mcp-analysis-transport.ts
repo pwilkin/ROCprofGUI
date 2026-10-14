@@ -159,8 +159,19 @@ export function validateManifest(input: unknown): Manifest {
       budgets.spoolBytes
     )
       throw Error("MCP_ANALYSIS_SPOOL_BUDGET: spool too large");
-    if (m.mode === "kernel-stream") keys(m.args, []);
-    else {
+    if (m.mode === "kernel-stream") {
+      const a = keys(m.args, ["query", "offset", "limit"]);
+      string(a.query, budgets.manifestBytes);
+      // Paging is authoritative in Rust; no worker arithmetic uses offset.
+      if (
+        !Number.isInteger(a.offset) ||
+        a.offset < 0 ||
+        a.offset > Number("18446744073709551615")
+      )
+        throw Error("Malformed page offset");
+      integer(a.limit);
+      if (a.limit > 1000) throw Error("Malformed effective page limit");
+    } else {
       const a = keys(m.args, [
         "timeline",
         "range",

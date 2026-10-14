@@ -56,11 +56,21 @@ Required arguments are marked `*`.
 `capture_query` with `dataset: "compileReports"` returns the imported Loom compile-time facts — one row per report, each with report- and per-entry identity, detail flags, target resources (SGPR/VGPR final counts and scheduled pressure, subgroup geometry, static occupancy percent, limiting resource, residency summary), instruction mix, allocation/spill and emitted-instruction counters, wait plan and workload geometry. Every row carries `unit: "static"` and the version-zero/same-compiler-horizon stability label: these are compiler evidence, never measurements, dispatches or runtime counts, and absent fields stay absent rather than defaulting to zero. A capture with no Loom report returns an empty list. See [Input formats](/input-formats) for the import contract.
 :::
 
+### Paging contract
+
+List responses keep `rows`, `total`, `offset`, and `nextOffset`, and add `effectiveLimit`. The default is 100; requests above 1000 are clamped, including existing `limit: 2000` calls. Continue with the returned `nextOffset` until it is `null`. A page shorter than the requested limit is not an EOF signal. `limit: 0` is count-only: it can return the same offset and must not drive traversal.
+
+```json
+{"captureId":"26","dataset":"dispatches","offset":0,"limit":2000}
+```
+
+For 1001 matching rows this returns 1000 rows, `effectiveLimit: 1000`, and `nextOffset: 1000`; request offset 1000 for the last row. Search retains its case-insensitive serialized-JSON semantics, including keys, punctuation, nulls and nested samples. Rows above 4 MiB and selected arrays above 16 MiB fail explicitly without dropping rows. Lower `limit` for a page-byte refusal; a single oversized counter/report row needs `capture_export` and offline inspection. Summary, metadata and sources remain unpaged under a 16 MiB response budget; the source path inventory is still resident.
+
 ### Analysis (read-only)
 
 | Tool | Purpose | Key arguments |
 | --- | --- | --- |
-| `capture_analyze` | Run the GUI's own analyses: kernels, occupancy, activity, hardware, hotspots, source, markers, scalar, tensor; or render a dispatch/global timeline. Requires Node.js at runtime. | `captureId*`, `analysis*`, plus per-analysis options (`formula`, `definitions`, `raw`, `metric`, `timeline`, `range`, …) |
+| `capture_analyze` | Run the GUI's own analyses: kernels, occupancy, activity, hardware, hotspots, source, markers, scalar, tensor; or render a dispatch/global timeline. Requires Node.js at runtime. | `captureId*`, `analysis*`, plus per-analysis options (`formula`, `definitions`, `raw`, `metric`, `timeline`, `range`, `output`, `maxOutputBytes`, …) |
 | `wave_read` | Read a detailed ATT wave (instruction execution + wait tokens). | `captureId*`, `waveId*` |
 | `wave_overview` | Bounded wave/timeline overview bins; optional SIMD-utilization model. | `captureId*`, `indices*`, `range*`, `utilization`, `separateLds` |
 | `wave_analyze` | Aggregate dynamic instruction statistics for selected waves and range. | `captureId*`, `indices*`, `range*` |
@@ -68,6 +78,20 @@ Required arguments are marked `*`.
 | `source_map` | Map recorded source paths from a prefix to a local directory. | `captureId*`, `prefix*`, `directory*` |
 | `source_read` | Read paged source (recorded capture source, or an explicit local path). | `path*`, `captureId`, `startLine`, `count` |
 | `reference_query` | Search/page the embedded ISA & matrix-type docs (`manifest`, `cdna1..4`, `rdna1..4`, `rdna3_5`). | `architecture`, `query`, `offset`, `limit` |
+
+### Kernel and timeline analysis contracts
+
+Kernel rows retain the GUI's exact numerical fields and ordering. Additive `analysisMeta` labels the full-capture scope, clock, recorded-data coverage, summed dispatch durations, summed matching residency lifetimes and per-kernel lifetime union. Outer `total` counts matching kernel rows. Zero residency values mean no matching recorded evidence, not measured absence of GPU activity. Cycle-domain point dispatches have no dispatch end timestamp and cannot establish dispatch duration. `range` and `kernel` remain ignored for kernels; `query` filters finalized rows. An output file contains all aggregate rows regardless of paging/query.
+
+Timeline `range` selects exact events. `limit`, `offset`, `query` and `kernel` do not limit timeline events. Inline responses retain `{html}`; output responses retain `{path}`, with additive `export` counts, clock, coverage, complete warnings and effective limits. File output streams HTML with a 512 MiB / two-million-glyph ceiling; inline HTML is limited to 16 MiB / 100,000 glyphs. `maxOutputBytes` may lower the applicable byte ceiling, and a larger inline request must supply `output`.
+
+```json
+{"captureId":"26","analysis":"timeline","timeline":"global","range":[100,200],"timePages":4,"lanesPerPage":12,"output":"/tmp/new-timeline.html","maxOutputBytes":67108864}
+```
+
+Choose a new path: publication never replaces an existing file or symlink. `timePages: 0` retains the default 1; `lanesPerPage: 0` retains the default 12. Points at the lower range boundary now appear; upper-boundary points belong to the next half-open segment. Automatic subdivision preserves split-midpoint points exactly once. Positive-duration events crossing segments may still appear on adjacent pages; those glyphs are not distinct dispatches.
+
+Kernel and timeline transport excludes unrelated capture datasets. Exact kernel union still has state bounds, and dense timeline windows may be impossible to subdivide. Explicit refusals do not return partial totals or sampled events. Use positive-limit dispatch/interval queries with `nextOffset` for offline aggregation; union intervals globally rather than adding per-part unions. Other analyses still materialize relevant datasets under 256 MiB encoded input, and diagnostics still needs the full capture. Activity `null` retains its historical meaning: instruction timing is absent, invalid, or has no positive finite total. A dispatch CSV alone cannot supply instruction activity.
 
 ### Evidence & artifacts
 

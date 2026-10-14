@@ -635,7 +635,9 @@ pub struct AnalysisJob {
 }
 impl Drop for AnalysisJob {
     fn drop(&mut self) {
-        if !self.prepared { let _ = fs::remove_file(self.folder.join("input.json")); }
+        if !self.prepared {
+            let _ = fs::remove_file(self.folder.join("input.json"));
+        }
         for name in [
             "payload.json",
             "dispatches.ndjson",
@@ -753,6 +755,12 @@ pub fn validate_analysis(c: &Capture, a: &Value, flag: &AtomicBool) -> Result<Va
     } else if a.get("maxOutputBytes").is_some() {
         return Err("maxOutputBytes is valid only for timeline".into());
     }
+    if a["analysis"] == "kernels" {
+        let page = PageArgs::parse(a);
+        args.insert("query".into(), json!(page.query));
+        args.insert("offset".into(), json!(page.offset));
+        args.insert("limit".into(), json!(page.limit));
+    }
     let context = if a["analysis"] == "kernels" {
         encoded_size(&KernelMeta(c), budget("contextBytes"), flag)
     } else if a["analysis"] == "timeline" {
@@ -855,7 +863,8 @@ fn kernel_stream<W: Write>(
     }
     if intervals {
         for (index, i) in c.intervals.iter().enumerate() {
-            finite(&[i.start, i.end])?;
+            finite(&[i.start, i.end])
+                .map_err(|e| format!("{e}; dataset intervals, record {index}"))?;
             record_write(
                 &KernelSample {
                     kernel: &i.kernel,
@@ -870,7 +879,8 @@ fn kernel_stream<W: Write>(
         Ok(c.intervals.len() as u64)
     } else {
         for (index, d) in c.dispatches.iter().enumerate() {
-            finite(&[d.start, d.end])?;
+            finite(&[d.start, d.end])
+                .map_err(|e| format!("{e}; dataset dispatches, record {index}"))?;
             record_write(
                 &KernelSample {
                     kernel: &d.kernel,
@@ -898,9 +908,11 @@ fn timeline_stream<W: Write>(
     if args["timeline"] == "global" {
         for (index, i) in c.intervals.iter().enumerate() {
             check(writer.flag)?;
-            finite(&[i.start, i.end])?;
+            finite(&[i.start, i.end])
+                .map_err(|e| format!("{e}; dataset intervals, record {index}"))?;
             if overlaps(i.start, i.end, range) {
-                string(&i.kernel)?;
+                string(&i.kernel)
+                    .map_err(|e| format!("{e}; dataset intervals, record {index}, field kernel"))?;
                 record_write(
                     &TimelineRecord {
                         kind: "residency",
@@ -921,10 +933,20 @@ fn timeline_stream<W: Write>(
             } else {
                 m.end.unwrap_or(c.end)
             };
-            finite(&[m.start, end])?;
+            finite(&[m.start, end]).map_err(|e| format!("{e}; dataset markers, record {index}"))?;
+            if let Some(end) = m.end {
+                finite(&[end])
+                    .map_err(|e| format!("{e}; dataset markers, record {index}, field end"))?;
+            }
             if overlaps(m.start, end, range) {
-                for v in [&m.name, &m.code_object, &m.source] {
-                    string(v)?;
+                for (field, v) in [
+                    ("name", &m.name),
+                    ("codeObject", &m.code_object),
+                    ("source", &m.source),
+                ] {
+                    string(v).map_err(|e| {
+                        format!("{e}; dataset markers, record {index}, field {field}")
+                    })?;
                 }
                 let record = MarkerRecord {
                     start: m.start,
@@ -956,10 +978,20 @@ fn timeline_stream<W: Write>(
     }
     for (index, d) in c.dispatches.iter().enumerate() {
         check(writer.flag)?;
-        finite(&[d.start, d.end])?;
+        finite(&[d.start, d.end])
+            .map_err(|e| format!("{e}; dataset dispatches, record {index}"))?;
         if d.end > d.start && overlaps(d.start, d.end, range) {
-            for v in [&d.id, &d.kernel, &d.agent, &d.queue, &d.grid, &d.workgroup] {
-                string(v)?;
+            for (field, v) in [
+                ("id", &d.id),
+                ("kernel", &d.kernel),
+                ("agent", &d.agent),
+                ("queue", &d.queue),
+                ("grid", &d.grid),
+                ("workgroup", &d.workgroup),
+            ] {
+                string(v).map_err(|e| {
+                    format!("{e}; dataset dispatches, record {index}, field {field}")
+                })?;
             }
             record_write(
                 &TimelineRecord {
@@ -977,14 +1009,20 @@ fn timeline_stream<W: Write>(
     if args["timeline"] == "global" {
         for (index, e) in c.decoder_events.iter().enumerate() {
             check(writer.flag)?;
-            finite(&[e.time])?;
+            finite(&[e.time])
+                .map_err(|e| format!("{e}; dataset events, record {index}, field time"))?;
             if overlaps(e.time, e.time, range) {
-                for v in [&e.id, &e.kind] {
-                    string(v)?;
+                for (field, v) in [("id", &e.id), ("kind", &e.kind)] {
+                    string(v).map_err(|e| {
+                        format!("{e}; dataset events, record {index}, field {field}")
+                    })?;
                 }
                 for (k, v) in &e.fields {
-                    string(k)?;
-                    string(v)?;
+                    string(k).map_err(|e| {
+                        format!("{e}; dataset events, record {index}, field-map key")
+                    })?;
+                    string(v)
+                        .map_err(|e| format!("{e}; dataset events, record {index}, field {k}"))?;
                 }
                 record_write(
                     &TimelineRecord {
@@ -1230,7 +1268,7 @@ pub fn prepare_analysis(
         },
         budget_version: protocol()["budgetVersion"].as_u64().unwrap(),
     };
-    encoded_size(&manifest, budget("manifestBytes"), flag)?;
+    encoded_size(&manifest, budget("manifestBytes"), flag).map_err(|e|format!("MCP_ANALYSIS_RECORD_BUDGET: input.json manifest exceeds {} bytes ({e}); use a smaller query or capture_export for offline inspection",budget("manifestBytes")))?;
     let f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1381,6 +1419,31 @@ mod transport_tests {
         assert_eq!(rows[11]["record"]["time"], 105.0);
         assert!(overlaps(105., 105., [105., 110.]));
         assert!(!overlaps(105., 105., [100., 105.]));
+        fs::write(
+            dir.path().join("analysis.cjs"),
+            include_str!(concat!(env!("OUT_DIR"), "/mcp-analysis.cjs")),
+        )
+        .unwrap();
+        let output = std::process::Command::new("node")
+            .arg("--max-old-space-size=256")
+            .arg(dir.path().join("analysis.cjs"))
+            .arg(dir.path().join("input.json"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(dir.path().join("stdout.log"), output.stdout).unwrap();
+        let result = timeline_result(&c, &json!({}), &job, &flag).unwrap();
+        assert_eq!(result["export"]["glyphs"], 12);
+        let html = result["html"].as_str().unwrap();
+        for index in 100..110 {
+            assert!(html.contains(&format!("data-key=\"dispatch:{index}\"")));
+        }
+        assert!(!html.contains("data-key=\"dispatch:99\""));
+        assert!(!html.contains("data-key=\"event:2\""));
     }
 }
 
@@ -2279,5 +2342,119 @@ mod projection_tests {
             assert_eq!(output.stdout, b"null");
             drop(job);
         }
+    }
+}
+
+pub fn publish_json(
+    data: &Value,
+    path: &Path,
+    diagnostics: bool,
+    flag: &AtomicBool,
+) -> Result<(), String> {
+    check(flag)?;
+    let max = if diagnostics {
+        if data["schemaVersion"] != 1 || data["kind"] != "rocprof-studio-diagnostics" {
+            return Err("Invalid diagnostic manifest schema".into());
+        }
+        16 * 1024 * 1024
+    } else {
+        u64::MAX
+    };
+    let mut count = CappedWriter {
+        inner: io::sink(),
+        bytes: 0,
+        max,
+        flag,
+    };
+    serde_json::to_writer_pretty(&mut count, data).map_err(|e| {
+        if diagnostics {
+            format!("Diagnostic manifest exceeds 16 MiB ({e})")
+        } else {
+            e.to_string()
+        }
+    })?;
+    let mut temp = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut writer = CappedWriter {
+        inner: BufWriter::new(temp.as_file_mut()),
+        bytes: 0,
+        max,
+        flag,
+    };
+    serde_json::to_writer_pretty(&mut writer, data).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    drop(writer);
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    check(flag)?;
+    temp.persist_noclobber(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+#[cfg(test)]
+mod json_output_tests {
+    use super::*;
+    #[test]
+    fn mcp_diagnostics_no_clobber_schema_and_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostic.json");
+        let flag = AtomicBool::new(false);
+        let data =
+            json!({"schemaVersion":1,"kind":"rocprof-studio-diagnostics","capture":{"name":"c"}});
+        fs::write(&path, b"raced").unwrap();
+        assert!(publish_json(&data, &path, true, &flag).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"raced");
+        fs::remove_file(&path).unwrap();
+        assert!(publish_json(&json!({}), &path, true, &flag).is_err());
+        assert!(!path.exists());
+        flag.store(true, Ordering::SeqCst);
+        assert!(publish_json(&data, &path, true, &flag).is_err());
+        assert!(!path.exists());
+        flag.store(false, Ordering::SeqCst);
+        publish_json(&data, &path, true, &flag).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap(),
+            data
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod large_publication_tests {
+    use super::*;
+    #[test]
+    fn mcp_file_publication_above_16_mib_never_uses_inline_or_plot_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Capture::empty("synthetic.csv".into(), "CSV", "ns");
+        let flag = AtomicBool::new(false);
+        let target = dir.path().join("large.html");
+        let args = json!({"analysis":"timeline","output":target});
+        let job = prepare_analysis(&c, &args, &flag, dir.path()).unwrap();
+        let source = dir.path().join("result.html");
+        let mut file = BufWriter::new(fs::File::create(&source).unwrap());
+        file.write_all(b"<!doctype html><html><body><p>").unwrap();
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..17 {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(b"</p></body></html>").unwrap();
+        file.flush().unwrap();
+        drop(file);
+        let bytes = fs::metadata(&source).unwrap().len();
+        let receipt = json!({"protocol":protocol()["protocol"],"version":protocol()["version"],"kind":"timeline-html","file":"result.html","bytes":bytes,"pages":1,"segments":1,"glyphs":0,"range":job.args["range"],"budgets":{"maxBytes":job.args["maxOutputBytes"],"maxGlyphs":job.args["maxGlyphs"],"chunkBytes":budget("chunkBytes"),"pages":budget("pages"),"segments":budget("segments"),"windowMarks":budget("windowMarks"),"windowBytes":budget("windowBytes"),"timePages":job.args["timePages"],"lanesPerPage":job.args["lanesPerPage"]}});
+        fs::write(dir.path().join("stdout.log"), receipt.to_string()).unwrap();
+        let response = timeline_result(&c, &args, &job, &flag).unwrap();
+        assert_eq!(response["export"]["bytes"], bytes);
+        assert_eq!(fs::metadata(&target).unwrap().len(), bytes);
+        assert!(bytes > budget("inlineBytes"));
+        assert!(timeline_result(&c, &json!({}), &job, &flag)
+            .unwrap_err()
+            .contains("set output"));
+        drop(job);
+        assert!(!source.exists());
+        assert!(target.exists());
     }
 }
