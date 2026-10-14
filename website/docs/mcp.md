@@ -23,7 +23,7 @@ When idle, the app shows the endpoint details it is serving:
 
 ## How this tool list was obtained
 
-The table below is generated from a live server, not transcribed from prose. An installed binary was started with an isolated data directory on a free port:
+The tool inventory below was captured from an installed 0.2.1 server with an isolated data directory on a free port. The argument and analysis contracts have been reviewed against the 0.3.0 source; this release review did not probe or redeploy the installed service:
 
 ```bash
 ROCPROFGUI_HOME=/tmp/rps-home rocprof-studio --headless --mcp-port 8791
@@ -32,7 +32,7 @@ ROCPROFGUI_HOME=/tmp/rps-home rocprof-studio --headless --mcp-port 8791
 Then `initialize` → `notifications/initialized` → `tools/list` were sent over the legacy SSE transport and the returned JSON schemas turned into the table. The live server reported `serverInfo` `{name: "rocprof-studio", version: "0.2.1"}` and 31 tools.
 
 ::: tip Count check
-Live `tools/list` returns 31 tools. Some internal notes say 27; that count predates the four staged-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`). Trust 31.
+The recorded 0.2.1 `tools/list` returned 31 tools; the 0.3.0 source retains that inventory. Some internal notes say 27; that count predates the four staged-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`). Trust 31.
 :::
 
 ## Tool reference (31 tools)
@@ -248,7 +248,8 @@ curl -s --max-time 10 -D - http://127.0.0.1:8765/mcp \
        "params":{"protocolVersion":"2024-11-05","capabilities":{},
                  "clientInfo":{"name":"demo","version":"1.0"}}}'
 # → Mcp-Session-Id: <id>
-# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.2.1"},...}}
+# Example response from a 0.3.0 build:
+# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.3.0"},...}}
 ```
 
 ::: warning The handshake is per-connection

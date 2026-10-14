@@ -2900,7 +2900,7 @@ test("diagnostic download records analysis context without claiming performance 
   expect(download.suggestedFilename()).toBe("rocprof-diagnostics.json");
   const report = JSON.parse(await readFile((await download.path())!, "utf8"));
   expect(report.kind).toBe("rocprof-studio-diagnostics");
-  expect(report.application.version).toBe("0.2.1");
+  expect(report.application.version).toBe("0.3.0");
   expect(report.runtime.environment).toBe("browser preview");
   expect(report.inventory.instructions).toBe(12);
   expect(report.inventory.waveIndexes).toBe(24);
@@ -2929,7 +2929,7 @@ test("native diagnostic export preserves source hashes and reports cancellation 
         if (command === "diagnostic_context")
           return {
             environment: "desktop",
-            backendVersion: "0.2.1",
+            backendVersion: "0.3.0",
             inputPath: null,
             decoder: { status: "configuration only" },
           };

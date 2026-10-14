@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "profile-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "csv",
  "rusqlite",
@@ -2643,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "rocprof-studio"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "profile-core",

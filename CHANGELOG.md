@@ -2,20 +2,25 @@
 
 All notable changes to rocprof studio are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
-This project is not yet published or tagged. 0.2.1 is the current state of `main`.
+Releases are recorded here without git tags. 0.3.0 is the current state of `main`.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
+### Changed
+
+- MCP queries select typed rows before JSON serialization, preserving row shapes, serialized-JSON search and `nextOffset`. Additive `effectiveLimit` exposes the 1000-row clamp; zero remains count-only. Explicit guards bound rows to 4 MiB and selected arrays/unpaged responses to 16 MiB.
+- Private worker transport v2 carries counted dependency projections. Kernel aggregation streams name/start/end records through the GUI's shared incremental reducer, preserving exact arithmetic, interval unions and stable ordering; paging applies after aggregation.
+- Timeline analysis projects the requested range, retains bounded windows and streams HTML with glyph, overlay and output budgets. Inline output permits 16 MiB / 100,000 glyphs; new-file output permits 512 MiB / two million glyphs. `maxOutputBytes` can lower the byte ceiling. Responses add clock, coverage and effective-budget context.
+
 ### Fixed
 
-- A1: MCP queries select typed rows before JSON allocation, preserving nested row shapes, serialized-JSON search, the 1000-row clamp and `nextOffset`. Additive `effectiveLimit` makes the clamp visible; zero remains count-only. New 4 MiB row / 16 MiB page and unpaged-response guards refuse explicitly.
-- A1: kernel analysis streams name/start/end records into the GUI's shared incremental reducer, preserving exact arithmetic, union semantics and stable ordering. Timeline analysis selects the requested range, retains bounded windows and streams HTML with pre-insertion glyph/overlay admission. Kernel metadata and timeline export receipts add clock, coverage, denominator/availability and effective-budget labels.
-- A1: timeline points use half-open segment ownership so lower-bound and split-midpoint events are retained once. Positive-interval boundary duplication is unchanged. New-path MCP publication validates the footer/receipt and commits without replacement; late cancellation preserves a completed publication.
+- Timeline points at lower and split boundaries appear exactly once. Output publication validates the complete document and commits atomically without replacing an existing path; late cancellation preserves a completed publication.
 
 ### Limits and compatibility
 
-- Import `ROCPROF_MAX_*` overrides remain separate from MCP transport budgets. Optimized kernel/timeline jobs admit at most 2 GiB of projected input; kernel state retains explicit group/name/interval limits. Timeline defaults are 16 MiB / 100,000 glyphs inline and 512 MiB / two million glyphs with `output`; optional `maxOutputBytes` can only lower the applicable byte ceiling.
-- Other analyses still materialize their complete relevant projection under a 256 MiB encoded input preflight; diagnostics retains full-capture compatibility and activity retains its historical nullable result. Production Node remains at 1024 MiB with the existing 120-second deadline. These changes do not make capture storage out-of-core or establish an RSS ceiling.
+- Import memory is unchanged. Exact kernel aggregation still scans all records, O(N), with bounded group/name/interval state. Other analyses still materialize relevant projections under a 256 MiB encoded-input cap; diagnostics retains full-capture compatibility. This release does not make all analysis out-of-core or establish an RSS ceiling. Import overrides, the 1024 MiB Node heap and the 120-second deadline are unchanged.
 
 ## [0.2.1] - 2026-10-02
 

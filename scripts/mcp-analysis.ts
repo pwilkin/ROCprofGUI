@@ -61,7 +61,7 @@ async function main() {
         definitions: { version: 1, selected: "", files: [] },
         hiddenPending: false,
         wave: null,
-        runtime: { environment: "MCP", backendVersion: "0.2.1" },
+        runtime: { environment: "MCP", backendVersion: "0.3.0" },
       });
       break;
     case "occupancy":

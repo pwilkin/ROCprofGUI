@@ -7,7 +7,25 @@
 
 All notable changes to rocprof studio are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
-This project is not yet published or tagged. 0.2.1 is the current state of `main`.
+Releases are recorded here without git tags. 0.3.0 is the current state of `main`.
+
+## [Unreleased]
+
+## [0.3.0] - 2026-10-14
+
+### Changed
+
+- MCP queries select typed rows before JSON serialization, preserving row shapes, serialized-JSON search and `nextOffset`. Additive `effectiveLimit` exposes the 1000-row clamp; zero remains count-only. Explicit guards bound rows to 4 MiB and selected arrays/unpaged responses to 16 MiB.
+- Private worker transport v2 carries counted dependency projections. Kernel aggregation streams name/start/end records through the GUI's shared incremental reducer, preserving exact arithmetic, interval unions and stable ordering; paging applies after aggregation.
+- Timeline analysis projects the requested range, retains bounded windows and streams HTML with glyph, overlay and output budgets. Inline output permits 16 MiB / 100,000 glyphs; new-file output permits 512 MiB / two million glyphs. `maxOutputBytes` can lower the byte ceiling. Responses add clock, coverage and effective-budget context.
+
+### Fixed
+
+- Timeline points at lower and split boundaries appear exactly once. Output publication validates the complete document and commits atomically without replacing an existing path; late cancellation preserves a completed publication.
+
+### Limits and compatibility
+
+- Import memory is unchanged. Exact kernel aggregation still scans all records, O(N), with bounded group/name/interval state. Other analyses still materialize relevant projections under a 256 MiB encoded-input cap; diagnostics retains full-capture compatibility. This release does not make all analysis out-of-core or establish an RSS ceiling. Import overrides, the 1024 MiB Node heap and the 120-second deadline are unchanged.
 
 ## [0.2.1] - 2026-10-02
 
