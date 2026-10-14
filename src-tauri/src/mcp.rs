@@ -1,4 +1,4 @@
-use crate::{tuning, Store};
+use crate::{mcp_analysis::{self, PageArgs, CompileReportRow}, tuning, Store};
 use profile_core::Capture;
 use serde_json::{json, Value};
 use std::{
@@ -1088,25 +1088,27 @@ impl Server {
             "capture_query" => {
                 let c = self.capture(a)?;
                 let dataset = text(a, "dataset")?;
+                let args = PageArgs::parse(a);
                 let data = match dataset {
-                    "summary" => return Ok(summary(&c)),
-                    "dispatches" => json!(c.dispatches),
-                    "instructions" => json!(c.instructions),
-                    "waves" => json!(c.waves),
-                    "counters" => json!(c.counters),
-                    "markers" => json!(c.markers),
-                    "hostCalls" => json!(c.host_calls),
-                    "codeObjects" => json!(c.code_objects),
-                    "intervals" => json!(c.intervals),
-                    "events" => json!(c.decoder_events),
-                    "eventCounters" => json!(c.event_counters),
-                    "monitorIntervals" => json!(c.monitor_intervals),
-                    "otherSimd" => json!(c.other_simd),
-                    "metadata" => return Ok(json!(c.metadata)),
+                    "dispatches" => mcp_analysis::page_slice(&c.dispatches, &args, &flag, dataset)?,
+                    "instructions" => mcp_analysis::page_slice(&c.instructions, &args, &flag, dataset)?,
+                    "waves" => mcp_analysis::page_slice(&c.waves, &args, &flag, dataset)?,
+                    "counters" => mcp_analysis::page_slice(&c.counters, &args, &flag, dataset)?,
+                    "markers" => mcp_analysis::page_slice(&c.markers, &args, &flag, dataset)?,
+                    "hostCalls" => mcp_analysis::page_slice(&c.host_calls, &args, &flag, dataset)?,
+                    "codeObjects" => mcp_analysis::page_slice(&c.code_objects, &args, &flag, dataset)?,
+                    "intervals" => mcp_analysis::page_slice(&c.intervals, &args, &flag, dataset)?,
+                    "events" => mcp_analysis::page_slice(&c.decoder_events, &args, &flag, dataset)?,
+                    "eventCounters" => mcp_analysis::page_slice(&c.event_counters, &args, &flag, dataset)?,
+                    "monitorIntervals" => mcp_analysis::page_slice(&c.monitor_intervals, &args, &flag, dataset)?,
+                    "otherSimd" => mcp_analysis::page_slice(&c.other_simd, &args, &flag, dataset)?,
+                    "summary" => return mcp_analysis::bounded_value(&mcp_analysis::Summary(&c), &flag),
+                    "metadata" => return mcp_analysis::bounded_value(&c.metadata, &flag),
                     "sources" => {
-                        return Ok(json!({"paths":profile_core::source_files::recorded_paths(&c)}))
+                        #[derive(serde::Serialize)] struct Sources { paths: Vec<String> }
+                        return mcp_analysis::bounded_value(&Sources { paths: profile_core::source_files::recorded_paths(&c) }, &flag);
                     }
-                    "compileReports" => json!(compile_report_rows(&c)),
+                    "compileReports" => mcp_analysis::page_rows(c.compile_reports.iter().map(CompileReportRow), &args, &flag, dataset)?,
                     _ => return Err("Unknown dataset".into()),
                 };
                 let view = match dataset {
@@ -1117,7 +1119,7 @@ impl Server {
                     _ => "evidence",
                 };
                 self.control.follow(json!({"captureId":c.id,"view":view}));
-                page(data, a, &flag)
+                Ok(data)
             }
             "workspace_select" => {
                 let c = self.capture(a)?;
@@ -2096,9 +2098,11 @@ fn summary(c: &Capture) -> Value {
 /// array. These are compile-time static facts (unit "static", version-zero,
 /// same-compiler-horizon), never measurements; the labelling travels with every
 /// row so a client reading the dataset cannot mistake it for runtime data.
+#[cfg(test)]
 fn compile_report_rows(c: &Capture) -> Vec<Value> {
     c.compile_reports.iter().map(compile_report_row).collect()
 }
+#[cfg(test)]
 fn compile_report_row(r: &profile_core::loom_report::LoomCompileReport) -> Value {
     let mut o = serde_json::Map::new();
     o.insert("stability".into(), json!(r.stability));
@@ -2151,6 +2155,7 @@ fn compile_report_row(r: &profile_core::loom_report::LoomCompileReport) -> Value
     );
     Value::Object(o)
 }
+#[cfg(test)]
 fn compile_entry_row(e: &profile_core::loom_report::LoomCompileEntry) -> Value {
     let mut o = serde_json::Map::new();
     o.insert("index".into(), json!(e.index));
@@ -2187,6 +2192,7 @@ fn compile_entry_row(e: &profile_core::loom_report::LoomCompileEntry) -> Value {
 /// SGPR/VGPR final counts plus scheduled pressure, subgroup geometry, the static
 /// occupancy percent, the limiting resource and the residency summary. Absent
 /// sub-fields stay absent rather than defaulting to zero.
+#[cfg(test)]
 fn target_resource_facts(tr: Option<&Value>) -> Option<Value> {
     let tr = tr?.as_object()?;
     let mut out = serde_json::Map::new();
@@ -2235,6 +2241,7 @@ fn target_resource_facts(tr: Option<&Value>) -> Option<Value> {
 }
 /// Surfaces the static (and dynamic, when present) instruction-mix sections
 /// verbatim under camelCase keys, or nothing when neither is present.
+#[cfg(test)]
 fn instruction_mix_facts(sections: &BTreeMap<String, Value>) -> Option<Value> {
     let mut m = serde_json::Map::new();
     if let Some(v) = sections.get("static_instruction_mix") {
@@ -2246,24 +2253,7 @@ fn instruction_mix_facts(sections: &BTreeMap<String, Value>) -> Option<Value> {
     (!m.is_empty()).then(|| Value::Object(m))
 }
 fn page(v: Value, a: &Value, flag: &AtomicBool) -> Result<Value, String> {
-    let rows = v.as_array().ok_or("Dataset is not a list")?;
-    let query = a["query"].as_str().unwrap_or("").to_lowercase();
-    let offset = a["offset"].as_u64().unwrap_or(0) as usize;
-    let limit = a["limit"].as_u64().unwrap_or(100).min(1000) as usize;
-    let mut matches = Vec::new();
-    let mut total = 0;
-    for row in rows {
-        Control::check(flag)?;
-        if query.is_empty() || row.to_string().to_lowercase().contains(&query) {
-            if total >= offset && matches.len() < limit {
-                matches.push(row.clone());
-            }
-            total += 1;
-        }
-    }
-    Ok(
-        json!({"rows":matches,"total":total,"offset":offset,"nextOffset":if offset+limit<total{Some(offset+limit)}else{None}}),
-    )
+    mcp_analysis::page_slice(v.as_array().ok_or("Dataset is not a list")?, &PageArgs::parse(a), flag, "analysis")
 }
 fn reference(a: &Value) -> Result<Value, String> {
     let architecture = a["architecture"].as_str().unwrap_or("manifest");
@@ -3175,6 +3165,7 @@ mod tests {
         capture.compile_reports.push(report);
 
         let rows = compile_report_rows(&capture);
+        assert_eq!(serde_json::to_value(CompileReportRow(&capture.compile_reports[0])).unwrap(), rows[0]);
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
         // Epistemic labelling travels with every row.

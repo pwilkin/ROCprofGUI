@@ -2,6 +2,7 @@
 mod appdir;
 mod tuning;
 mod mcp;
+mod mcp_analysis;
 use profile_core::{Capture, Wave};
 use std::{
     collections::BTreeMap,
