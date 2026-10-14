@@ -2766,6 +2766,37 @@ pub fn shutdown(control: &Control, tuning: &tuning::Tuning) {
 mod tests {
     use super::*;
     #[test]
+    fn analysis_protocol_matches_catalog_and_timeline_caps() {
+        let p: Value = serde_json::from_str(include_str!("../../src/mcpAnalysisProtocol.json")).unwrap();
+        let catalog = tools();
+        let schema = &catalog.iter().find(|t| t["name"] == "capture_analyze").unwrap()["inputSchema"];
+        assert_eq!(p["analyses"], schema["properties"]["analysis"]["enum"]);
+        assert_eq!(p["budgets"]["chunkBytes"], profile_core::timeline_file::MAX_CHUNK_BYTES);
+        assert_eq!(p["budgets"]["fileBytes"], profile_core::timeline_file::MAX_DOCUMENT_BYTES);
+    }
+    #[test]
+    fn golden_json_search_and_traversal() {
+        let flag = AtomicBool::new(false);
+        let rows = json!([{"nested":[null,"Żółć","a\\b\n\""],"key":true}, {"nested":[]}, null]);
+        for query in ["", "nested", "null", "żółć", "\\", "\"", "[]", ":", "missing"] {
+            for offset in [0, 1, 3, 10] {
+                for limit in [0, 1, 1000, 2000] {
+                    let result = page(rows.clone(), &json!({"query":query,"offset":offset,"limit":limit}), &flag).unwrap();
+                    let expected: Vec<_> = rows.as_array().unwrap().iter().filter(|r| query.is_empty() || r.to_string().to_lowercase().contains(query)).collect();
+                    assert_eq!(result["total"], expected.len());
+                    assert_eq!(result["rows"], json!(expected.into_iter().skip(offset).take(limit.min(1000)).collect::<Vec<_>>()));
+                }
+            }
+        }
+        let rows: Vec<_> = (0..1001).collect();
+        let first = page(json!(rows), &json!({"limit":2000}), &flag).unwrap();
+        assert_eq!(first["rows"].as_array().unwrap().len(), 1000);
+        assert_eq!(first["nextOffset"], 1000);
+        let last = page(json!(rows), &json!({"limit":2000,"offset":1000}), &flag).unwrap();
+        assert_eq!(last["rows"], json!([1000]));
+        assert!(last["nextOffset"].is_null());
+    }
+    #[test]
     fn schemas_and_argument_validation() {
         let catalog = tools();
         let mut names = std::collections::BTreeSet::new();

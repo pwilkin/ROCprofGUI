@@ -1,0 +1,74 @@
+{
+  "protocol": "rocprof-studio-analysis",
+  "version": 2,
+  "budgetVersion": 2,
+  "analyses": [
+    "kernels",
+    "occupancy",
+    "activity",
+    "hardware",
+    "hotspots",
+    "source",
+    "markers",
+    "scalar",
+    "tensor",
+    "timeline",
+    "diagnostics"
+  ],
+  "modes": [
+    "kernel-stream",
+    "timeline-stream",
+    "projected-json",
+    "diagnostics-compatibility"
+  ],
+  "streamKinds": [
+    "kernel-dispatch",
+    "kernel-interval",
+    "timeline-record",
+    "payload"
+  ],
+  "recordKinds": [
+    "dispatch",
+    "residency",
+    "marker",
+    "event"
+  ],
+  "files": {
+    "manifest": "input.json",
+    "payload": "payload.json",
+    "dispatches": "dispatches.ndjson",
+    "intervals": "intervals.ndjson",
+    "timeline": "timeline.ndjson",
+    "kernelResult": "result.ndjson",
+    "timelineResult": "result.html"
+  },
+  "budgets": {
+    "manifestBytes": 1048576,
+    "recordBytes": 1048576,
+    "readBufferBytes": 65536,
+    "spoolBytes": 2147483648,
+    "kernelGroups": 65536,
+    "kernelNameBytes": 16777216,
+    "kernelIntervals": 2000000,
+    "kernelResultBytes": 33554432,
+    "windowMarks": 100000,
+    "windowBytes": 16777216,
+    "stringBytes": 65536,
+    "chunkBytes": 1048576,
+    "inlineBytes": 16777216,
+    "inlineGlyphs": 100000,
+    "fileBytes": 536870912,
+    "fileGlyphs": 2000000,
+    "pages": 512,
+    "segments": 256,
+    "timePages": 64,
+    "lanesPerPage": 24,
+    "projectedBytes": 268435456,
+    "stdoutBytes": 67108864,
+    "receiptBytes": 65536,
+    "contextBytes": 1048576,
+    "queryRowBytes": 4194304,
+    "queryPageBytes": 16777216,
+    "deadlineSeconds": 120
+  }
+}
