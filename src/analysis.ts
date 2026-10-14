@@ -16,7 +16,7 @@ export function union(ranges: Range[]): number {
   return total + end - start;
 }
 export function occupancy(
-  c: Capture,
+  c: Pick<Capture, "intervals">,
   se?: number,
   kernel?: string,
 ): [number, number][] {

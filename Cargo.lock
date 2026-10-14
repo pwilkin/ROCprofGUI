@@ -2652,6 +2652,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "tiny_http",
 ]
 

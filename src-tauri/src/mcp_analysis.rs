@@ -264,3 +264,321 @@ mod tests {
         assert_eq!(beyond["total"],1001); assert!(beyond["nextOffset"].is_null());
     }
 }
+
+use profile_core::{Capture, Dispatch};
+use std::{fs, io::BufWriter, path::{Path, PathBuf}};
+
+pub enum AnalysisPlan<'a> {
+    Kernels(&'a Capture), Timeline(&'a Capture), Projected(&'a Capture, &'a str), DiagnosticsCompatibility(&'a Capture),
+}
+impl<'a> AnalysisPlan<'a> {
+    fn select(c: &'a Capture, a: &'a Value) -> Result<Self,String> {
+        match a["analysis"].as_str().ok_or("Missing analysis")? {
+            "kernels" => Ok(Self::Kernels(c)), "timeline" => Ok(Self::Timeline(c)), "diagnostics" => Ok(Self::DiagnosticsCompatibility(c)),
+            k if protocol()["analyses"].as_array().unwrap().iter().any(|v| v == k) => Ok(Self::Projected(c,k)),
+            _ => Err("Unknown analysis".into()),
+        }
+    }
+}
+#[derive(Serialize)]
+pub struct Identity<'a> { id:&'a str, name:&'a str, format:&'a str, architecture:&'a str, unit:&'a str, origin:&'a str, start:f64, end:f64 }
+impl<'a> Identity<'a> {
+    fn new(c:&'a Capture)->Self { Self{id:&c.id,name:&c.name,format:&c.format,architecture:&c.architecture,unit:&c.unit,origin:&c.origin,start:c.start,end:c.end} }
+    fn validate(&self)->Result<(),String> {
+        finite(&[self.start,self.end])?;
+        for v in [self.id,self.name,self.format,self.architecture,self.unit,self.origin] { string(v)?; }
+        Ok(())
+    }
+}
+#[derive(Serialize)]
+struct ResponseContext<'a> { capture:Identity<'a>, warnings:&'a [String] }
+#[derive(Debug, Clone, Serialize)]
+pub struct Stream { pub kind:String, pub file:String, pub rows:u64, pub bytes:u64 }
+#[derive(Serialize)]
+struct PayloadDescriptor { kind:&'static str, file:&'static str, bytes:u64 }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+struct Manifest<'a> {
+    protocol:&'static str, version:u64, analysis:&'a str, mode:&'a str, capture:Identity<'a>, args:&'a Value,
+    #[serde(skip_serializing_if="Option::is_none")] streams:Option<&'a [Stream]>,
+    #[serde(skip_serializing_if="Option::is_none")] payload:Option<PayloadDescriptor>, budget_version:u64,
+}
+pub struct AnalysisJob { pub folder:PathBuf, pub mode:String, pub analysis:String, pub args:Value, pub streams:Vec<Stream> }
+impl Drop for AnalysisJob {
+    fn drop(&mut self) {
+        for name in ["payload.json","dispatches.ndjson","intervals.ndjson","timeline.ndjson","result.ndjson","result.html"] { let _=fs::remove_file(self.folder.join(name)); }
+    }
+}
+fn finite(v:&[f64])->Result<(),String> {
+    if v.iter().all(|n|n.is_finite()) { Ok(()) } else { Err("MCP_ANALYSIS_RECORD_BUDGET: nonfinite analysis coordinates; use capture_export for offline inspection".into()) }
+}
+fn string(v:&str)->Result<(),String> {
+    if v.len() as u64 <= budget("stringBytes") { Ok(()) } else { Err(format!("MCP_ANALYSIS_RECORD_BUDGET: timeline input string exceeds {} UTF-8 bytes; export the capture for offline inspection",budget("stringBytes"))) }
+}
+pub fn overlaps(start:f64,end:f64,range:[f64;2])->bool {
+    if start==end { range[0]<=start && start<range[1] } else { start<range[1] && end>range[0] }
+}
+pub fn validate_analysis(c:&Capture,a:&Value,flag:&AtomicBool)->Result<Value,String> {
+    check(flag)?; AnalysisPlan::select(c,a)?;
+    if let Some(output)=a["output"].as_str() { crate::mcp::new_target(Path::new(output))?; }
+    let mut args=serde_json::Map::new();
+    if a["analysis"]=="timeline" {
+        let range=if a.get("range").is_some() { a["range"].as_array().ok_or("Choose a finite positive range")?.iter().map(|v|v.as_f64().ok_or("Choose a finite positive range")).collect::<Result<Vec<_>,_>>()? } else { vec![c.start,c.end] };
+        if range.len()!=2 || !range.iter().all(|v|v.is_finite()) || range[1]<=range[0] || !(range[1]-range[0]).is_finite() { return Err("Choose a finite positive range".into()); }
+        let count=|key:&str,default:u64,max:u64|->Result<u64,String> { let n=match a.get(key){None=>default,Some(v)=>v.as_u64().ok_or_else(||format!("Invalid {key}"))?}; let n=if n==0 {default}else{n}; if n>max {Err(format!("Choose 1–{max} {key}"))}else{Ok(n)} };
+        let file=a["output"].is_string(); let max=budget(if file{"fileBytes"}else{"inlineBytes"});
+        let bytes=match a.get("maxOutputBytes"){None=>max,Some(v)=>v.as_u64().ok_or("maxOutputBytes must be a positive integer")?};
+        if bytes==0 || bytes>max { return Err(format!("MCP_TIMELINE_BUDGET: maxOutputBytes must be 1..{max}; set output to a new HTML path for the file-output budget. limit does not limit timeline events.")); }
+        let timeline=a["timeline"].as_str().unwrap_or("dispatch"); if !["dispatch","global"].contains(&timeline) {return Err("Unknown timeline".into());}
+        args.insert("timeline".into(),json!(timeline)); args.insert("range".into(),json!(range));
+        args.insert("timePages".into(),json!(count("timePages",1,budget("timePages"))?)); args.insert("lanesPerPage".into(),json!(count("lanesPerPage",12,budget("lanesPerPage"))?));
+        args.insert("outputMode".into(),json!(if file{"file"}else{"inline"})); args.insert("maxOutputBytes".into(),json!(bytes));
+        args.insert("maxGlyphs".into(),json!(budget(if file{"fileGlyphs"}else{"inlineGlyphs"})));
+    } else if a.get("maxOutputBytes").is_some() { return Err("maxOutputBytes is valid only for timeline".into()); }
+    encoded_size(&ResponseContext{capture:Identity::new(c),warnings:&c.warnings},budget("contextBytes"),flag).map_err(|e|format!("MCP_ANALYSIS_CONTEXT_BUDGET: capture identity/clock/warnings exceed {} bytes ({e}); use capture_export for offline inspection",budget("contextBytes")))?;
+    Ok(Value::Object(args))
+}
+#[derive(Serialize)]
+struct KernelSample<'a> { kernel:&'a str, start:f64, end:f64 }
+#[derive(Serialize)]
+struct DispatchRecord<'a> { id:&'a str,kernel:&'a str,start:f64,end:f64,agent:&'a str,queue:&'a str,grid:&'a str,workgroup:&'a str }
+impl<'a> From<&'a Dispatch> for DispatchRecord<'a> {
+    fn from(d:&'a Dispatch)->Self { Self{id:&d.id,kernel:&d.kernel,start:d.start,end:d.end,agent:&d.agent,queue:&d.queue,grid:&d.grid,workgroup:&d.workgroup} }
+}
+#[derive(Serialize)]
+struct TimelineRecord<T:Serialize> { kind:&'static str,index:usize,record:T }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+struct MarkerRecord<'a> { start:f64,end:Option<f64>,point:bool,se:u32,cu:u32,simd:u32,slot:u32,depth:usize,name:&'a str,marker_id:u32,code_object:&'a str,source:&'a str }
+fn record_write<T:Serialize,W:Write>(record:&T,writer:&mut CappedWriter<'_,W>,index:usize,dataset:&str)->Result<u64,String> {
+    check(writer.flag)?;
+    let bytes=encoded_size(record,budget("recordBytes")-1,writer.flag).map_err(|e|format!("MCP_ANALYSIS_RECORD_BUDGET: {dataset} record {index} exceeds {} bytes ({e}); use positive-limit capture_query and nextOffset for offline inspection",budget("recordBytes")))?+1;
+    if bytes>writer.max.saturating_sub(writer.bytes) {return Err(format!("MCP_ANALYSIS_SPOOL_BUDGET: {dataset} exceeds {} total bytes; use offline paged queries or import a smaller capture",budget("spoolBytes")));}
+    serde_json::to_writer(&mut *writer,record).map_err(|e|e.to_string())?;
+    writer.write_all(b"\n").map_err(|e|e.to_string())?;
+    Ok(bytes)
+}
+fn kernel_stream<W:Write>(c:&Capture,intervals:bool,writer:&mut CappedWriter<'_,W>)->Result<u64,String> {
+    if intervals && c.intervals.len() as u64>budget("kernelIntervals") { return Err(format!("MCP_KERNEL_STATE_BUDGET: conservative transport preflight counts {} residency intervals, exceeding {} even if unmatched. limit/query do not reduce aggregate input. Use positive-limit capture_query on dispatches/intervals and nextOffset for offline exact aggregation; union intervals globally, never sum per-part unions. No partial totals were returned.",c.intervals.len(),budget("kernelIntervals"))); }
+    if intervals {
+        for (index,i) in c.intervals.iter().enumerate() { finite(&[i.start,i.end])?; record_write(&KernelSample{kernel:&i.kernel,start:i.start,end:i.end},writer,index,"intervals")?; }
+        Ok(c.intervals.len() as u64)
+    } else {
+        for (index,d) in c.dispatches.iter().enumerate() { finite(&[d.start,d.end])?; record_write(&KernelSample{kernel:&d.kernel,start:d.start,end:d.end},writer,index,"dispatches")?; }
+        Ok(c.dispatches.len() as u64)
+    }
+}
+fn timeline_stream<W:Write>(c:&Capture,args:&Value,writer:&mut CappedWriter<'_,W>)->Result<u64,String> {
+    let range=[args["range"][0].as_f64().unwrap(),args["range"][1].as_f64().unwrap()]; let mut rows=0;
+    if args["timeline"]=="global" {
+        for (index,i) in c.intervals.iter().enumerate() {
+            check(writer.flag)?; finite(&[i.start,i.end])?;
+            if overlaps(i.start,i.end,range) { string(&i.kernel)?; record_write(&TimelineRecord{kind:"residency",index,record:i},writer,index,"intervals")?; rows+=1; }
+        }
+        for (index,m) in c.markers.iter().enumerate() {
+            check(writer.flag)?; let end=if m.point {m.start}else{m.end.unwrap_or(c.end)}; finite(&[m.start,end])?;
+            if overlaps(m.start,end,range) {
+                for v in [&m.name,&m.code_object,&m.source] {string(v)?;}
+                let record=MarkerRecord{start:m.start,end:m.end,point:m.point,se:m.se,cu:m.cu,simd:m.simd,slot:m.slot,depth:m.depth,name:&m.name,marker_id:m.marker_id,code_object:&m.code_object,source:&m.source};
+                record_write(&TimelineRecord{kind:"marker",index,record},writer,index,"markers")?; rows+=1;
+            }
+        }
+    }
+    for (index,d) in c.dispatches.iter().enumerate() {
+        check(writer.flag)?; finite(&[d.start,d.end])?;
+        if d.end>d.start && overlaps(d.start,d.end,range) {
+            for v in [&d.id,&d.kernel,&d.agent,&d.queue,&d.grid,&d.workgroup] {string(v)?;}
+            record_write(&TimelineRecord{kind:"dispatch",index,record:DispatchRecord::from(d)},writer,index,"dispatches")?; rows+=1;
+        }
+    }
+    if args["timeline"]=="global" {
+        for (index,e) in c.decoder_events.iter().enumerate() {
+            check(writer.flag)?; finite(&[e.time])?;
+            if overlaps(e.time,e.time,range) {
+                for v in [&e.id,&e.kind] { string(v)?; }
+                for (k,v) in &e.fields {string(k)?;string(v)?;}
+                record_write(&TimelineRecord{kind:"event",index,record:e},writer,index,"events")?; rows+=1;
+            }
+        }
+    }
+    Ok(rows)
+}
+struct Projection<'a>{ c:&'a Capture, kind:&'a str }
+impl Serialize for Projection<'_> {
+    fn serialize<S:Serializer>(&self,s:S)->Result<S::Ok,S::Error> {
+        let c=self.c; let mut m=s.serialize_map(None)?;
+        match self.kind {
+            "occupancy"=>m.serialize_entry("intervals",&c.intervals)?,
+            "activity"=>{
+                #[derive(Serialize)] struct Activity{ idle:f64,stall:f64,latency:f64 }
+                struct Instructions<'a>(&'a [profile_core::Instruction]);
+                impl Serialize for Instructions<'_> {
+                    fn serialize<S:Serializer>(&self,s:S)->Result<S::Ok,S::Error>{let mut seq=s.serialize_seq(Some(self.0.len()))?; for i in self.0{seq.serialize_element(&Activity{idle:i.idle,stall:i.stall,latency:i.latency})?;}seq.end()}
+                }
+                m.serialize_entry("instructions",&Instructions(&c.instructions))?;
+            }
+            "hardware"=>{m.serialize_entry("architecture",&c.architecture)?;m.serialize_entry("counters",&c.counters)?;}
+            "hotspots"|"source"=>m.serialize_entry("instructions",&c.instructions)?,
+            "markers"=>{m.serialize_entry("markers",&c.markers)?;m.serialize_entry("start",&c.start)?;m.serialize_entry("end",&c.end)?;}
+            "scalar"=>m.serialize_entry("counters",&c.counters)?,
+            "tensor"=>{}, _=>return Err(serde::ser::Error::custom("Unknown projection")),
+        }
+        m.end()
+    }
+}
+struct ApplicableArgs<'a>{ args:&'a Value,kind:&'a str }
+impl Serialize for ApplicableArgs<'_> {
+    fn serialize<S:Serializer>(&self,s:S)->Result<S::Ok,S::Error>{
+        let mut m=s.serialize_map(None)?;m.serialize_entry("analysis",self.kind)?;
+        let keys:&[&str]=match self.kind{"occupancy"=>&["se","kernel"],"hotspots"|"source"=>&["metric"],"markers"=>&["range"],"scalar"=>&["name","formula"],"tensor"=>&["raw","definitions"],"diagnostics"=>&["workspace"],_=>&[]};
+        for k in keys{if let Some(v)=self.args.get(*k){m.serialize_entry(k,v)?;}}m.end()
+    }
+}
+#[derive(Serialize)] struct Payload<C:Serialize,A:Serialize>{capture:C,args:A}
+fn payload_write<W:Write>(c:&Capture,a:&Value,kind:&str,w:&mut W)->Result<(),String>{
+    let args=ApplicableArgs{args:a,kind};
+    if kind=="diagnostics"{serde_json::to_writer(w,&Payload{capture:c,args})}else{serde_json::to_writer(w,&Payload{capture:Projection{c,kind},args})}.map_err(|e|e.to_string())
+}
+pub fn prepare_analysis(c:&Capture,a:&Value,flag:&AtomicBool,folder:&Path)->Result<AnalysisJob,String> {
+    let args=validate_analysis(c,a,flag)?; let plan=AnalysisPlan::select(c,a)?;
+    let identity=Identity::new(c); identity.validate()?;
+    let (mode,analysis)=match &plan{AnalysisPlan::Kernels(_)=>("kernel-stream","kernels"),AnalysisPlan::Timeline(_)=>("timeline-stream","timeline"),AnalysisPlan::Projected(_,k)=>("projected-json",*k),AnalysisPlan::DiagnosticsCompatibility(_)=>("diagnostics-compatibility","diagnostics")};
+    let mut job=AnalysisJob{folder:folder.into(),mode:mode.into(),analysis:analysis.into(),args,streams:vec![]};
+    let mut descriptors=vec![];
+    match plan {
+        AnalysisPlan::Kernels(c)|AnalysisPlan::Timeline(c)=>{
+            let files:&[(&str,&str)]=if analysis=="kernels"{&[("kernel-dispatch","dispatches.ndjson"),("kernel-interval","intervals.ndjson")]}else{&[("timeline-record","timeline.ndjson")]};
+            let mut total=0;
+            for (kind,file) in files {
+                let mut w=CappedWriter{inner:io::sink(),bytes:0,max:budget("spoolBytes")-total,flag};
+                let rows=if analysis=="kernels"{kernel_stream(c,*kind=="kernel-interval",&mut w)?}else{timeline_stream(c,&job.args,&mut w)?};
+                total+=w.bytes;descriptors.push(Stream{kind:(*kind).into(),file:(*file).into(),rows,bytes:w.bytes});
+            }
+            total=0;
+            for d in &descriptors {
+                let f=fs::OpenOptions::new().write(true).create_new(true).open(folder.join(&d.file)).map_err(|e|e.to_string())?;
+                let mut w=CappedWriter{inner:BufWriter::new(f),bytes:0,max:budget("spoolBytes")-total,flag};
+                let rows=if analysis=="kernels"{kernel_stream(c,d.kind=="kernel-interval",&mut w)?}else{timeline_stream(c,&job.args,&mut w)?};
+                w.flush().map_err(|e|e.to_string())?;
+                if w.bytes!=d.bytes || rows!=d.rows{return Err("Analysis spool accounting mismatch".into());}total+=w.bytes;
+            }
+        }
+        AnalysisPlan::Projected(c,_)|AnalysisPlan::DiagnosticsCompatibility(c)=>{
+            let mut count=CappedWriter{inner:io::sink(),bytes:0,max:budget("projectedBytes"),flag};
+            payload_write(c,a,analysis,&mut count).map_err(|e|format!("MCP_ANALYSIS_INPUT_BUDGET: {analysis} projected input exceeds {} bytes ({e}); this analysis still requires its complete relevant dataset. Use positive-limit capture_query and nextOffset for offline analysis, or capture_export for diagnostics. Changing ROCPROF_MAX_FILE_MIB does not change this budget.",budget("projectedBytes")))?;
+            let f=fs::OpenOptions::new().write(true).create_new(true).open(folder.join("payload.json")).map_err(|e|e.to_string())?;
+            let mut w=CappedWriter{inner:BufWriter::new(f),bytes:0,max:budget("projectedBytes"),flag};payload_write(c,a,analysis,&mut w)?;w.flush().map_err(|e|e.to_string())?;
+            descriptors.push(Stream{kind:"payload".into(),file:"payload.json".into(),rows:0,bytes:w.bytes});
+        }
+    }
+    let manifest=Manifest{protocol:"rocprof-studio-analysis",version:protocol()["version"].as_u64().unwrap(),analysis,mode,capture:identity,args:&job.args,
+        streams:if analysis=="kernels"||analysis=="timeline"{Some(&descriptors)}else{None},payload:if analysis=="kernels"||analysis=="timeline"{None}else{Some(PayloadDescriptor{kind:"payload",file:"payload.json",bytes:descriptors[0].bytes})},budget_version:protocol()["budgetVersion"].as_u64().unwrap()};
+    encoded_size(&manifest,budget("manifestBytes"),flag)?;
+    let f=fs::OpenOptions::new().write(true).create_new(true).open(folder.join("input.json")).map_err(|e|e.to_string())?;
+    let mut w=CappedWriter{inner:BufWriter::new(f),bytes:0,max:budget("manifestBytes"),flag};serde_json::to_writer(&mut w,&manifest).map_err(|e|e.to_string())?;w.flush().map_err(|e|e.to_string())?;
+    job.streams=descriptors;Ok(job)
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    pub fn capture()->Capture {
+        let mut c=Capture::empty("synthetic.csv".into(),"rocprofv3 CSV","ns");
+        c.dispatches.push(Dispatch{id:"d".into(),kernel:"a".into(),start:1.,end:2.,agent:"0".into(),queue:"1".into(),grid:"64".into(),workgroup:"32".into(),shader_engine:None,vgpr:None,sgpr:None,lds:None,scratch:None});c.end=100.;c
+    }
+    #[test]
+    fn mcp_actual_bundle_projected_handshake_and_wrong_version() {
+        let dir=tempfile::tempdir().unwrap();let c=capture();let flag=AtomicBool::new(false);
+        let job=prepare_analysis(&c,&json!({"analysis":"activity"}),&flag,dir.path()).unwrap();
+        fs::write(dir.path().join("analysis.cjs"),include_str!(concat!(env!("OUT_DIR"),"/mcp-analysis.cjs"))).unwrap();
+        let run=||std::process::Command::new("node").arg(dir.path().join("analysis.cjs")).arg(dir.path().join("input.json")).output().unwrap();
+        let output=run();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));assert_eq!(output.stdout,b"null");
+        let mut manifest:Value=serde_json::from_slice(&fs::read(dir.path().join("input.json")).unwrap()).unwrap();manifest["version"]=json!(99);fs::write(dir.path().join("input.json"),manifest.to_string()).unwrap();
+        let output=run();assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("rebuild the rocprof-studio binary and bundled analysis worker together"));
+        drop(job);assert!(!dir.path().join("payload.json").exists());
+    }
+    #[test]
+    fn mcp_irrelevant_257_mib_metadata_does_not_enter_optimized_spools() {
+        let mut c=capture();let flag=AtomicBool::new(false);
+        for analysis in ["kernels","timeline"] {
+            let dir=tempfile::tempdir().unwrap();let a=json!({"analysis":analysis,"range":[0,3]});
+            let small=prepare_analysis(&c,&a,&flag,dir.path()).unwrap();let descriptors=serde_json::to_value(&small.streams).unwrap();let manifest=fs::read(dir.path().join("input.json")).unwrap();drop(small);fs::remove_file(dir.path().join("input.json")).unwrap();
+            c.metadata.insert("irrelevant".into(),"sentinel".repeat(257*1024*1024/8+1));
+            let large=prepare_analysis(&c,&a,&flag,dir.path()).unwrap();assert_eq!(serde_json::to_value(&large.streams).unwrap(),descriptors);assert_eq!(fs::read(dir.path().join("input.json")).unwrap(),manifest);
+            for d in &large.streams {assert_eq!(fs::metadata(dir.path().join(&d.file)).unwrap().len(),d.bytes);assert!(!fs::read_to_string(dir.path().join(&d.file)).unwrap().contains("sentinel"));}
+            drop(large);c.metadata.clear();
+        }
+    }
+    #[test]
+    fn mcp_narrow_range_retains_original_ordinals_and_half_open_points() {
+        let dir=tempfile::tempdir().unwrap();let mut c=capture();let flag=AtomicBool::new(false);
+        c.dispatches=(0..527878).map(|index|Dispatch{id:index.to_string(),start:index as f64,end:index as f64+0.5,..c.dispatches[0].clone()}).collect();
+        for time in [100.,105.,110.] {c.decoder_events.push(profile_core::DecoderEvent{id:time.to_string(),time,se:0,kind:"dispatch".into(),fields:BTreeMap::new()});}
+        let job=prepare_analysis(&c,&json!({"analysis":"timeline","timeline":"global","range":[100,110]}),&flag,dir.path()).unwrap();
+        assert_eq!(job.streams[0].rows,12);
+        let lines=fs::read_to_string(dir.path().join("timeline.ndjson")).unwrap();let rows:Vec<Value>=lines.lines().map(|l|serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows[0]["index"],100);assert_eq!(rows[9]["index"],109);assert_eq!(rows[10]["record"]["time"],100.0);assert_eq!(rows[11]["record"]["time"],105.0);
+        assert!(overlaps(105.,105.,[105.,110.]));assert!(!overlaps(105.,105.,[100.,105.]));
+    }
+}
+
+use std::io::{BufRead, BufReader, Read};
+pub struct NdjsonRows<'a> { reader:BufReader<fs::File>, flag:&'a AtomicBool, rows:u64, bytes:u64, expected_rows:u64, expected_bytes:u64, done:bool }
+impl<'a> NdjsonRows<'a> {
+    pub fn new(path:&Path,rows:u64,bytes:u64,flag:&'a AtomicBool)->Result<Self,String>{
+        let meta=fs::symlink_metadata(path).map_err(|e|e.to_string())?;
+        if !meta.is_file() || meta.len()!=bytes || bytes>budget("kernelResultBytes") {return Err("Invalid kernel result size/type".into());}
+        Ok(Self{reader:BufReader::with_capacity(budget("readBufferBytes") as usize,fs::File::open(path).map_err(|e|e.to_string())?),flag,rows:0,bytes:0,expected_rows:rows,expected_bytes:bytes,done:false})
+    }
+    fn read_row(&mut self)->Result<Option<Value>,String>{
+        check(self.flag)?;let mut line=Vec::new();
+        loop {
+            check(self.flag)?;
+            let buffer=self.reader.fill_buf().map_err(|e|e.to_string())?;
+            if buffer.is_empty(){
+                if !line.is_empty(){return Err("Truncated kernel result record".into());}
+                if self.rows!=self.expected_rows || self.bytes!=self.expected_bytes{return Err("Kernel result count/byte mismatch".into());}
+                return Ok(None);
+            }
+            let len=buffer.iter().position(|b|*b==b'\n').map_or(buffer.len(),|i|i+1);let newline=buffer[len-1]==b'\n';
+            if line.len()+len>budget("recordBytes") as usize{return Err("MCP_ANALYSIS_RECORD_BUDGET: kernel result row too large".into());}
+            line.extend_from_slice(&buffer[..len]);self.bytes+=len as u64;self.reader.consume(len);
+            if newline{break;}
+        }
+        self.rows+=1;if self.rows>self.expected_rows{return Err("Kernel result row count mismatch".into());}
+        let value:Value=serde_json::from_slice(&line).map_err(|e|e.to_string())?;
+        let object=value.as_object().ok_or("Invalid kernel result row")?;
+        let keys=["name","count","total","min","max","waves","waveTime","activeTime"];
+        if object.len()!=keys.len() || keys.iter().any(|k|!object.contains_key(*k)) || !value["name"].is_string() || !value["count"].is_number() || !value["waves"].is_number() || keys[2..].iter().any(|k|!value[*k].is_number() && !value[*k].is_null()) {return Err("Invalid kernel result fields".into());}
+        Ok(Some(value))
+    }
+}
+impl Iterator for NdjsonRows<'_>{type Item=Result<Value,String>;fn next(&mut self)->Option<Self::Item>{if self.done{return None;}match self.read_row(){Ok(Some(row))=>Some(Ok(row)),Ok(None)=>{self.done=true;None},Err(e)=>{self.done=true;Some(Err(e))}}}}
+pub fn read_receipt(job:&AnalysisJob,flag:&AtomicBool)->Result<Value,String>{
+    check(flag)?;let log=job.folder.join("stdout.log");if fs::metadata(&log).map_err(|e|e.to_string())?.len()>budget("receiptBytes"){return Err("Analysis receipt exceeds 64 KiB".into());}
+    let v:Value=serde_json::from_slice(&fs::read(log).map_err(|e|e.to_string())?).map_err(|e|format!("Invalid analysis receipt: {e}"))?;
+    if v["protocol"]!=protocol()["protocol"] || v["version"]!=protocol()["version"] {return Err("Analysis worker protocol mismatch; rebuild the rocprof-studio binary and bundled analysis worker together.".into());}
+    if job.mode=="kernel-stream" {
+        let fields=["protocol","version","kind","file","rows","bytes"];
+        let o=v.as_object().ok_or("Invalid kernel receipt")?;
+        if o.len()!=fields.len() || fields.iter().any(|k|!o.contains_key(*k)) || v["kind"]!="kernel-rows" || v["file"]!="result.ndjson" || v["rows"].as_u64().is_none_or(|n|n>budget("kernelGroups")) || v["bytes"].as_u64().is_none_or(|n|n>budget("kernelResultBytes")) {return Err("Invalid kernel receipt fields".into());}
+        let _=NdjsonRows::new(&job.folder.join("result.ndjson"),v["rows"].as_u64().unwrap(),v["bytes"].as_u64().unwrap(),flag)?;
+    }
+    Ok(v)
+}
+pub fn kernel_metadata(c:&Capture)->Value {
+    json!({"analysis":"kernels","scope":"full-capture","clock":{"unit":c.unit,"origin":c.origin,"start":c.start,"end":c.end},"coverage":"recorded-data-only; replay completeness unknown","denominators":{"total":"summed recorded dispatch durations; overlaps counted","waveTime":"summed recorded matching residency lifetimes; overlaps counted","activeTime":"union of recorded matching residency lifetimes per kernel"},"availability":{"recordedDispatches":c.dispatches.len(),"recordedIntervals":c.intervals.len(),"residency":if c.intervals.is_empty(){"not-recorded"}else{"recorded"},"zeroQualification":"Zero residency fields mean no matching recorded evidence, not measured absence of GPU work","dispatchDuration":if c.unit=="cycles"{"unavailable: SQTT dispatch events have no dispatch end timestamp"}else{"recorded dispatch intervals; not native application wall time"}},"warnings":c.warnings,"budgets":{"kernelGroups":budget("kernelGroups"),"kernelIntervals":budget("kernelIntervals")}})
+}
+pub fn kernel_result(c:&Capture,a:&Value,job:&AnalysisJob,flag:&AtomicBool)->Result<Value,String>{
+    let receipt=read_receipt(job,flag)?;
+    let rows=NdjsonRows::new(&job.folder.join("result.ndjson"),receipt["rows"].as_u64().unwrap(),receipt["bytes"].as_u64().unwrap(),flag)?;
+    let meta=kernel_metadata(c);
+    if let Some(output)=a["output"].as_str(){
+        let path=Path::new(output);let mut temp=tempfile::NamedTempFile::new_in(path.parent().ok_or("Missing output directory")?).map_err(|e|e.to_string())?;
+        temp.write_all(b"[").map_err(|e|e.to_string())?;
+        for (i,row) in rows.enumerate(){check(flag)?;let row=row?;if i>0{temp.write_all(b",").map_err(|e|e.to_string())?;}serde_json::to_writer(&mut temp,&row).map_err(|e|e.to_string())?;}
+        temp.write_all(b"]").map_err(|e|e.to_string())?;temp.as_file().sync_all().map_err(|e|e.to_string())?;check(flag)?;
+        temp.persist_noclobber(path).map_err(|e|e.to_string())?;return Ok(json!({"path":output,"analysisMeta":meta}));
+    }
+    let mut page=page_fallible_rows(rows,&PageArgs::parse(a),flag,"kernel aggregates")?;page["analysisMeta"]=meta;Ok(page)
+}

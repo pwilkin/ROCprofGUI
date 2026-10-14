@@ -2083,7 +2083,7 @@ fn range(v: &Value) -> Result<[f64; 2], String> {
     }
     Ok(r)
 }
-fn new_target(p: &Path) -> Result<(), String> {
+pub(crate) fn new_target(p: &Path) -> Result<(), String> {
     if p.exists() {
         Err("Output already exists; choose a new path".into())
     } else {

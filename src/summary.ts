@@ -11,7 +11,7 @@ export interface ActivityCost {
   total: number;
 }
 function* activityCostSteps(
-  instructions: readonly Instruction[],
+  instructions: readonly Pick<Instruction, "idle" | "stall" | "latency">[],
 ): Generator<void, ActivityCost | null> {
   let idle = 0,
     stall = 0,
@@ -37,7 +37,7 @@ function* activityCostSteps(
 }
 
 
-export function activityCost(instructions: readonly Instruction[]): ActivityCost | null {
+export function activityCost(instructions: readonly Pick<Instruction, "idle" | "stall" | "latency">[]): ActivityCost | null {
   const steps = activityCostSteps(instructions);
   for (;;) {
     const step = steps.next();
@@ -46,7 +46,7 @@ export function activityCost(instructions: readonly Instruction[]): ActivityCost
 }
 
 export async function requestActivityCost(
-  instructions: readonly Instruction[],
+  instructions: readonly Pick<Instruction, "idle" | "stall" | "latency">[],
   signal: AbortSignal,
   yieldTask: () => Promise<void> = () =>
     new Promise((resolve) => setTimeout(resolve, 0)),

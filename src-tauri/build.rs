@@ -12,7 +12,8 @@ fn main() {
         .status()
         .expect("Node.js is required to bundle shared MCP analysis");
     assert!(status.success(), "MCP analysis bundling failed");
-    println!("cargo:rerun-if-changed=../scripts/mcp-analysis.ts");
+    println!("cargo:rerun-if-changed=../scripts");
+    println!("cargo:rerun-if-changed=../src/mcpAnalysisProtocol.json");
     println!("cargo:rerun-if-changed=../scripts/build-mcp-analysis.mjs");
     println!("cargo:rerun-if-changed=../src");
     tauri_build::build();

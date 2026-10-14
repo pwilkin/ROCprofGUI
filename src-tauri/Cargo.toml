@@ -15,6 +15,7 @@ tauri-plugin-dialog = "2"
 profile-core = { path = "../crates/profile-core" }
 tiny_http = "0.12"
 libc = "0.2"
+tempfile = "3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
