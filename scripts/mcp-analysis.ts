@@ -10,13 +10,15 @@ import { Tensor, tensorDefinitions, withTensorBudget } from "../src/tensor";
 import type { Capture, Instruction, Range, Series, MarkerScope } from "../src/types";
 import { budgets, readBoundedJson, validateManifest } from "./mcp-analysis-transport";
 
+import { timelineAnalysis } from "./mcp-analysis-timeline";
 import { kernelAnalysis } from "./mcp-analysis-kernels";
 
 async function main() {
   const manifest = validateManifest(readBoundedJson(process.argv[2], budgets.manifestBytes));
   const folder = dirname(process.argv[2]);
   if (manifest.mode === "kernel-stream") { process.stdout.write(JSON.stringify(await kernelAnalysis(folder, manifest))); return; }
-  if (!manifest.payload) throw Error("Timeline streaming mode is not yet connected");
+  if (manifest.mode === "timeline-stream") { process.stdout.write(JSON.stringify(await timelineAnalysis(folder, manifest))); return; }
+  if (!manifest.payload) throw Error("Missing projected payload");
   const path = join(folder, manifest.payload.file);
   if (statSync(path).size !== manifest.payload.bytes) throw Error("Analysis payload byte count mismatch");
   const { capture: c, args: a } = readBoundedJson(path, budgets.projectedBytes);

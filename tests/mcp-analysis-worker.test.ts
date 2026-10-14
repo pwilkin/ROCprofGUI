@@ -60,3 +60,16 @@ it("actual bundle rejects record/version/path/count defects without a success re
     const result = run(folder, m); expect(result.status).not.toBe(0); expect(result.stdout).toBe("");
   }
 });
+
+it("maximal retained interval state succeeds with the unchanged production 1024 MiB setting", () => {
+  const folder = mkdtempSync(join(root, "intervals-"));
+  writeFileSync(join(folder, "dispatches.ndjson"), '{"kernel":"a","start":0,"end":1}\n');
+  writeFileSync(join(folder, "intervals.ndjson"), "");
+  const line = '{"kernel":"a","start":0,"end":1}\n', block = line.repeat(4096);
+  let count = 0;
+  while (count + 4096 <= protocol.budgets.kernelIntervals) { appendFileSync(join(folder, "intervals.ndjson"), block); count += 4096; }
+  appendFileSync(join(folder, "intervals.ndjson"), line.repeat(protocol.budgets.kernelIntervals - count));
+  const result = run(folder, manifest(folder, 1, protocol.budgets.kernelIntervals), 1024);
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(readFileSync(join(folder, "result.ndjson"), "utf8"))).toEqual({ name: "a", count: 1, total: 1, min: 1, max: 1, waves: 2000000, waveTime: 2000000, activeTime: 1 });
+}, 120000);

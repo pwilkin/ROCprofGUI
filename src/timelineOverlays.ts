@@ -1,3 +1,4 @@
+import { drawnRecordBudgetError } from "./timelineExportBudget";
 import type { Mark } from "./components/Plots";
 import type { Range } from "./types";
 import type { TimelineGlyph } from "./timelineDetail";
@@ -7,6 +8,7 @@ export function timelineOverlays(
   range: Range,
   width: number,
   laneHeight: number,
+  maxGlyphs = Infinity,
 ): TimelineGlyph[] {
   if (width <= 169 || range[1] <= range[0]) return [];
   const laneEngines = new Map<string, number>();
@@ -51,7 +53,8 @@ export function timelineOverlays(
           size / 2,
       ),
     );
-    for (const row of rows)
+    for (const row of rows) {
+      if (result.length >= maxGlyphs) throw drawnRecordBudgetError(maxGlyphs);
       result.push({
         mark,
         rect: {
@@ -61,6 +64,7 @@ export function timelineOverlays(
           height: (row.end - row.start) * laneHeight,
         },
       });
+    }
   }
   return result;
 }

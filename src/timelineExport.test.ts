@@ -186,3 +186,36 @@ it("does not subdivide unrelated query failures", async () => {
     expect(loads).toBe(1);
   }
 });
+
+it("bisects typed window budgets while assigning boundary points once", async () => {
+  const { TimelineWindowBudgetError } = await import("./timelineExportBudget");
+  const { overlaps } = await import("../scripts/mcp-analysis-transport");
+  const marks = [0, 5, 10].map((start, i) => ({ start, end: start, lane: "events", color: "#abc", label: "point", key: `point:${i}` }));
+  let html = "", complete: any;
+  await timelineDocument({ label: "points", unit: "ns", bounds: [0, 10], timePages: 1, lanesPerPage: 12, stacked: true, signal: new AbortController().signal,
+    load: async range => { if (range[1] - range[0] > 5) throw new TimelineWindowBudgetError("density"); return marks.filter(m => overlaps(m.start, m.end, range)); },
+    writeChunk: async text => { html += text; }, onComplete: stats => { complete = stats; },
+  });
+  expect(html.match(/data-key="point:0"/g)).toHaveLength(1);
+  expect(html.match(/data-key="point:1"/g)).toHaveLength(1);
+  expect(html).not.toContain('data-key="point:2"'); expect(complete.segments).toBe(2);
+});
+it("streams more than 16 MiB with bounded chunks and refuses lowered or inline budgets", async () => {
+  const marks = Array.from({ length: 10000 }, (_, i) => ({ start: i, end: i + 0.5, lane: "Q0", color: "#abc", label: "λ".repeat(900), key: `d:${i}` }));
+  let bytes = 0, maximum = 0, tail = "", complete: any;
+  const options = { label: "large", unit: "ns", bounds: [0, 10000] as [number, number], timePages: 1, lanesPerPage: 12, stacked: true, signal: new AbortController().signal, load: async () => marks };
+  await timelineDocument({ ...options, writeChunk: async text => { const n = new TextEncoder().encode(text).length; bytes += n; maximum = Math.max(maximum, n); tail = text.slice(-14); }, onComplete: stats => { complete = stats; } });
+  expect(bytes).toBeGreaterThan(16 * 1024 * 1024); expect(maximum).toBeLessThanOrEqual(1024 * 1024); expect(tail).toBe("</body></html>"); expect(complete.bytes).toBe(bytes); expect(complete.glyphs).toBe(10000);
+  await expect(timelineDocument({ ...options, limits: { maxBytes: 16 * 1024 * 1024 }, writeChunk: async () => {} })).rejects.toThrow("16777216 bytes");
+  let accepted = 0;
+  await expect(timelineDocument({ ...options, limits: { maxBytes: 1000 }, writeChunk: async text => { accepted += text.length; } })).rejects.toThrow("1000 bytes"); expect(accepted).toBeLessThanOrEqual(1000);
+});
+it("glyph admission bounds overlay expansion and selected/bucket insertion", async () => {
+  const { timelineGlyphs } = await import("./timelineDetail"), { timelineOverlays } = await import("./timelineOverlays");
+  const lanes = Array.from({ length: 24 }, (_, i) => `SE${i % 2}-${i}`);
+  const marks = lanes.map((lane, i) => ({ start: 0, end: 5, lane, color: "#abc", label: "r", key: lane, recordKind: "residency" as const, shaderEngine: i % 2 }));
+  const event = { start: 2, end: 2, lane: "event", color: "#abc", label: "e", key: "event", recordKind: "event" as const, shaderEngine: 0, overlayWidth: 5 };
+  expect(timelineOverlays([...marks, event], lanes, [0, 5], 1100, 28, 12)).toHaveLength(12);
+  expect(() => timelineOverlays([...marks, event, event], lanes, [0, 5], 1100, 28, 12)).toThrow("drawn records");
+  for (const detail of [0, 2]) expect(() => timelineGlyphs(marks.map((m, i) => ({ ...m, selected: i % 2 === 0 })), lanes, [0, 5], 1100, 28, true, detail, undefined, 3)).toThrow("drawn records");
+});

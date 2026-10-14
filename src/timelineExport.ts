@@ -3,6 +3,10 @@ import type { Range } from "./types";
 import { timelineGlyphs } from "./timelineDetail";
 import { timelineOverlays } from "./timelineOverlays";
 import { isWaveDetailBudgetError } from "./waveOverview";
+import { isTimelineWindowBudgetError, drawnRecordBudgetError } from "./timelineExportBudget";
+import protocol from "./mcpAnalysisProtocol.json";
+export const timelineExportMaxima = protocol.budgets;
+export interface TimelineExportStats { bytes: number; pages: number; segments: number; glyphs: number; budgets: { maxBytes: number; maxGlyphs: number; chunkBytes: number; pages: number; segments: number } }
 const escape = (value: unknown) =>
   String(value).replace(
     /[&<>"']/g,
@@ -46,6 +50,9 @@ export async function timelineDocument(options: {
   signal: AbortSignal;
   progress?: (message: string) => void;
   writeChunk?: (text: string) => Promise<void>;
+  limits?: { maxBytes?: number; maxGlyphs?: number };
+  onComplete?: (stats: TimelineExportStats) => void;
+  contextNote?: string;
 }): Promise<Blob> {
   const {
     label,
@@ -64,7 +71,13 @@ export async function timelineDocument(options: {
   const chunks: string[] = [];
   const encoder = new TextEncoder();
   let bufferedBytes = 0;
-  const maxBytes = (writeChunk ? 512 : 16) * 1024 * 1024;
+  const maxima = protocol.budgets;
+  const byteCeiling = writeChunk ? maxima.fileBytes : maxima.inlineBytes;
+  const glyphCeiling = writeChunk ? maxima.fileGlyphs : maxima.inlineGlyphs;
+  const maxBytes = options.limits?.maxBytes ?? byteCeiling;
+  const maxGlyphs = options.limits?.maxGlyphs ?? glyphCeiling;
+  const byteDescription = options.limits?.maxBytes === undefined ? `${writeChunk ? 512 : 16} MiB` : `${maxBytes} bytes`;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > byteCeiling || !Number.isSafeInteger(maxGlyphs) || maxGlyphs < 1 || maxGlyphs > glyphCeiling) throw Error("Timeline limits may only lower the output mode maxima");
   const flush = async () => {
     if (writeChunk && chunks.length) {
       check();
@@ -79,12 +92,13 @@ export async function timelineDocument(options: {
     glyphCount = 0;
   const append = (text: string) => {
     const size = encoder.encode(text).length;
+    if (bytes + size > maxBytes) throw Error(`Timeline export exceeds ${byteDescription}; export a smaller time range`);
     bytes += size;
     bufferedBytes += size;
     if (writeChunk && bufferedBytes > 1024 * 1024) throw Error("Timeline export chunk exceeds 1 MiB; shorten event labels");
     if (bytes > maxBytes)
       throw Error(
-        `Timeline export exceeds ${writeChunk ? 512 : 16} MiB; export a smaller time range`,
+        `Timeline export exceeds ${byteDescription}; export a smaller time range`,
       );
     chunks.push(text);
   };
@@ -109,7 +123,7 @@ export async function timelineDocument(options: {
     try { input = await load(window, signal); }
     catch (error) {
       check();
-      if (writeChunk && isWaveDetailBudgetError(error)) { split(); continue; }
+      if (writeChunk && (isWaveDetailBudgetError(error) || isTimelineWindowBudgetError(error))) { split(); continue; }
       throw error;
     }
     check();
@@ -140,23 +154,24 @@ export async function timelineDocument(options: {
         );
       const group = lanes.slice(row, row + lanesPerPage),
         height = 42 + Math.max(1, group.length) * 28;
-      const glyphs = [
-        ...timelineGlyphs(marks, group, window, 1100, 28, stacked, 0),
-        ...timelineOverlays(marks, group, window, 1100, 28),
-      ];
-      glyphCount += glyphs.length;
-      if (glyphCount > (writeChunk ? 2000000 : 100000))
-        throw Error(
-          `Timeline export exceeds ${writeChunk ? "2,000,000" : "100,000"} drawn records; export a smaller range`,
-        );
+      let glyphs, overlays;
+      try {
+        glyphs = timelineGlyphs(marks, group, window, 1100, 28, stacked, 0, undefined, maxGlyphs - glyphCount);
+        overlays = timelineOverlays(marks, group, window, 1100, 28, maxGlyphs - glyphCount - glyphs.length);
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("drawn records")) throw drawnRecordBudgetError(maxGlyphs);
+        throw error;
+      }
+      glyphCount += glyphs.length + overlays.length;
       append(
         `<section data-page="${pages}" data-start="${window[0]}" data-end="${window[1]}"><h1>${escape(label)}</h1><p>Page ${pages} · time segment ${t + 1}${writeChunk ? "" : `/${timePages}`} · ${window[0]}–${window[1]} ${escape(unit)} · lanes ${lanes.length ? row + 1 : 0}–${Math.min(row + lanesPerPage, lanes.length)} of ${lanes.length} · exact geometry, no aggregation · ${stacked ? "stacked" : "flat"}</p><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 ${height}" role="img" aria-label="Timeline page ${pages}">`,
       );
-      group.forEach((lane, i) =>
+      for (const [i, lane] of group.entries()) {
         append(
           `<rect x="0" y="${27 + i * 28}" width="1100" height="28" fill="${i % 2 ? "#f0f3f6" : "#ffffff"}"/><text x="4" y="${45 + i * 28}" font-size="10" fill="#18212f"${lane.length > 24 ? ' textLength="145" lengthAdjust="spacingAndGlyphs"' : ""}><title>${escape(lane)}</title>${escape(lane)}</text>`,
-        ),
-      );
+        );
+        if (writeChunk) await flush();
+      }
       for (let tick = 0; tick <= 5; tick++) {
         const x = 155 + (tick * 931) / 5;
         append(
@@ -164,7 +179,7 @@ export async function timelineDocument(options: {
         );
       }
       await flush();
-      for (const { mark, rect } of glyphs) {
+      for (const array of [glyphs, overlays]) for (const { mark, rect } of array) {
         const color = /^#[0-9a-f]{3,8}$/i.test(mark.color)
           ? mark.color
           : "#538aad";
@@ -182,7 +197,9 @@ export async function timelineDocument(options: {
     }
   }
   check();
+  if (options.contextNote) append(`<p>${escape(options.contextNote)}</p>`);
   append("</body></html>");
   await flush();
+  options.onComplete?.({ bytes, pages, segments: windows.length, glyphs: glyphCount, budgets: { maxBytes, maxGlyphs, chunkBytes: maxima.chunkBytes, pages: maxima.pages, segments: maxima.segments } });
   return new Blob(chunks, { type: "text/html;charset=utf-8" });
 }

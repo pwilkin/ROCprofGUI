@@ -29,3 +29,20 @@ it("rejects malformed records and protocol fields without subdivision", () => {
   expect(overlaps(2, 8, [0, 5])).toBe(true);
   expect(overlaps(2, 8, [5, 10])).toBe(true);
 });
+
+it("timeline loading bounds retention, preserves ordinals and never splits malformed data", async () => {
+  const { loadTimelineWindow } = await import("../scripts/mcp-analysis-timeline");
+  const { TimelineWindowBudgetError } = await import("../src/timelineExportBudget");
+  const d = directory();
+  const record = (index: number, start: number) => ({ kind: "dispatch", index, record: { id: String(index), kernel: "λ", start, end: start + 0.5, agent: "0", queue: "1", grid: "64", workgroup: "32" } });
+  const records = [record(2, -1), record(17, 5), record(100, 6)];
+  const text = records.map(r => JSON.stringify(r) + "\n").join(""); writeFileSync(join(d, "timeline.ndjson"), text);
+  const m = validateManifest({ protocol: protocol.protocol, version: 2, budgetVersion: 2, analysis: "timeline", mode: "timeline-stream", capture: { id: "c", name: "c", format: "CSV", architecture: "gfx1151", unit: "ns", origin: "0", start: -2, end: 10 }, args: { timeline: "dispatch", range: [-2, 10], timePages: 1, lanesPerPage: 12, outputMode: "inline", maxOutputBytes: protocol.budgets.inlineBytes, maxGlyphs: protocol.budgets.inlineGlyphs }, streams: [{ kind: "timeline-record", file: "timeline.ndjson", rows: 3, bytes: Buffer.byteLength(text) }] });
+  const stats = { marks: 0, bytes: 0 };
+  const marks = loadTimelineWindow(d, m, [5, 7], { marks: 2, bytes: 10000 }, stats);
+  expect(marks.map(m => m.key)).toEqual(["dispatch:17", "dispatch:100"]); expect(stats.marks).toBe(2);
+  expect(() => loadTimelineWindow(d, m, [-2, 10], { marks: 2, bytes: 10000 }, stats)).toThrow(TimelineWindowBudgetError); expect(stats.marks).toBe(2);
+  expect(() => loadTimelineWindow(d, m, [-2, 10], { marks: 2, bytes: 5 })).toThrow("single generated mark");
+  records[0].index = -1; const invalid = records.map(r => JSON.stringify(r) + "\n").join(""); writeFileSync(join(d, "timeline.ndjson"), invalid); m.streams![0].bytes = Buffer.byteLength(invalid);
+  expect(() => loadTimelineWindow(d, m, [5, 7])).toThrow("nonnegative");
+});

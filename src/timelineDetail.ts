@@ -1,3 +1,4 @@
+import { drawnRecordBudgetError } from "./timelineExportBudget";
 import { timelineRect, type Rect, type MipGeometry } from "./timelineLayout";
 import type { Mark } from "./components/Plots";
 import type { Range } from "./types";
@@ -14,11 +15,13 @@ export function timelineGlyphs(
   stacked: boolean,
   detailPixels: number,
   mip?: MipGeometry,
+  maxGlyphs = Infinity,
 ): TimelineGlyph[] {
   const rows = new Map(lanes.map((lane, index) => [lane, index]));
   const glyphs: TimelineGlyph[] = [],
     selected: TimelineGlyph[] = [];
   const buckets = new Map<string, TimelineGlyph>();
+  const admit = () => { if (glyphs.length + selected.length >= maxGlyphs) throw drawnRecordBudgetError(maxGlyphs); };
   for (const mark of marks) {
     const row = rows.get(mark.lane);
     if (row === undefined) continue;
@@ -35,16 +38,19 @@ export function timelineGlyphs(
     );
     if (!rect || rect.width <= 0) continue;
     if (!detailPixels) {
+      admit();
       glyphs.push({ mark, rect });
       continue;
     }
     if (mark.selected) {
+      admit();
       selected.push({ mark, rect });
       continue;
     }
     const projected =
       ((mark.end - mark.start) / (range[1] - range[0])) * (width - 169);
     if (projected > detailPixels) {
+      admit();
       glyphs.push({ mark, rect });
       continue;
     }
@@ -56,6 +62,7 @@ export function timelineGlyphs(
     ]);
     const previous = buckets.get(key);
     if (!previous) {
+      admit();
       const glyph = { mark: { ...mark }, rect };
       buckets.set(key, glyph);
       glyphs.push(glyph);
