@@ -1,0 +1,62 @@
+import { afterAll, expect, it } from "vitest";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync, appendFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import protocol from "../src/mcpAnalysisProtocol.json";
+import { boundedKernelAccumulator } from "../scripts/mcp-analysis-kernels";
+import { goldenKernelStats } from "./fixtures/a1-golden";
+import type { Capture } from "../src/types";
+const root = mkdtempSync(join(tmpdir(), "a1-worker-")), bundle = join(root, "analysis.cjs");
+execFileSync(process.execPath, ["scripts/build-mcp-analysis.mjs", bundle]);
+afterAll(() => rmSync(root, { recursive: true }));
+function manifest(folder: string, rows: number, intervals = 0) {
+  const streams = [["kernel-dispatch", "dispatches.ndjson", rows], ["kernel-interval", "intervals.ndjson", intervals]].map(([kind, file, count]) => ({ kind, file, rows: count, bytes: statSync(join(folder, String(file))).size }));
+  return { protocol: protocol.protocol, version: 2, budgetVersion: 2, analysis: "kernels", mode: "kernel-stream", capture: { id: "c", name: "synthetic", format: "CSV", architecture: "gfx1151", unit: "ns", origin: "0", start: -10, end: 527878 }, args: {}, streams };
+}
+function run(folder: string, input: unknown, heap = 256) {
+  writeFileSync(join(folder, "input.json"), JSON.stringify(input));
+  return spawnSync(process.execPath, [`--max-old-space-size=${heap}`, bundle, join(folder, "input.json")], { encoding: "utf8", timeout: 120000 });
+}
+it("bundled worker aggregates 527878 dispatches exactly with a test-only 256 MiB heap", () => {
+  const folder = mkdtempSync(join(root, "large-"));
+  const counts = [0, 0, 0];
+  let buffer = ""; writeFileSync(join(folder, "dispatches.ndjson"), ""); writeFileSync(join(folder, "intervals.ndjson"), "");
+  for (let i = 0; i < 527878; i++) {
+    counts[i % 3]++; buffer += JSON.stringify({ kernel: String(i % 3), start: i, end: i + 1 }) + "\n";
+    if (buffer.length > 65536) { appendFileSync(join(folder, "dispatches.ndjson"), buffer); buffer = ""; }
+  }
+  appendFileSync(join(folder, "dispatches.ndjson"), buffer);
+  const result = run(folder, manifest(folder, 527878)); expect(result.status, result.stderr).toBe(0);
+  const receipt = JSON.parse(result.stdout); expect(receipt.rows).toBe(3); expect(receipt.bytes).toBe(statSync(join(folder, "result.ndjson")).size);
+  const rows = readFileSync(join(folder, "result.ndjson"), "utf8").trim().split("\n").map(l => JSON.parse(l));
+  expect(rows).toEqual(counts.map((count, name) => ({ name: String(name), count, total: count, min: 1, max: 1, waves: 0, waveTime: 0, activeTime: 0 })));
+}, 120000);
+it("kernel guard charges once per group and refuses before retaining state", () => {
+  const { accumulator: a, stats } = boundedKernelAccumulator({ groups: 2, names: 4, pairs: 3 });
+  const sample = { kernel: "λλ", start: 0, end: 1 }; a.dispatch(sample); a.dispatch(sample);
+  expect(stats).toEqual({ groups: 1, nameBytes: 4, pairs: 0, retainedDispatchRecords: 0 });
+  expect(() => a.dispatch({ ...sample, kernel: "b" })).toThrow("name"); expect(stats.groups).toBe(1);
+  a.interval({ ...sample, kernel: "ignored" }); expect(stats.pairs).toBe(0);
+  for (let i = 0; i < 3; i++) a.interval(sample);
+  expect(() => a.interval(sample)).toThrow("intervals"); expect(stats.pairs).toBe(3);
+  expect(a.finish()).toEqual(goldenKernelStats({ dispatches: [sample, sample], intervals: [sample, sample, sample] } as unknown as Capture));
+  const g = boundedKernelAccumulator({ groups: 2, names: 100, pairs: 3 });
+  for (const kernel of ["a", "b"]) g.accumulator.dispatch({ ...sample, kernel });
+  expect(() => g.accumulator.dispatch({ ...sample, kernel: "c" })).toThrow("groups"); expect(g.stats.groups).toBe(2);
+});
+it("actual bundle rejects record/version/path/count defects without a success receipt", () => {
+  for (const defect of ["version", "path", "count", "fields", "truncated", "nonfinite", "kind"]) {
+    const folder = mkdtempSync(join(root, "bad-"));
+    let line = JSON.stringify({ kernel: "a", start: -1, end: 0 }) + "\n";
+    if (defect === "fields") line = '{"kernel":"a","start":0,"end":1,"extra":true}\n';
+    if (defect === "truncated") line = line.trimEnd();
+    if (defect === "nonfinite") line = '{"kernel":"a","start":1e999,"end":1}\n';
+    writeFileSync(join(folder, "dispatches.ndjson"), line); writeFileSync(join(folder, "intervals.ndjson"), "");
+    const m = manifest(folder, defect === "count" ? 2 : 1);
+    if (defect === "version") m.version = 99;
+    if (defect === "path") m.streams[0].file = "../dispatches.ndjson";
+    if (defect === "kind") m.streams[0].kind = "unknown";
+    const result = run(folder, m); expect(result.status).not.toBe(0); expect(result.stdout).toBe("");
+  }
+});

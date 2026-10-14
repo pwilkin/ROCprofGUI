@@ -1333,79 +1333,49 @@ impl Server {
             }
             "capture_analyze" => {
                 let c = self.capture(a)?;
+                mcp_analysis::validate_analysis(&c, a, &flag)?;
                 let folder = job_directory()?;
-                fs::write(
-                    folder.join("analysis.cjs"),
-                    include_str!(concat!(env!("OUT_DIR"), "/mcp-analysis.cjs")),
-                )
-                .map_err(|e| e.to_string())?;
-                let input = serde_json::to_vec(&json!({"capture":c,"args":a}))
-                    .map_err(|e| e.to_string())?;
-                if input.len() > 256 * 1024 * 1024 {
-                    return Err("Analysis input exceeds 256 MiB; use paged queries".into());
-                }
-                fs::write(folder.join("input.json"), input).map_err(|e| e.to_string())?;
+                let job = mcp_analysis::prepare_analysis(&c, a, &flag, &folder)?;
+                fs::write(folder.join("analysis.cjs"), include_str!(concat!(env!("OUT_DIR"), "/mcp-analysis.cjs"))).map_err(|e| e.to_string())?;
                 let analysis = text(a, "analysis")?;
                 let view = match analysis {
-                    "timeline" => "trace",
-                    "diagnostics" => "evidence",
-                    "hardware" => "summary",
-                    "activity" => "summary",
-                    "kernels" => "dispatch",
-                    "source" => "flame",
-                    "scalar" | "tensor" => "counters",
-                    other => other,
+                    "timeline" => "trace", "diagnostics" => "evidence", "hardware" | "activity" => "summary", "kernels" => "dispatch", "source" => "flame", "scalar" | "tensor" => "counters", other => other,
                 };
                 self.control.follow(json!({"captureId":c.id,"view":view}));
-                let run = run_process(
+                run_analysis_process(
                     vec![
                         std::env::var("ROCPROF_MCP_NODE").unwrap_or("node".into()),
                         "--max-old-space-size=1024".into(),
                         folder.join("analysis.cjs").to_string_lossy().into(),
                         folder.join("input.json").to_string_lossy().into(),
-                    ],
-                    &folder,
-                    &flag,
-                    120,
-                );
-                // The input is a copy of the open capture, up to 256 MiB per call; keep it
-                // only as long as the worker needs it. A failed run keeps its logs.
-                let _ = fs::remove_file(folder.join("input.json"));
-                run?;
-                let stdout = fs::read(folder.join("stdout.log")).map_err(|e| e.to_string());
-                let _ = fs::remove_dir_all(&folder);
-                let data: Value = serde_json::from_slice(&stdout?).map_err(|e| e.to_string())?;
-                if let Some(output) = a["output"].as_str() {
-                    Control::check(&flag)?;
-                    let path = Path::new(output);
-                    new_target(path)?;
-                    match analysis {
-                        "timeline" => profile_core::plot_files::write(
-                            path,
-                            "html",
-                            text(&data, "html")?.as_bytes(),
-                        )?,
-                        "diagnostics" => profile_core::diagnostics::write(
-                            path,
-                            &serde_json::to_vec_pretty(&data).unwrap(),
-                        )?,
-                        _ => {
-                            let mut f = fs::OpenOptions::new()
-                                .write(true)
-                                .create_new(true)
-                                .open(path)
-                                .map_err(|e| e.to_string())?;
-                            serde_json::to_writer_pretty(&mut f, &data)
-                                .map_err(|e| e.to_string())?;
-                        }
-                    }
-                    return Ok(json!({"path":path}));
-                }
-                if data.is_array() {
-                    page(data, a, &flag)
+                    ], &job, &flag,
+                )?;
+                let result = if job.mode == "kernel-stream" {
+                    mcp_analysis::kernel_result(&c, a, &job, &flag)
+                } else if job.mode == "timeline-stream" {
+                    Err("Timeline result publication is not yet connected".into())
                 } else {
-                    Ok(data)
-                }
+                    let stdout = fs::read(folder.join("stdout.log")).map_err(|e| e.to_string())?;
+                    let data: Value = serde_json::from_slice(&stdout).map_err(|e| e.to_string())?;
+                    if let Some(output) = a["output"].as_str() {
+                        Control::check(&flag)?;
+                        let path = Path::new(output);
+                        new_target(path)?;
+                        if analysis == "diagnostics" {
+                            profile_core::diagnostics::write(path, &serde_json::to_vec_pretty(&data).map_err(|e|e.to_string())?)?;
+                        } else {
+                            let mut temp = tempfile::NamedTempFile::new_in(path.parent().ok_or("Missing output directory")?).map_err(|e|e.to_string())?;
+                            serde_json::to_writer_pretty(&mut temp, &data).map_err(|e|e.to_string())?;
+                            temp.as_file().sync_all().map_err(|e|e.to_string())?;
+                            Control::check(&flag)?;
+                            temp.persist_noclobber(path).map_err(|e|e.to_string())?;
+                        }
+                        Ok(json!({"path":output}))
+                    } else if data.is_array() { page(data, a, &flag) } else { Ok(data) }
+                };
+                drop(job);
+                if result.is_ok() { let _ = fs::remove_dir_all(&folder); }
+                result
             }
             "profile_start" => profile_start_core(&self.control, a),
             "profile_trigger" => profile_trigger_core(&self.control, a, &flag),
@@ -2523,6 +2493,14 @@ fn run_process_env(
     seconds: u64,
     env: &[(String, String)],
 ) -> Result<(), String> {
+    run_process_env_monitored(argv, cwd, folder, flag, seconds, env, None)
+}
+fn run_analysis_process(argv: Vec<String>, job: &mcp_analysis::AnalysisJob, flag: &AtomicBool) -> Result<(), String> {
+    run_process_env_monitored(argv, &job.folder, &job.folder, flag, mcp_analysis::budget("deadlineSeconds"), &[], Some(job))
+}
+fn run_process_env_monitored(
+    argv: Vec<String>, cwd: &Path, folder: &Path, flag: &AtomicBool, seconds: u64, env: &[(String, String)], job: Option<&mcp_analysis::AnalysisJob>,
+) -> Result<(), String> {
     Control::check(flag)?;
     let mut child = spawn_process_env(&argv, cwd, folder, env)?;
     let start = Instant::now();
@@ -2531,14 +2509,20 @@ fn run_process_env(
         let exceeded = ["stdout.log", "stderr.log"]
             .iter()
             .any(|p| fs::metadata(folder.join(p)).is_ok_and(|m| m.len() > 64 * 1024 * 1024));
+        let analysis_error = job.and_then(|j| mcp_analysis::monitor(j).err());
         if status.is_some()
+            || analysis_error.is_some()
             || flag.load(Ordering::SeqCst)
             || start.elapsed().as_secs() > seconds
             || exceeded
         {
             tuning::stop(&mut child);
             Control::check(flag)?;
+            if let Some(e) = analysis_error { return Err(e); }
             if exceeded || status.is_none() {
+                if let Some(job) = job {
+                    return Err(format!("MCP_ANALYSIS_TIMEOUT: {} exceeded {seconds} s or its log budget; use a narrower timeline range or offline positive-limit dispatch/interval queries for kernels. Artifacts: {}",job.analysis, folder.display()));
+                }
                 return Err("Process exceeded its time or output budget".into());
             }
             if !status.unwrap().success() {

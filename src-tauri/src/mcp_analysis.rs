@@ -582,3 +582,33 @@ pub fn kernel_result(c:&Capture,a:&Value,job:&AnalysisJob,flag:&AtomicBool)->Res
     }
     let mut page=page_fallible_rows(rows,&PageArgs::parse(a),flag,"kernel aggregates")?;page["analysisMeta"]=meta;Ok(page)
 }
+pub fn monitor(job:&AnalysisJob)->Result<(),String>{
+    let stdout=if job.mode=="kernel-stream"||job.mode=="timeline-stream"{budget("receiptBytes")}else{budget("stdoutBytes")};
+    let html=job.args["maxOutputBytes"].as_u64().unwrap_or(budget("fileBytes"));
+    for (name,max) in [("stdout.log",stdout),("result.ndjson",budget("kernelResultBytes")),("result.html",html)] {
+        if let Ok(m)=fs::symlink_metadata(job.folder.join(name)) {if !m.is_file() || m.len()>max{return Err(format!("MCP_ANALYSIS_SPOOL_BUDGET: {name} exceeds {max} bytes or is not a regular file; no output was published"));}}
+    }
+    for stream in &job.streams {if fs::metadata(job.folder.join(&stream.file)).map_err(|e|e.to_string())?.len()>stream.bytes{return Err("MCP_ANALYSIS_SPOOL_BUDGET: input spool grew beyond preflight size".into());}}
+    Ok(())
+}
+#[cfg(test)]
+mod kernel_tests {
+    use super::*;
+    #[test]
+    fn mcp_rust_prepared_bundle_kernel_page_and_all_row_output() {
+        let dir=tempfile::tempdir().unwrap();let mut c=super::transport_tests::capture();let flag=AtomicBool::new(false);
+        c.dispatches=(0..1001).map(|i|Dispatch{kernel:format!("kernel-{i:04}"),..c.dispatches[0].clone()}).collect();
+        let args=json!({"analysis":"kernels","limit":2000,"range":[50,60],"kernel":"ignored"});
+        let job=prepare_analysis(&c,&args,&flag,dir.path()).unwrap();
+        fs::write(dir.path().join("analysis.cjs"),include_str!(concat!(env!("OUT_DIR"),"/mcp-analysis.cjs"))).unwrap();
+        let output=std::process::Command::new("node").arg("--max-old-space-size=256").arg(dir.path().join("analysis.cjs")).arg(dir.path().join("input.json")).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));fs::write(dir.path().join("stdout.log"),output.stdout).unwrap();
+        let first=kernel_result(&c,&args,&job,&flag).unwrap();assert_eq!(first["effectiveLimit"],1000);assert_eq!(first["total"],1001);assert_eq!(first["nextOffset"],1000);
+        let last=kernel_result(&c,&json!({"offset":1000,"limit":2000}),&job,&flag).unwrap();assert_eq!(last["rows"].as_array().unwrap().len(),1);assert!(last["nextOffset"].is_null());
+        assert_eq!(first["rows"][0],json!({"name":"kernel-0000","count":1,"total":1,"min":1,"max":1,"waves":0,"waveTime":0,"activeTime":0}));
+        assert_eq!(first["analysisMeta"]["availability"]["residency"],"not-recorded");
+        let target=dir.path().join("all.json");kernel_result(&c,&json!({"output":target,"limit":1,"query":"nonmatch"}),&job,&flag).unwrap();
+        let all:Value=serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();assert_eq!(all.as_array().unwrap().len(),1001);
+        assert!(kernel_result(&c,&json!({"output":target}),&job,&flag).is_err());
+    }
+}
