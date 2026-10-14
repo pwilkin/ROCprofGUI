@@ -32,3 +32,45 @@ it("pins v2 budgets and vocabulary", () => {
   expect(protocol.budgets.kernelIntervals).toBe(2_000_000);
   expect(protocol.budgets.chunkBytes).toBe(1024 * 1024);
 });
+
+it("incremental kernels preserve every arithmetic edge and reject before insertion", async () => {
+  const { createKernelStatsAccumulator } = await import("./analysis");
+  for (const nonfinite of [false, true]) {
+    const c = edgeCapture();
+    if (nonfinite) c.intervals.push({ ...c.intervals[0], start: NaN, end: Infinity });
+    for (let split = 0; split <= c.dispatches.length; split++) {
+      const a = createKernelStatsAccumulator();
+      for (const chunk of [c.dispatches.slice(0, split), c.dispatches.slice(split)]) for (const d of chunk) a.dispatch(d);
+      for (const i of c.intervals) a.interval(i);
+      expect(a.finish()).toEqual(goldenKernelStats(c));
+    }
+  }
+  const a = createKernelStatsAccumulator({
+    beforeKernel: (_name, count) => { if (count > 2) throw Error("groups"); },
+    beforeInterval: count => { if (count > 3) throw Error("pairs"); },
+  });
+  const sample = { kernel: "a", start: 0, end: 1 };
+  a.dispatch(sample); a.dispatch({ ...sample, kernel: "b" });
+  expect(() => a.dispatch({ ...sample, kernel: "c" })).toThrow("groups");
+  for (let i = 0; i < 3; i++) a.interval(sample);
+  expect(() => a.interval(sample)).toThrow("pairs");
+  expect(a.finish()).toEqual(goldenKernelStats({ dispatches: [sample, { ...sample, kernel: "b" }], intervals: [sample, sample, sample] } as unknown as Capture));
+});
+it("single marks retain sparse original ordinals, selection and event masks", async () => {
+  const { dispatchMark, residencyMark, markerMark, decoderMark } = await import("./globalTimeline");
+  const c = demo.capture as unknown as Capture;
+  for (const index of [2, 17, 100]) {
+    const d = { ...c.dispatches[0], start: 1, end: 2 };
+    const intervals = Array.from({ length: index + 1 }, () => c.intervals[0]);
+    const dispatches = Array.from({ length: index + 1 }, () => d);
+    const markers = Array.from({ length: index + 1 }, () => ({ start: 0, end: null, point: index === 17, se: 2, cu: 0, simd: 0, slot: 0, depth: 3, name: "λ<&", markerId: 4, codeObject: "x", source: "a.cpp" }));
+    const e = { id: "e", se: 2, time: 1, kind: "event", fields: { type: "6", "λ": "<&" } };
+    const decoderEvents = Array.from({ length: index + 1 }, () => e);
+    const input = { ...c, intervals, dispatches, markers, decoderEvents } as unknown as Capture;
+    const expected = goldenGlobalMarks(input, defaultGlobalLayers);
+    const single = [residencyMark(intervals[index], index), markerMark(markers[index], index, c.end), dispatchMark(d, index), decoderMark(e, index, defaultGlobalLayers)];
+    for (const m of single) expect({ ...m, selected: false }).toEqual(expected.find(v => v.key === m!.key));
+    expect(dispatchMark({ ...d, end: 1 }, index)).toBeNull();
+    expect(decoderMark(e, index, { ...defaultGlobalLayers, eventGroups: 0 })).toBeNull();
+  }
+});
