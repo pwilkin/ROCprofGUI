@@ -187,10 +187,17 @@ struct Undelivered {
 }
 /// Tools that only read state, and so may run while an action is active.
 const READ_ONLY_TOOLS: [&str; 2] = ["tuning_status", "profile_status"];
-/// How a live profile is gated: RADV RGP file triggers, or rocprofv3 attach windows.
+/// How a live profile is gated: RADV RGP file triggers, rocprofv3 attach windows,
+/// or an HRX/Loom native profile that records the whole process lifetime.
 enum Gate {
     Radv {
         trigger: PathBuf,
+    },
+    /// The target writes its own IREE HAL profile bundle (`--device_profiling_*`)
+    /// and finalizes it when it shuts down, so there is no window to trigger:
+    /// profile_stop interrupts the process and collects the bundle.
+    Hrx {
+        output: PathBuf,
     },
     Rocprofv3 {
         profiler: String,
@@ -234,7 +241,7 @@ impl LiveProfile {
     fn radv_trigger(&self) -> Option<&PathBuf> {
         match &self.gate {
             Gate::Radv { trigger } => Some(trigger),
-            Gate::Rocprofv3 { .. } => None,
+            Gate::Rocprofv3 { .. } | Gate::Hrx { .. } => None,
         }
     }
 }
@@ -1404,6 +1411,20 @@ impl Server {
                         .map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| e.to_string())?;
+                if a["tracer"] != "hrx" && HRX_ONLY_KEYS.iter().any(|key| a.get(*key).is_some()) {
+                    return Err(format!("{} applies to tracer hrx only", HRX_ONLY_KEYS.join(", ")));
+                }
+                if a["tracer"] == "hrx" {
+                    if rocprofv3_only_run_keys().iter().any(|key| a.get(*key).is_some()) {
+                        return Err(format!("{} apply to tracer rocprofv3 only", rocprofv3_only_run_keys().join(", ")));
+                    }
+                    let output = folder.join(HRX_BUNDLE);
+                    let mut command = argv.clone();
+                    command.extend(hrx_profiling_flags(a, &argv, &output)?);
+                    let run = run_process_env(command, cwd, &folder, &flag, seconds, &env);
+                    let report = hrx_report(&folder, &output, if run.is_ok() { "completed" } else { "failed" });
+                    return run.map(|_| report.clone()).map_err(|e| format!("{e}. Artifacts: {report}"));
+                }
                 if a["tracer"] == "radv" {
                     if rocprofv3_only_run_keys().iter().any(|key| a.get(*key).is_some()) {
                         return Err(format!("{} apply to tracer rocprofv3 only", rocprofv3_only_run_keys().join(", ")));
@@ -1432,11 +1453,19 @@ impl Server {
                 rocprof_streams(a, &mut command)?;
                 kernel_filters(a, &mut command)?;
                 command.push("--".into());
+                let program = argv[0].clone();
                 command.extend(argv);
                 let run = run_process_env(command, cwd, &folder, &flag, seconds, &env);
                 let mut paths = Vec::new();
                 find_outputs(&folder, &mut paths)?;
-                let report = json!({"directory":folder,"files":paths,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"next":"Use capture_open with a returned trace or counter CSV path; open a ui_output directory or a single .att file for SQTT waves"});
+                // rocprofv3 exits 0 and writes nothing when the application never
+                // loads the ROCm runtime; name that case instead of returning a
+                // silent empty file list.
+                let mut warnings = Vec::new();
+                if !paths.iter().any(|p| p.file_name().is_some_and(|n| n != "profile.json")) {
+                    warnings.extend(native_kfd_hint(&program, cwd));
+                }
+                let report = json!({"directory":folder,"files":paths,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"warnings":warnings,"next":"Use capture_open with a returned trace or counter CSV path; open a ui_output directory or a single .att file for SQTT waves"});
                 run.map(|_| report.clone()).map_err(|e| format!("{e}. Artifacts: {report}"))
             }
             "tuning_open" => {
@@ -1528,6 +1557,171 @@ fn rocprofv3_only_window_keys() -> Vec<&'static str> {
     ROCPROFV3_ONLY_KEYS.iter().filter(|k| k.window).map(|k| k.key).collect()
 }
 
+/// Request keys that apply only to the hrx tracer. The same contract test that
+/// checks ROCPROFV3_ONLY_KEYS requires every schema key to be universal or in
+/// exactly one tracer-only table.
+const HRX_ONLY_KEYS: [&str; 1] = ["hrx"];
+/// File name of the IREE HAL profile bundle the hrx tracer asks the target for.
+const HRX_BUNDLE: &str = "hrx-profile.irpf";
+/// IREE HAL profiling data families (`--device_profiling_mode`). Which of them a
+/// device implements is the driver's decision: the native AMD GPU driver takes
+/// queue-events, dispatch-events and executable-metadata; the AMD XDNA NPU driver
+/// takes queue-events, host-execution, counters and executable-metadata.
+const HRX_FAMILIES: [&str; 11] = [
+    "queue-events",
+    "host-execution",
+    "device-queue-events",
+    "dispatch-events",
+    "memory-events",
+    "device-metrics",
+    "command-region-events",
+    "counters",
+    "counter-ranges",
+    "executable-metadata",
+    "executable-traces",
+];
+/// Families requested when the client names none: dispatch names, grids and
+/// device timestamps, plus the metadata needed to resolve them.
+const HRX_DEFAULT_FAMILIES: [&str; 3] = ["queue-events", "dispatch-events", "executable-metadata"];
+/// Options of the `hrx` request object.
+const HRX_OPTIONS: [&str; 4] = ["families", "flushIntervalMs", "filterFunction", "allowPartial"];
+/// Periodic flush used when the client names none. The native AMD GPU driver
+/// keeps a bounded ring of 4096 records per queue between flushes and drops the
+/// rest, so a long-running target needs a flush well inside that budget.
+const HRX_DEFAULT_FLUSH_MS: u64 = 25;
+
+/// Builds the `--device_profiling_*` flags the hrx tracer appends to the target's
+/// argv. The target must be an IREE HAL tooling binary that defines those flags
+/// (loom-serve, loom-run, iree-run-module); the flags are managed here, so an
+/// argv that already carries one is rejected.
+fn hrx_profiling_flags(a: &Value, argv: &[String], output: &Path) -> Result<Vec<String>, String> {
+    if let Some(managed) = argv.iter().find(|arg| arg.starts_with("--device_profiling_") || arg.starts_with("--print_device_statistics")) {
+        return Err(format!("{managed} is managed by tracer hrx; pass profiling options through the hrx object instead"));
+    }
+    let empty = serde_json::Map::new();
+    let options = match a.get("hrx") {
+        Some(value) => value.as_object().ok_or("hrx must be an object")?,
+        None => &empty,
+    };
+    if let Some(unknown) = options.keys().find(|key| !HRX_OPTIONS.contains(&key.as_str())) {
+        return Err(format!("Unknown hrx option {unknown}"));
+    }
+    let families: Vec<String> = match options.get("families") {
+        Some(value) => serde_json::from_value(value.clone()).map_err(|e| e.to_string())?,
+        None => HRX_DEFAULT_FAMILIES.iter().map(|f| f.to_string()).collect(),
+    };
+    if families.is_empty() {
+        return Err("hrx families cannot be empty".into());
+    }
+    if let Some(unknown) = families.iter().find(|f| !HRX_FAMILIES.contains(&f.as_str())) {
+        return Err(format!("Unknown hrx data family {unknown}"));
+    }
+    if families.iter().enumerate().any(|(i, f)| families[..i].contains(f)) {
+        return Err("hrx families must be unique".into());
+    }
+    let flush = match options.get("flushIntervalMs") {
+        Some(value) => value.as_u64().filter(|ms| *ms <= 60_000).ok_or("hrx flushIntervalMs must be an integer between 0 and 60000")?,
+        None => HRX_DEFAULT_FLUSH_MS,
+    };
+    let mut flags = vec![
+        format!("--device_profiling_mode={}", families.join(",")),
+        format!("--device_profiling_output={}", output.to_string_lossy()),
+    ];
+    if flush > 0 {
+        flags.push(format!("--device_profiling_flush_interval_ms={flush}"));
+    }
+    if let Some(value) = options.get("filterFunction") {
+        let pattern = value
+            .as_str()
+            .filter(|s| !s.is_empty() && !s.contains('\0') && s.len() <= 256)
+            .ok_or("hrx filterFunction must be a nonempty glob of at most 256 characters")?;
+        flags.push(format!("--device_profiling_filter_function={pattern}"));
+    }
+    if let Some(value) = options.get("allowPartial") {
+        if value.as_bool().ok_or("hrx allowPartial must be a boolean")? {
+            flags.push("--device_profiling_allow_partial=true".into());
+        }
+    }
+    Ok(flags)
+}
+
+/// Reports what an hrx-traced run left behind: the bundle path, a structural
+/// summary read through the importer, and every reason the bundle may not hold
+/// what the client asked for. An absent, unfinalized, truncated or dispatch-less
+/// bundle is a warning with its cause, never a silent empty result.
+fn hrx_report(folder: &Path, output: &Path, status: &str) -> Value {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut bundle = Value::Null;
+    let stderr = fs::read_to_string(folder.join("stderr.log")).unwrap_or_default();
+    let stderr_line = |needle: &str| -> Option<String> {
+        stderr.lines().find(|l| l.contains(needle)).map(|l| l.chars().take(300).collect())
+    };
+    if let Some(line) = stderr_line("device_profiling_allow_partial' not recognized") {
+        warnings.push(format!("The target does not define --device_profiling_allow_partial: hrx.allowPartial needs a Loom tool built with docs/hrx-device-profiling-allow-partial.patch. Its stderr: {line}"));
+    } else if let Some(line) = stderr_line("not recognized") {
+        warnings.push(format!("The target rejected a profiling flag; tracer hrx needs an IREE HAL tooling binary that defines --device_profiling_mode/--device_profiling_output (loom-serve, loom-run, iree-run-module). Its stderr: {line}"));
+    }
+    if let Some(line) = stderr_line("unsupported XDNA profiling data families").or_else(|| stderr_line("unsupported GPU profiling data families")) {
+        warnings.push(format!("A device rejected a requested data family and the target aborted profiling for the whole device group. The native AMD GPU driver implements queue-events, dispatch-events and executable-metadata; the XDNA NPU driver implements queue-events, host-execution, counters and executable-metadata. For a GPU + NPU group either request only families both implement (no dispatch timing), or set hrx.allowPartial with a Loom tool built with docs/hrx-device-profiling-allow-partial.patch. Its stderr: {line}"));
+    }
+    if output.is_file() {
+        files.push(output.to_path_buf());
+        match profile_core::irpf::summarize(output) {
+            Ok(summary) => {
+                if !summary.finalized {
+                    warnings.push("The profile bundle is not finalized: the target ended before it closed its profiling session (killed, crashed, or stopped by the run timeout). It cannot be imported. For a server, use profile_start/profile_stop, which interrupts the target so it finalizes the bundle.".into());
+                } else if summary.dispatch_events == 0 {
+                    warnings.push(format!("The profile bundle holds no dispatch events ({} session(s), {} function(s), {} queue event(s)): dispatch-events was not requested, was dropped for every device, or no kernel ran while profiling was active. capture_open will reject it.", summary.sessions, summary.functions, summary.queue_events));
+                }
+                for family in &summary.truncated {
+                    warnings.push(format!("The {} stream is TRUNCATED: the producer dropped {} record(s). The native AMD GPU driver keeps 4096 records per queue between flushes; lower hrx.flushIntervalMs or narrow hrx.filterFunction.", family.family, family.dropped));
+                }
+                for code in &summary.failed_sessions {
+                    warnings.push(format!("A profiling session ended with status code {code}; the capture may be incomplete."));
+                }
+                bundle = serde_json::to_value(summary).unwrap_or(Value::Null);
+            }
+            Err(e) => warnings.push(format!("The profile bundle could not be read: {e}")),
+        }
+    } else if warnings.is_empty() {
+        warnings.push("The target wrote no profile bundle. Tracer hrx needs an IREE HAL tooling binary that defines --device_profiling_mode/--device_profiling_output (loom-serve, loom-run, iree-run-module); check stderr.log.".into());
+    }
+    json!({"status":status,"directory":folder,"files":files,"bundle":bundle,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"warnings":warnings,"next":"Use capture_open with the returned .irpf path for the dispatch table and per-kernel time. The bundle is dispatch-level: it carries no waves, ISA hotspots or hardware counters."})
+}
+
+/// Whether an IRPF bundle on disk has been finalized: the producer writes the
+/// logical file length into the header (offset 16) with its last session-end
+/// record, and leaves it zero until then.
+fn irpf_finalized(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 24];
+    fs::File::open(path).and_then(|mut f| f.read_exact(&mut header)).is_ok()
+        && header[0..4] == *b"IRPF"
+        && header[16..24] != [0u8; 8]
+}
+
+/// Explains an empty rocprofv3 result for an application that drives the GPU
+/// without the ROCm runtime. rocprofiler-sdk observes dispatches by hooking ROCr
+/// (libhsa-runtime64) AQL queues inside the target; a binary that never
+/// references ROCr or HIP and opens /dev/kfd itself (the HRX/Loom native AMD
+/// driver, which submits PM4 to its own KFD user queues) gives it nothing to
+/// hook, so rocprofv3 exits cleanly with no output. Returns None unless both
+/// facts hold, so ordinary launchers and scripts get no false hint.
+fn native_kfd_hint(program: &str, cwd: &Path) -> Option<String> {
+    let path = if Path::new(program).is_absolute() { PathBuf::from(program) } else { cwd.join(program) };
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 1024 * 1024 * 1024 {
+        return None;
+    }
+    let image = fs::read(&path).ok()?;
+    let contains = |needle: &[u8]| image.windows(needle.len()).any(|w| w == needle);
+    if !image.starts_with(b"\x7fELF") || !contains(b"/dev/kfd") || contains(b"libhsa-runtime64") || contains(b"libamdhip64") {
+        return None;
+    }
+    Some(format!("rocprofv3 produced no output and {} never references the ROCm runtime (libhsa-runtime64 / libamdhip64) while opening /dev/kfd itself: it drives the GPU through its own KFD queues (the HRX/Loom native AMD driver submits PM4 to user queues), which rocprofiler-sdk cannot observe in any trace, counter or ATT mode. Use tracer hrx to collect the application's native profile instead.", path.display()))
+}
+
 /// Starts the long-lived application for gated live profiling. Shared by the MCP
 /// `profile_start` arm and the `live_profile_start` desktop command.
 fn profile_start_core(control: &Control, a: &Value) -> Result<Value, String> {
@@ -1536,8 +1730,11 @@ fn profile_start_core(control: &Control, a: &Value) -> Result<Value, String> {
         return Err("Application argv cannot be empty".into());
     }
     let tracer = a["tracer"].as_str().unwrap_or("radv");
-    if !["radv", "rocprofv3"].contains(&tracer) {
-        return Err("tracer must be radv or rocprofv3".into());
+    if !["radv", "rocprofv3", "hrx"].contains(&tracer) {
+        return Err("tracer must be radv, rocprofv3 or hrx".into());
+    }
+    if tracer != "hrx" && HRX_ONLY_KEYS.iter().any(|key| a.get(*key).is_some()) {
+        return Err(format!("{} applies to tracer hrx only", HRX_ONLY_KEYS.join(", ")));
     }
     if tracer != "rocprofv3" && a.get("profiler").is_some() {
         return Err("profiler applies to tracer rocprofv3 only".into());
@@ -1557,7 +1754,18 @@ fn profile_start_core(control: &Control, a: &Value) -> Result<Value, String> {
     let folder = job_directory()?;
     let id = folder.file_name().unwrap().to_string_lossy().into_owned();
     let mut vars = env;
-    let (gate, capture_mode) = if tracer == "radv" {
+    let mut argv = argv;
+    let (gate, capture_mode) = if tracer == "hrx" {
+        let output = folder.join(HRX_BUNDLE);
+        match hrx_profiling_flags(a, &argv, &output) {
+            Ok(flags) => argv.extend(flags),
+            Err(e) => {
+                let _ = fs::remove_dir_all(&folder);
+                return Err(e);
+            }
+        }
+        (Gate::Hrx { output }, "whole-run")
+    } else if tracer == "radv" {
         let trigger = folder.join("radv-trigger");
         vars.extend([
             ("MESA_VK_TRACE".to_owned(), "rgp".to_owned()),
@@ -1576,9 +1784,16 @@ fn profile_start_core(control: &Control, a: &Value) -> Result<Value, String> {
     let pid = child.id();
     let trigger_file = match &gate {
         Gate::Radv { trigger } => Some(trigger.clone()),
-        Gate::Rocprofv3 { .. } => None,
+        Gate::Rocprofv3 { .. } | Gate::Hrx { .. } => None,
+    };
+    let hrx_output = match &gate {
+        Gate::Hrx { output } => Some(output.clone()),
+        _ => None,
     };
     *live = Some(LiveProfile { id: id.clone(), child, folder: folder.clone(), program: argv[0].clone(), started, triggers: 0, gate });
+    if let Some(output) = hrx_output {
+        return Ok(json!({"id":id,"pid":pid,"directory":folder,"bundle":output,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"captureMode":"whole-run","next":"The application records its own profile for its whole lifetime; there is no window to trigger. Wait for it to become ready, send the workload, then call profile_stop: it interrupts the application (SIGINT) so the bundle is finalized, and returns the .irpf path for capture_open. Keep the workload short: every dispatch is recorded."}));
+    }
     Ok(match trigger_file {
         Some(trigger) => json!({"id":id,"pid":pid,"directory":folder,"triggerFile":trigger,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"driverRequirement":"Headless compute file triggers require a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only during swapchain presentation.","next":"Wait for the server to become ready, call profile_trigger, send one inference request, wait for savedMessages, then call profile_stop to collect captures"}),
         None => json!({"id":id,"pid":pid,"directory":folder,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"armRequirement":"The application is started with ROCP_TOOL_ATTACH=1 so the ROCm runtime keeps an attach thread ready; rocprofv3 can attach only to processes armed this way.","next":"Wait for the application to become ready, then call profile_trigger. Give the window its collection (counters, traces, att) and, optionally, kernelIncludeRegex/kernelExcludeRegex; choose a timed window (windowMs) or a triggered window (triggered:true, which stays open until profile_trigger end:true or profile_stop). Every window of this process must request the same streams, filters and mode. Collect with profile_stop."}),
@@ -1657,6 +1872,9 @@ fn profile_trigger_core(control: &Control, a: &Value, flag: &AtomicBool) -> Resu
     let folder = profile.folder.clone();
     let mut new_triggers = profile.triggers;
     let response = match &mut profile.gate {
+        Gate::Hrx { .. } => {
+            return Err("Tracer hrx records the whole process lifetime; there is no window to trigger. Send the workload, then call profile_stop to finalize and collect the bundle.".into());
+        }
         Gate::Radv { trigger } => {
             if end {
                 return Err("end applies to tracer rocprofv3 only".into());
@@ -1798,6 +2016,10 @@ fn profile_status_core(control: &Control, a: &Value) -> Result<Value, String> {
     let folder = profile.folder.clone();
     let triggers = profile.triggers;
     match &mut profile.gate {
+        Gate::Hrx { output } => {
+            let bytes = fs::metadata(&*output).map(|m| m.len()).unwrap_or(0);
+            Ok(json!({"id":id,"running":status.is_none(),"exitCode":status.and_then(|s| s.code()),"bundle":output,"bundleBytes":bytes,"directory":folder,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log")}))
+        }
         Gate::Radv { trigger } => {
             let (saved, unique) = rgp_save_counts(&folder);
             Ok(json!({"id":id,"running":status.is_none(),"exitCode":status.and_then(|s| s.code()),"triggerPending":trigger.exists(),"triggerCount":triggers,"savedMessages":saved,"uniqueSavePaths":unique,"directory":folder,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log")}))
@@ -1829,6 +2051,43 @@ fn profile_stop_core(control: &Control, a: &Value, flag: &AtomicBool) -> Result<
     drop(live);
     let status = child.try_wait().map_err(|e| e.to_string())?;
     match gate {
+        Gate::Hrx { output } => {
+            // The target finalizes its bundle only on an orderly shutdown, so ask
+            // for one (SIGINT, what the Loom tools subscribe to) and wait before
+            // falling back to a kill, which leaves the bundle unfinalized.
+            let mut exit = status;
+            let mut interrupted = false;
+            // Set once the bundle's header carries its final length: the profile is
+            // complete even if the target then lingers in its own teardown.
+            let mut finalized: Option<Instant> = None;
+            if exit.is_none() {
+                send_sigint(&child);
+                interrupted = true;
+                let waited = Instant::now();
+                while exit.is_none() && !flag.load(Ordering::SeqCst) && waited.elapsed() < Duration::from_secs(90) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    exit = child.try_wait().map_err(|e| e.to_string())?;
+                    if finalized.is_none() && irpf_finalized(&output) {
+                        finalized = Some(Instant::now());
+                    }
+                    if finalized.is_some_and(|at| at.elapsed() > Duration::from_secs(10)) {
+                        break;
+                    }
+                }
+            }
+            let forced = exit.is_none();
+            tuning::stop(&mut child);
+            let mut report = hrx_report(&folder, &output, if !interrupted { "exited" } else if forced { "killed" } else { "stopped" });
+            report["exitCode"] = json!(exit.and_then(|code| code.code()));
+            if forced {
+                report["warnings"].as_array_mut().unwrap().push(json!(if finalized.is_some() {
+                    "The application finalized its profile bundle but had not exited 10 s later and was killed; the bundle is complete."
+                } else {
+                    "The application did not finalize its profile bundle within 90 s of SIGINT (or the call was cancelled) and was killed; the bundle cannot be imported."
+                }));
+            }
+            Ok(report)
+        }
         Gate::Radv { trigger } => {
             tuning::stop(&mut child);
             let _ = fs::remove_file(&trigger);
@@ -1866,7 +2125,9 @@ fn profile_stop_core(control: &Control, a: &Value, flag: &AtomicBool) -> Result<
                     let detail: String = log.lines().rev().find(|l| l.contains("Error") || l.contains("error"))
                         .or_else(|| log.lines().rev().find(|l| !l.trim().is_empty()))
                         .unwrap_or("stderr.log is empty").chars().take(300).collect();
-                    if attach_set_agent_failure(&log) {
+                    if let Some(hint) = native_kfd_hint(&program, Path::new("/")) {
+                        warnings.push(format!("window-{count} produced no output files. {hint}"));
+                    } else if attach_set_agent_failure(&log) {
                         warnings.push(format!("window-{count} produced no output files: rocprofv3 could not set the agent to be profiled (the ROCm set_profiler_active_on_queue PM4 handshake timed out while the target queue was busy — a known ROCm attach limitation, not fixed here; retry when the GPU queue is idle). Its stderr: {detail}"));
                     } else {
                         warnings.push(format!("window-{count} produced no output files (rocprofv3 requires every window of one process to request the same streams, counters, att and kernel filters; the attach may also have failed or no GPU work ran). Its stderr: {detail}"));
@@ -2262,15 +2523,16 @@ fn tools() -> Vec<Value> {
     let page_limit = json!({"type":"integer","minimum":0,"default":100,"description":"Requests above 1000 are clamped. Follow nextOffset until null; effectiveLimit reports the clamp. Zero is count-only and must not drive traversal."});
     let traces = json!({"type":"array","items":{"enum":["kernel","hip","marker","memoryCopy","memoryAllocation","scratchMemory","hsa","rccl","runtime","sys"]},"minItems":1});
     let att = json!({"type":"object","properties":{"targetCu":num,"simdSelect":num,"bufferSize":num,"shaderEngineMask":num},"additionalProperties":false});
+    let hrx = json!({"type":"object","properties":{"families":{"type":"array","items":{"enum":HRX_FAMILIES},"minItems":1},"flushIntervalMs":{"type":"integer","minimum":0,"maximum":60000},"filterFunction":str_,"allowPartial":{"type":"boolean"}},"additionalProperties":false});
     let entries=vec![
  ("workspace","List open captures, tuning sessions, current view and MCP status.",json!({}),vec![]),
  ("capture_open","Import a trace, counters, ATT run, sampling data or portable capture from an explicit path.",json!({"path":str_,"samplingMethod":str_,"loadWaveStates":{"type":"boolean"}}),vec!["path"]),
  ("capture_analyze","Run GUI-shared analyses: kernels, occupancy, activity, hardware, hotspots, source, markers, scalar, tensor, timeline, diagnostics. Kernels aggregate the full capture; range/kernel are ignored and query filters finalized rows. analysisMeta labels clock, coverage and summed-duration/union denominators; zero residency fields are not measured absence of work. Timeline range filters exact dispatch/global events; kernel/query/offset/limit do not limit events. Inline HTML is bounded to 16 MiB/100000 glyphs, output to 512 MiB/2000000 glyphs; maxOutputBytes only lowers the timeline byte cap. Output must be a new path and is committed without replacement. timePages zero defaults to 1; lanesPerPage zero to 12. Other modes still materialize relevant datasets under 256 MiB encoded input; diagnostics retains full-capture compatibility. Activity null means instruction timing is absent, invalid, or has no positive finite total; dispatch-only captures cannot supply it. Scalar takes name/formula (C0 etc); tensor takes definitions and raw named shape/values. Paged arrays include effectiveLimit; follow nextOffset until null. Requires Node.js.",json!({"captureId":str_,"analysis":{"enum":["kernels","occupancy","activity","hardware","hotspots","source","markers","scalar","tensor","timeline","diagnostics"]},"metric":{"enum":["latency","pcSamples","pcIssued","pcStalled"]},"se":num,"kernel":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"name":str_,"formula":str_,"definitions":str_,"raw":obj,"output":str_,"timeline":{"enum":["dispatch","global"]},"timePages":num,"lanesPerPage":num,"maxOutputBytes":{"type":"integer","minimum":1,"maximum":mcp_analysis::budget("fileBytes"),"description":"Timeline only. Default 16777216 inline or 536870912 with output; may only lower that mode ceiling. Inline values above 16777216 require output."},"workspace":obj,"query":str_,"offset":num,"limit":page_limit}),vec!["captureId","analysis"]),
- ("profile_start","Start a long-lived application for gated live profiling. tracer radv (default) runs a Vulkan server under RADV RGP file-trigger capture: headless compute needs a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only on swapchain presentation, and the capture gets the next eligible submit after each trigger. tracer rocprofv3 starts a HIP/ROCm application armed with ROCP_TOOL_ATTACH=1 so each profile_trigger attaches rocprofv3 for one bounded, time-based collection window; profiler overrides the rocprofv3 path. Returns an ID and log paths immediately. Only one live profile can run at a time; the process is stopped when rocprof-studio shuts down. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"env":obj,"tracer":{"enum":["radv","rocprofv3"]},"profiler":str_}),vec!["argv","cwd"]),
- ("profile_trigger","Fire one capture in a live profile. tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application, collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) plus optional kernelIncludeRegex/kernelExcludeRegex (mapped to --kernel-include-regex/--kernel-exclude-regex, honoured in attach mode including for att data) and optional kernelIterationRange (mapped to --kernel-iteration-range, e.g. \"64\" or \"0-3\": ATT otherwise samples the FIRST occurrence of each kernel name and a name regex cannot discriminate grids that share a name, so an iteration range is the only way to target a later dispatch) into a window-N directory. Two window modes: a TIMED window (windowMs milliseconds, default 5000) that detaches on its own, or a TRIGGERED window (triggered:true, no windowMs) that stays attached until you end it with profile_trigger end:true (writes a newline to rocprofv3's stdin so it detaches) or profile_stop — use it to capture exactly one request without guessing a duration. A window is time- or trigger-based and cannot isolate a single dispatch; only one window is open at a time; detachment can lag by 1-2 minutes (ROCm); and because rocprofv3 pickles each PID's attach options and reattaches only with identical ones, every window of one process must request the same streams, counters, att, kernel filters AND mode (timed vs triggered) — a mismatch is rejected up front, and an empty window still warns at profile_stop. Attach is retried with backoff when the ROCm set_profiler_active handshake times out on a busy queue; attachAttempts and any attachWarning are reported.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"triggered":{"type":"boolean"},"end":{"type":"boolean"},"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_}),vec!["id"]),
- ("profile_status","Check whether a live profiled process is running. tracer radv also reports whether its trigger is pending and how many RGP saves RADV has announced; tracer rocprofv3 reports whether the current attach window is still open (windowRunning) and whether it is a triggered window (windowTriggered). Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
- ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), or every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3). An open triggered window is detached first by writing a newline to rocprofv3's stdin; a timed window detaches on its own. If a window has not detached after ~30 s it is sent SIGINT (rocprofv3's documented alternative detach, which still flushes --attach-sync-output), and only past 180 s is it SIGKILLed with a warning (SIGKILL can truncate the sync-output files). Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
- ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex); kernelIterationRange (--kernel-iteration-range, e.g. \"64\" or \"0-3\") selects which occurrences are sampled, the only way to target a dispatch other than the first under a given kernel name. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_,"tracer":{"enum":["rocprofv3","radv"]},"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
+ ("profile_start","Start a long-lived application for gated live profiling. tracer radv (default) runs a Vulkan server under RADV RGP file-trigger capture: headless compute needs a RADV build with docs/radv-compute-trigger.patch; stock Mesa checks file triggers only on swapchain presentation, and the capture gets the next eligible submit after each trigger. tracer rocprofv3 starts a HIP/ROCm application armed with ROCP_TOOL_ATTACH=1 so each profile_trigger attaches rocprofv3 for one bounded, time-based collection window; profiler overrides the rocprofv3 path. tracer hrx starts an HRX/Loom application that drives the GPU through its own native AMD driver (PM4 on KFD user queues, invisible to rocprofv3) with --device_profiling_* flags appended, so it records its own IREE HAL profile bundle for its whole lifetime: there is no profile_trigger window, and profile_stop interrupts it (SIGINT) to finalize and collect the .irpf; the hrx object is described under profile_run. Returns an ID and log paths immediately. Only one live profile can run at a time; the process is stopped when rocprof-studio shuts down. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"env":obj,"tracer":{"enum":["radv","rocprofv3","hrx"]},"profiler":str_,"hrx":hrx}),vec!["argv","cwd"]),
+ ("profile_trigger","Fire one capture in a live profile (tracers radv and rocprofv3; tracer hrx records the whole run and has no trigger). tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application, collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) plus optional kernelIncludeRegex/kernelExcludeRegex (mapped to --kernel-include-regex/--kernel-exclude-regex, honoured in attach mode including for att data) and optional kernelIterationRange (mapped to --kernel-iteration-range, e.g. \"64\" or \"0-3\": ATT otherwise samples the FIRST occurrence of each kernel name and a name regex cannot discriminate grids that share a name, so an iteration range is the only way to target a later dispatch) into a window-N directory. Two window modes: a TIMED window (windowMs milliseconds, default 5000) that detaches on its own, or a TRIGGERED window (triggered:true, no windowMs) that stays attached until you end it with profile_trigger end:true (writes a newline to rocprofv3's stdin so it detaches) or profile_stop — use it to capture exactly one request without guessing a duration. A window is time- or trigger-based and cannot isolate a single dispatch; only one window is open at a time; detachment can lag by 1-2 minutes (ROCm); and because rocprofv3 pickles each PID's attach options and reattaches only with identical ones, every window of one process must request the same streams, counters, att, kernel filters AND mode (timed vs triggered) — a mismatch is rejected up front, and an empty window still warns at profile_stop. Attach is retried with backoff when the ROCm set_profiler_active handshake times out on a busy queue; attachAttempts and any attachWarning are reported.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"triggered":{"type":"boolean"},"end":{"type":"boolean"},"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_}),vec!["id"]),
+ ("profile_status","Check whether a live profiled process is running. tracer radv also reports whether its trigger is pending and how many RGP saves RADV has announced; tracer rocprofv3 reports whether the current attach window is still open (windowRunning) and whether it is a triggered window (windowTriggered); tracer hrx reports the bundle path and its size so far (bundleBytes grows with each periodic flush). Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
+ ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3), or the native IREE HAL profile bundle (tracer hrx: the application is sent SIGINT and given 90 s to finalize the .irpf before it is killed; the report carries a bundle summary and warns when the bundle is unfinalized, truncated or holds no dispatch events). An open triggered window is detached first by writing a newline to rocprofv3's stdin; a timed window detaches on its own. If a window has not detached after ~30 s it is sent SIGINT (rocprofv3's documented alternative detach, which still flushes --attach-sync-output), and only past 180 s is it SIGKILLed with a warning (SIGKILL can truncate the sync-output files). Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
+ ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex); kernelIterationRange (--kernel-iteration-range, e.g. \"64\" or \"0-3\") selects which occurrences are sampled, the only way to target a dispatch other than the first under a given kernel name. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. tracer hrx is for HRX/Loom applications that drive the GPU through their own native AMD driver (PM4 on KFD user queues): rocprofv3 sees none of their dispatches in any mode, so the application records its own IREE HAL profile bundle instead. argv must be an IREE HAL tooling binary that defines --device_profiling_mode/--device_profiling_output (loom-run, loom-serve, iree-run-module); those flags are appended for you and the run returns one .irpf to open with capture_open (dispatch names, grid, workgroup and device-timestamped durations; no waves, ISA or counters). The hrx object selects families (data families, default queue-events, dispatch-events, executable-metadata), flushIntervalMs (periodic flush, default 25; the native GPU driver keeps only 4096 records per queue between flushes, 0 disables), filterFunction (glob limiting heavy records to matching function names) and allowPartial (lets each device of a GPU + NPU group keep the families it implements; needs a Loom tool built with docs/hrx-device-profiling-allow-partial.patch, otherwise a mixed group aborts on dispatch-events). A run that must be killed at the timeout leaves an unfinalized bundle; use profile_start/profile_stop for servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_,"tracer":{"enum":["rocprofv3","radv","hrx"]},"hrx":hrx,"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
  ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources, compileReports. Default limit 100, clamp 1000 (requests such as 2000 remain accepted). Returns additive effectiveLimit. Follow nextOffset until null; limit zero is count-only and can return a nonadvancing cursor. JSON key/null/nested/escaped-string search semantics are unchanged. Encoded row/page caps are 4/16 MiB, with explicit refusal and offline-export remedies. sources path inventory remains resident. Counter rows include recorded samples. compileReports returns Loom compile-time STATIC facts (unit static, version-zero/same-compiler-horizon), one row per report with report- and per-entry identity, detail flags, target resources (SGPR/VGPR, subgroup geometry, static occupancy percent, limiting resource, residency), instruction mix, allocation/spill and emitted-instruction counters, wait plan and workload geometry; these are compiler evidence, never measurements, dispatches or runtime counts.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":page_limit}),vec!["captureId","dataset"]),
  ("workspace_select","Follow a capture, view, range, wave, instruction or dispatch in the GUI. Views: reference, trace, hardware, summary, sampling, occupancy, dispatch, hotspots, flame, markers, counters, evidence.",json!({"captureId":str_,"view":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"waveId":str_,"dispatchId":str_,"instruction":num,"timeline":str_,"se":num}),vec!["captureId"]),
@@ -2640,7 +2902,7 @@ fn find_outputs(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
         } else if item
             .path()
             .extension()
-            .is_some_and(|e| e == "csv" || e == "json" || e == "att" || e == "out")
+            .is_some_and(|e| e == "csv" || e == "json" || e == "att" || e == "out" || e == "irpf")
         {
             output.push(item.path());
         }
@@ -2739,6 +3001,8 @@ pub fn shutdown(control: &Control, tuning: &tuning::Tuning) {
             Gate::Rocprofv3 { .. } => {
                 let _ = fs::remove_file(format!("/tmp/rocprofv3_attach_{pid}.pkl"));
             }
+            // A killed target leaves its bundle unfinalized; nothing to tidy.
+            Gate::Hrx { .. } => {}
         }
     }
     tuning::stop_all(tuning);
@@ -2913,8 +3177,20 @@ mod tests {
         let window_keys = ROCPROFV3_ONLY_KEYS.iter().filter(|k| k.window).map(|k| k.key).collect::<BTreeSet<_>>();
         let run_universal = set(&["argv", "cwd", "tracer", "env", "timeoutSeconds"]);
         for key in schema("profile_run").as_object().unwrap().keys() {
-            assert_eq!(run_universal.contains(key), !run_keys.contains(key.as_str()),
-                "profile_run key {key}: must be either a universal key or in ROCPROFV3_ONLY_KEYS(run)");
+            let owners = [run_universal.contains(key), run_keys.contains(key.as_str()), HRX_ONLY_KEYS.contains(&key.as_str())];
+            assert_eq!(owners.iter().filter(|o| **o).count(), 1,
+                "profile_run key {key}: must be exactly one of universal, ROCPROFV3_ONLY_KEYS(run) or HRX_ONLY_KEYS");
+        }
+        // profile_start accepts the same hrx object; the schemas and the option /
+        // family tables that build the command line must agree.
+        for tool in ["profile_run", "profile_start"] {
+            let props = schema(tool);
+            let hrx_props: BTreeSet<String> = props["hrx"]["properties"].as_object().unwrap().keys().cloned().collect();
+            assert_eq!(hrx_props, set(&HRX_OPTIONS), "{tool} hrx properties vs HRX_OPTIONS");
+            let families: BTreeSet<String> = props["hrx"]["properties"]["families"]["items"]["enum"]
+                .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            assert_eq!(families, set(&HRX_FAMILIES), "{tool} hrx families enum vs HRX_FAMILIES");
+            assert!(props["tracer"]["enum"].as_array().unwrap().contains(&json!("hrx")), "{tool}");
         }
         // `end` is a command (its own check), `id` is universal; all else is a window key.
         let trigger_universal = set(&["id", "end"]);
@@ -3117,6 +3393,118 @@ mod tests {
         assert!(v["nextOffset"].is_null());
         flag.store(true, Ordering::SeqCst);
         assert!(page(json!([1]), &json!({}), &flag).is_err());
+    }
+    #[test]
+    fn hrx_flags_are_built_from_the_hrx_object_and_validated() {
+        let out = Path::new("/jobs/x/hrx-profile.irpf");
+        let app = vec!["loom-serve".to_owned(), "--device=amdgpu://0".to_owned()];
+        let build = |a: Value| hrx_profiling_flags(&a, &app, out);
+        // Defaults: dispatch timing with its metadata, and a periodic flush so the
+        // driver's bounded per-queue ring does not drop records.
+        assert_eq!(
+            build(json!({})).unwrap(),
+            [
+                "--device_profiling_mode=queue-events,dispatch-events,executable-metadata",
+                "--device_profiling_output=/jobs/x/hrx-profile.irpf",
+                "--device_profiling_flush_interval_ms=25",
+            ]
+        );
+        assert_eq!(
+            build(json!({"hrx":{"families":["queue-events","executable-metadata"],"flushIntervalMs":0,"filterFunction":"g_mv_*","allowPartial":true}})).unwrap(),
+            [
+                "--device_profiling_mode=queue-events,executable-metadata",
+                "--device_profiling_output=/jobs/x/hrx-profile.irpf",
+                "--device_profiling_filter_function=g_mv_*",
+                "--device_profiling_allow_partial=true",
+            ]
+        );
+        assert!(!build(json!({"hrx":{"allowPartial":false}})).unwrap().iter().any(|f| f.contains("allow_partial")));
+        for bad in [
+            json!({"hrx":[]}),
+            json!({"hrx":{"families":[]}}),
+            json!({"hrx":{"families":["waves"]}}),
+            json!({"hrx":{"families":["queue-events","queue-events"]}}),
+            json!({"hrx":{"flushIntervalMs":60001}}),
+            json!({"hrx":{"flushIntervalMs":-1}}),
+            json!({"hrx":{"filterFunction":""}}),
+            json!({"hrx":{"allowPartial":"yes"}}),
+            json!({"hrx":{"outputPath":"/elsewhere"}}),
+        ] {
+            assert!(build(bad.clone()).is_err(), "{bad}");
+        }
+        // The profiling flags are managed: an argv that already carries one is refused.
+        for managed in ["--device_profiling_mode=dispatch-events", "--device_profiling_output=/x", "--print_device_statistics"] {
+            let argv = vec!["loom-serve".to_owned(), managed.to_owned()];
+            assert!(hrx_profiling_flags(&json!({}), &argv, out).unwrap_err().contains("managed by tracer hrx"), "{managed}");
+        }
+        let catalog = tools();
+        for tool in ["profile_run", "profile_start"] {
+            let schema = &catalog.iter().find(|t| t["name"] == tool).unwrap()["inputSchema"];
+            assert!(validate(&json!({"argv":["app"],"cwd":"/","tracer":"hrx","hrx":{"families":["dispatch-events"],"flushIntervalMs":10,"allowPartial":true}}), schema).is_ok(), "{tool}");
+            assert!(validate(&json!({"argv":["app"],"cwd":"/","tracer":"hrx","hrx":{"families":["waves"]}}), schema).is_err(), "{tool}");
+            assert!(validate(&json!({"argv":["app"],"cwd":"/","tracer":"hrx","hrx":{"sink":"x"}}), schema).is_err(), "{tool}");
+        }
+    }
+    #[test]
+    fn hrx_report_names_why_a_bundle_is_missing_or_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        let output = folder.join(HRX_BUNDLE);
+        let warnings = |report: &Value| report["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        // No bundle and nothing on stderr: the target is not an IREE tooling binary.
+        let report = hrx_report(&folder, &output, "completed");
+        assert!(report["files"].as_array().unwrap().is_empty());
+        assert!(warnings(&report)[0].contains("wrote no profile bundle"), "{report}");
+        // A mixed device group aborting on the NPU is named, with both remedies.
+        fs::write(folder.join("stderr.log"), "hrx-system/runtime/src/iree/hal/driver/amd/xdna/profile.c:85: UNIMPLEMENTED; unsupported XDNA profiling data families 0x8\n").unwrap();
+        let report = hrx_report(&folder, &output, "failed");
+        assert!(warnings(&report).iter().any(|w| w.contains("rejected a requested data family") && w.contains("allowPartial")), "{report}");
+        // An unpatched tool asked for allowPartial.
+        fs::write(folder.join("stderr.log"), "flags.c:521: INVALID_ARGUMENT; flag 'device_profiling_allow_partial' not recognized\n").unwrap();
+        let report = hrx_report(&folder, &output, "failed");
+        assert!(warnings(&report).iter().any(|w| w.contains("hrx-device-profiling-allow-partial.patch")), "{report}");
+        // An unfinalized bundle (24-byte header, file_length 0) is reported, not hidden.
+        fs::write(folder.join("stderr.log"), "").unwrap();
+        let mut header = vec![0u8; 24];
+        header[0..4].copy_from_slice(&0x4650_5249u32.to_le_bytes());
+        header[4..6].copy_from_slice(&2u16.to_le_bytes());
+        header[8..12].copy_from_slice(&24u32.to_le_bytes());
+        fs::write(&output, &header).unwrap();
+        assert!(!irpf_finalized(&output));
+        let report = hrx_report(&folder, &output, "killed");
+        assert_eq!(report["files"].as_array().unwrap().len(), 1);
+        assert_eq!(report["bundle"]["finalized"], false);
+        assert!(warnings(&report).iter().any(|w| w.contains("not finalized")), "{report}");
+        header[16..24].copy_from_slice(&24u64.to_le_bytes());
+        fs::write(&output, &header).unwrap();
+        assert!(irpf_finalized(&output));
+        assert!(!irpf_finalized(&folder.join("absent.irpf")));
+    }
+    #[test]
+    fn native_kfd_hint_needs_both_a_kfd_user_and_no_rocm_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        let write = |name: &str, body: &[u8]| {
+            let mut image = b"\x7fELF".to_vec();
+            image.extend_from_slice(body);
+            fs::write(folder.join(name), image).unwrap();
+            name.to_owned()
+        };
+        // Static native-driver binary: opens /dev/kfd, never names ROCr or HIP.
+        let native = write("loom-serve", b"....open /dev/kfd ....renderD....");
+        let hint = native_kfd_hint(&native, &folder).unwrap();
+        assert!(hint.contains("tracer hrx") && hint.contains("/dev/kfd"), "{hint}");
+        // A binary that can load ROCr (legacy HRX dlopens it) is visible to rocprofv3.
+        let legacy = write("llama-hrx", b"/dev/kfd libhsa-runtime64.so.1");
+        assert!(native_kfd_hint(&legacy, &folder).is_none());
+        let hip = write("llama-hip", b"/dev/kfd libamdhip64.so.6");
+        assert!(native_kfd_hint(&hip, &folder).is_none());
+        // An ordinary launcher that touches neither gets no hint.
+        let plain = write("python3", b"just an interpreter");
+        assert!(native_kfd_hint(&plain, &folder).is_none());
+        fs::write(folder.join("script.sh"), b"#!/bin/sh\n/dev/kfd\n").unwrap();
+        assert!(native_kfd_hint("script.sh", &folder).is_none());
+        assert!(native_kfd_hint("missing", &folder).is_none());
     }
     #[test]
     fn profile_env_accepts_plain_variables_and_refuses_reserved_ones() {

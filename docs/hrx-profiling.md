@@ -20,6 +20,21 @@ gfx1151 device through native `amdgpu`, exposed to llama.cpp as an `HRX0` device
 compiled kernel. rocprof studio imports those reports as static compile facts;
 see the Loom compile reports section below.
 
+## Two HRX drivers, two visibilities
+
+Whether rocprofv3 can see an HRX or Loom run depends on which GPU driver the
+binary was built with. This decides everything else on this page.
+
+| Driver | How it dispatches | rocprofv3 | Native IRPF profile |
+|---|---|---|---|
+| **Legacy ROCr driver** (`legacy-amdgpu`, what hrx-b99 `libhrx` uses) | loads `libhsa-runtime64` and submits AQL packets to ROCr queues | visible: kernel trace, counters, ATT | `HRX_PROFILE_FILE` / `HRX_PROFILE_MODE` |
+| **Native AMD driver** (`amdgpu://`, `rdna://`; what current `loom-serve`, `loom-run` and `loom-benchmark` use) | opens `/dev/kfd` itself, creates its own KFD user queues and writes PM4 into them | **invisible in every mode** | `--device_profiling_mode` / `--device_profiling_output` |
+
+The second row is the current Loom tooling in hrx-system (verified at
+`23e9b32232`, branch `loom-working`, gfx1151). See
+[Native AMD driver: PM4 direct dispatch](#native-amd-driver-pm4-direct-dispatch)
+below for the mechanism, the reproduction and the collection path that works.
+
 ## Pinned beta
 
 | Item | Value |
@@ -149,6 +164,207 @@ service (`capture_open` → `capture_query` → `capture_analyze`):
 | `hook-dispatch/trace.irpf` | 4,540 | 46 | 46 | 19 kernel rows (top by time: `ggml_mul_mat_swiglu_q4_q8_1_x4_lowtoken_dot_q8_output`, 289 dispatches) |
 | `hook-queue/trace.irpf` | 1,708 | 46 | 0 | 19 kernel rows (no device timing) |
 
+## Native AMD driver: PM4 direct dispatch
+
+Verified on gfx1151 against hrx-system `23e9b32232` (`loom-working`), the tree
+that holds the Qwen3.8-27B hybrid project (`loom/models/qwen3.8-27b-hybrid`).
+
+### Why rocprofv3 returns nothing
+
+The Loom tools are built with the native AMD driver only (`-DLIBHRX_BUILD=OFF
+-DIREE_HAL_DRIVER_AMD_GPU=ON -DIREE_HAL_DRIVER_AMD_XDNA=ON`). `loom-serve` is a
+static binary: `ldd` shows libc, libm, libstdc++ and libgcc, and its strings
+contain `/dev/kfd` but neither `libhsa-runtime64` nor `libamdhip64`.
+
+- `libamdf` opens `/dev/kfd` (`libamdf/src/gpu/umd/kfd/file.h:24`) and creates
+  the compute queue with `AMDKFD_IOC_CREATE_QUEUE`
+  (`libamdf/src/gpu/umd/kfd/user_queue_native.c:46`) as
+  `KFD_IOC_QUEUE_TYPE_COMPUTE` — a PM4 user queue, not `COMPUTE_AQL`
+  (`libamdf/src/gpu/umd/kfd/target/pm4_queue.c:99`).
+- The HAL driver prefers PM4 on every non-CDNA GPU
+  (`runtime/src/iree/hal/driver/amd/gpu/device.c:1091-1095`; its README: "The
+  default prefers PM4 on RDNA and AQL on CDNA").
+- Dispatches are `DISPATCH_DIRECT` packets the driver encodes itself
+  (`iree_hal_amd_gpu_pm4_emit_dispatch_direct`,
+  `runtime/src/iree/hal/driver/amd/gpu/queue/pm4/commands.h:49`) and publishes by
+  storing the write index and ringing the doorbell
+  (`runtime/src/iree/hal/driver/amd/gpu/queue/pm4/publication.c:162-168`).
+
+rocprofiler-sdk observes dispatches by hooking ROCr's AQL queues inside the
+target. A process that never loads ROCr gives it nothing to hook, so this is a
+"producer cannot emit it through that interface" limit, not a rocprofv3 option
+that was missed. Every mode was tried against 192,000 real dispatches of
+`loom-benchmark` on `amdgpu://0` (rocprofv3 1.4.1, ROCm 10.1):
+
+| Attempt | Result |
+|---|---|
+| `--kernel-trace` (direct launch) | exit 0, **no output file** |
+| `--kernel-trace --hip-trace --hsa-trace --marker-trace` | exit 0, no output file |
+| `--kernel-trace --pmc SQ_WAVES` | exit 0, no output file |
+| `--kernel-trace --att --att-target-cu 0 --att-simd-select 0xF --att-buffer-size 0x6000000 --att-shader-engine-mask 0x1` | exit 0, no output file (kernel logs `failed to disable PTL`) |
+| `--sys-trace --kfd-trace --stats --summary` | exit 0, no output file |
+| `--attach PID` on a target started with `ROCP_TOOL_ATTACH=1` | exit 1: `Calling attach in librocprofiler-sdk-rocattach.so.1 returned non-zero status 1`; no output file; target unaffected |
+
+`profile_run` and `profile_stop` now name this case instead of returning an empty
+file list: when rocprofv3 leaves no output and the target is an ELF that opens
+`/dev/kfd` without referencing `libhsa-runtime64` or `libamdhip64`, the report
+carries a warning that points at tracer `hrx`.
+
+### What the native driver can record
+
+`iree_hal_amd_gpu_profile_begin` accepts exactly three data families
+(`runtime/src/iree/hal/driver/amd/gpu/profile.c:626-628`): `queue-events`,
+`dispatch-events` and `executable-metadata`. Anything else fails with
+`unsupported GPU profiling data families`; hardware counters fail with `GPU queue
+profiling does not support hardware counters`. There is **no ATT/SQTT, wave or
+counter path in the native driver**, so waves and ISA hotspots cannot be collected
+for these kernels by any tool today.
+
+`dispatch-events` gives one record per dispatch with the function, workgroup
+counts and sizes, and a start/end pair of raw device ticks at 99,810,000 Hz. The
+samples "bracket dispatch issue and completion joins"
+(`runtime/src/iree/hal/driver/amd/gpu/profile.h`), and on the real capture below
+they never overlap.
+
+Two producer behaviours shape collection:
+
+- **A bounded ring.** The driver keeps 4,096 records per queue between flushes
+  (`IREE_HAL_AMD_GPU_PROFILE_CAPACITY`, `gpu/profile.c:335`) and drops the rest,
+  marking the chunk `TRUNCATED`. Two 48-token requests on the hybrid model, with
+  no periodic flush, kept 4,096 of 16,312 queue events on the busy queue and
+  dropped 12,216. With a periodic flush (20 or 25 ms) the same workload lost none.
+- **One session per device, one request for the whole group.** The tooling begins
+  profiling on every device of a device group with the same family set
+  (`runtime/src/iree/tooling/device_profiling.c`). The XDNA NPU driver implements
+  `queue-events`, `host-execution`, `counters` and `executable-metadata`
+  (`runtime/src/iree/hal/driver/amd/xdna/profile.c:59-64`) but not
+  `dispatch-events`, so a GPU + NPU group asked for dispatch timing fails with
+  `xdna/profile.c:85: UNIMPLEMENTED; unsupported XDNA profiling data families 0x8`
+  and the server exits 1. The only family set both accept is `queue-events` +
+  `executable-metadata`, which carries no dispatch record at all.
+
+### Collecting: tracer `hrx`
+
+`profile_run`, `profile_start` and `profile_stop` take `tracer: "hrx"`. The target
+must be an IREE HAL tooling binary that defines `--device_profiling_mode` and
+`--device_profiling_output`; those flags are appended to the argv you pass, so an
+argv that already carries one is rejected.
+
+| `hrx` option | Flag | Default |
+|---|---|---|
+| `families` | `--device_profiling_mode` | `queue-events`, `dispatch-events`, `executable-metadata` |
+| `flushIntervalMs` | `--device_profiling_flush_interval_ms` | 25 (0 disables) |
+| `filterFunction` | `--device_profiling_filter_function` | none |
+| `allowPartial` | `--device_profiling_allow_partial=true` | off |
+
+The target records for its whole lifetime, so there is no `profile_trigger`
+window. `profile_stop` sends SIGINT, waits up to 90 s for the bundle to be
+finalized (the header's file length is written with the last session-end record),
+and kills the target only after that. The report carries the `.irpf` path, a
+structural summary (sessions, producers, functions, dispatch events, queue events,
+truncated families) and a warning for each way the bundle can fall short: not
+written, not finalized, truncated, no dispatch events, a device rejecting a
+family, or an unknown flag.
+
+```jsonc
+{"name":"profile_start","arguments":{
+  "tracer":"hrx","cwd":"/path/to/run",
+  "argv":["/path/to/loom-serve","--device=amdgpu://0","--model=/path/to/model","--listen=127.0.0.1:8093"]}}
+// ... wait for /v1/models to report ready, send the requests to profile ...
+{"name":"profile_stop","arguments":{"id":"<id>"}}
+{"name":"capture_open","arguments":{"path":"<job>/hrx-profile.irpf"}}
+```
+
+### A GPU + NPU device group needs a patched tool
+
+For a hybrid deployment, stock tooling cannot give GPU dispatch timing: the NPU
+aborts the group. [`hrx-device-profiling-allow-partial.patch`](hrx-device-profiling-allow-partial.patch)
+adds `--device_profiling_allow_partial` to `runtime/src/iree/tooling/device_profiling.c`
+(84 added lines, against `23e9b32232`): when a device reports a family as
+unimplemented, it is retried with the largest subset of the requested families it
+accepts, and each reduction is printed on stderr. Drivers validate families before
+they touch the sink, so a rejected attempt leaves no session behind. The patch is
+not applied to hrx-system; build a patched `loom-serve` from a copy of the tree and
+pass `hrx.allowPartial: true`.
+
+With it, the hybrid server prints `device_profiling: device 1 keeps data families
+0x21 of requested 0x29` and the GPU records dispatch events while the NPU records
+queue events and executable metadata.
+
+### The real capture
+
+Qwen3.8-27B hybrid (`amdgpu://0` + `xdna://0?columns=8`), patched `loom-serve`,
+one 60-token prompt with 48 generated tokens and one 5,556-token prompt with 24,
+collected with `profile_start`/`profile_stop` (tracer `hrx`, `allowPartial`) and
+opened through a private headless instance of the release binary:
+
+| Fact | Value |
+|---|---:|
+| Bundle | 7,662,769 bytes, finalized, 2 sessions (`amd-gpu`, `xdna`), nothing truncated |
+| Dispatches | 47,875, all on `HRX device 0 (amd-gpu)`, `HRX queue 0` |
+| Kernel names resolved | 101 distinct, none unresolved |
+| Elapsed span | 11.991 s of device time |
+| Queue events | 16,590 (counted, not imported) |
+| Waves / ISA rows / counters | 0 / 0 / 0 |
+
+Top kernels by total device time (`capture_analyze`, `kernels`):
+
+| Kernel | Dispatches | Total |
+|---|---:|---:|
+| `g_gemm_q4_k_store_m256` | 962 | 3,229.5 ms |
+| `g_gemm_q4_k_swiglu_m256_rt` | 188 | 1,024.4 ms |
+| `g_gemm_q6_k_store_m256` | 412 | 940.7 ms |
+| `g_gemm_q4_k_swiglu_m256` | 94 | 763.8 ms |
+| `g_mv_q4_k_k5120_swiglu_t8_q8` | 1,196 | 569.9 ms |
+| `g_gdn_recurrence` | 2,640 | 476.1 ms |
+
+A dispatch row reads, for example, `g_gemm_q4_k_store_m256_rt`, grid `18432 × 4 ×
+1`, workgroup `256 × 1 × 1`, 3.17 ms.
+
+### What the importer does with these bundles
+
+- **Each chunk is attributed to its own session, device and queue.** The native
+  driver splits a family across many chunks (one per queue and per flush) and
+  states the session, physical device ordinal, queue ordinal and stream only in
+  the chunk header. The importer walks chunks individually: a dispatch's agent is
+  `HRX device N (producer)`, its queue `HRX queue N`, and its function name is
+  resolved inside its own session, because executable identifiers are
+  session-local and a GPU and an NPU session can reuse one.
+- **Device clock domains stay apart.** Every device that records ticks has its own
+  origin and frequency. Ticks of two devices are never compared.
+- **Dispatch ids stay unique.** `event_id` is unique only within one dispatch
+  stream; with more than one stream the id becomes `dispatch-events:s<stream>:<id>`.
+- **A device that recorded no dispatch is named.** For the hybrid capture the
+  warning reads that `HRX device 1 (xdna)` recorded no dispatch records, so NPU
+  work is absent from the dispatch table and from every per-kernel total.
+- **A bundle with no dispatch record is rejected, not opened empty.** The
+  `queue-events` + `executable-metadata` bundle of a stock hybrid server, and the
+  bundle an aborted session leaves, used to open as a capture with 0 dispatches
+  labelled "queue mode". They now fail with what the bundle does hold (sessions,
+  producers, functions, queue events) and how to get dispatches.
+- **Queue events are counted, not imported.** They are host-timestamped admission
+  records with no kernel identity; the count is in `metadata.hrxQueueEventCount`.
+
+### What still does not work
+
+- **rocprofv3 on the native driver**, in any mode. Nothing to collect.
+- **Waves, ISA hotspots and hardware counters** for native-driver kernels. The
+  driver implements no executable-trace or counter family.
+- **NPU work.** The XDNA driver records queue events and executable metadata only.
+  Kernels placed on the NPU never appear as dispatches.
+- **Hybrid dispatch timing without the patch.** A stock `loom-serve` on a GPU +
+  NPU group either aborts or records no dispatch.
+- **`loom-run` with `dispatch-events`** at this checkout: the single direct
+  dispatch fails with `pm4/queue.c:2077: FAILED_PRECONDITION; dispatch capture
+  requires command buffer profile metadata`. `loom-serve` works; `loom-benchmark`
+  has its own `--profile-final-batch` / `--profile-artifacts-dir` flags and writes
+  `.irpf` files that open directly.
+- **Host timeline.** Ticks are device-relative, as for hrx-b99 bundles.
+- **Published model cards from another compiler horizon.** The `loom-fun` cards in
+  the Hugging Face cache (Qwen2.5-0.5B, Qwen3-4B) do not compile with this tree
+  (`PARSE/006: unknown op 'vector.constant'`), so they could not be used as a
+  smaller workload.
+
 ## HRX kernel-name families
 
 The read-side classifier (`src/kernelName.ts`) recognises two HRX/loom families
@@ -166,6 +382,17 @@ Model-specific fused kernels (`qwen*`, `llm_attention_*`) are intentionally left
 as plain names: they carry no stable backend prefix to key a family on, and
 classifying by one workload's model name would over-fit. See
 [kernel-name-layer.md](kernel-name-layer.md).
+
+Loom programs add one more family:
+
+- `__command_launch_counts_N` → **loom-internal**: the launch-count realization
+  kernel the Loom command-program lowering synthesises
+  (`loom/src/loom/target/arch/cmd/lower/launch_count_realization.c`), marked
+  internal.
+
+Authored Loom kernels stay plain. A Loom kernel is named by its author's
+`kernel.def export("…")`, so `g_mv_q4_k_k5120_t8_q8`, `g_gdn_recurrence` or
+`native_*` follow one model generator's convention, not a compiler-wide one.
 
 ## ROCm-side limitations observed during collection
 
@@ -357,10 +584,15 @@ additionally sweeps the original `benchmark-live` bundle directory when present.
   cancellable, fingerprinted path the GUI, headless CLI and MCP all use) by the
   `.irpf` extension and by an IRPF magic sniff, so an oddly-named bundle still
   opens.
-- Tests: synthetic round-trip, malformed/unfinalized rejection and cap behaviour
-  run by default; the exact-count round-trips of the two retained bundles are
-  `#[ignore]` and gated on `ROCPROF_IRPF_DISPATCH_BUNDLE` /
-  `ROCPROF_IRPF_QUEUE_BUNDLE` (README, "Tests that do not run by default").
+- Tests: synthetic round-trip, malformed/unfinalized rejection, cap behaviour, the
+  device-group attribution and the two real native-driver bundles under
+  `fixtures/irpf/` run by default; the exact-count round-trips of the retained
+  hrx-b99 bundles and of the Loom hybrid serving bundle are `#[ignore]` and gated
+  on `ROCPROF_IRPF_DISPATCH_BUNDLE` / `ROCPROF_IRPF_QUEUE_BUNDLE` /
+  `ROCPROF_IRPF_LOOM_HYBRID_BUNDLE` (README, "Tests that do not run by default").
+- Collection: tracer `hrx` in `src-tauri/src/mcp.rs` (`hrx_profiling_flags`,
+  `hrx_report`, `Gate::Hrx`) for `profile_run`, `profile_start` and
+  `profile_stop`, plus `native_kfd_hint` for an empty rocprofv3 result.
 - Loom compile-report importer: `crates/profile-core/src/loom_report.rs`, reached
   through the same router by the `.compile-report.json` suffix or a
   `loom.compile_report` content sniff, so a report named `.summary.json` or

@@ -11,6 +11,21 @@ Releases are recorded here without git tags. 0.3.0 is the current state of `main
 
 ## [Unreleased]
 
+### Added
+
+- Tracer `hrx` for `profile_run`, `profile_start` and `profile_stop`: collects the native IREE HAL profile of an HRX/Loom application that dispatches PM4 on its own KFD user queues (the native AMD driver used by `loom-serve`, `loom-run` and `loom-benchmark`), which rocprofv3 cannot observe in any trace, counter or ATT mode. The `hrx` object selects `families`, `flushIntervalMs`, `filterFunction` and `allowPartial`. `profile_stop` interrupts the application and waits for the bundle to be finalized; the report carries a bundle summary and a warning for each way it can fall short.
+- `docs/hrx-device-profiling-allow-partial.patch`, a hrx-system tooling patch that lets each device of a GPU + NPU device group keep the profiling families it implements. Without it a hybrid Loom deployment aborts when asked for dispatch timing.
+- Kernel family `loom-internal` for the `__command_launch_counts_N` kernels the Loom compiler synthesises.
+
+### Changed
+
+- The IRPF importer attributes every chunk to its own session, physical device and queue, resolves function names inside the dispatch's session, keeps each device's clock domain apart, and names a device that recorded no dispatch. Agents now read `HRX device N (producer)` when the producer names itself, and multi-queue bundles read `HRX queue N`.
+- An IRPF bundle with no dispatch record is rejected with what it holds (sessions, producers, functions, queue events) instead of opening as a capture with 0 dispatches.
+
+### Fixed
+
+- `profile_run` and `profile_stop` no longer return a silent empty file list when rocprofv3 writes nothing for an application that opens `/dev/kfd` without loading the ROCm runtime; the report names the cause and points at tracer `hrx`.
+
 ## [0.3.0] - 2026-10-14
 
 ### Changed

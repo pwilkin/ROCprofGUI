@@ -21,6 +21,7 @@ export type KernelFamily =
   | "radv-code-object" // "code object N": a RADV code object with no PSO name
   | "hrx-ggml" // "ggml_…": a compute kernel from the HRX/loom ggml backend
   | "hrx-runtime" // "iree_hal_amdgpu_device_…": an HRX runtime device-library kernel
+  | "loom-internal" // "__command_launch_counts_N": a kernel the Loom compiler synthesises
   | "mangled" // an Itanium-mangled C++ symbol ("_Z…"); demangle in the tuning worker
   | "plain" // a plain or already-demangled name
   | "unknown"; // empty or unrecognised
@@ -174,3 +175,30 @@ export function hrxKernelFamily(name: string): KernelNameInfo | null {
 }
 
 registerKernelFamily(hrxKernelFamily);
+
+/** Kernels the Loom compiler synthesises itself, as observed in native IREE HAL
+ *  profiles of Loom programs run through the native AMD GPU driver:
+ *  - `__command_launch_counts_N` — the launch-count realization kernel the
+ *    command-program lowering emits (hrx-system
+ *    `loom/src/loom/target/arch/cmd/lower/launch_count_realization.c`), one per
+ *    command program. It is compiler plumbing, not an authored kernel, so it is
+ *    marked internal like RADV's internal command shaders.
+ *
+ *  Authored Loom kernels are NOT classified by name. A Loom kernel is named by its
+ *  author's `kernel.def export("…")`, so the names seen in one model's programs
+ *  (`g_mv_q4_k_k5120_t8_q8`, `g_gdn_recurrence`, `native_*`, `imsilu`) follow that
+ *  generator's own convention and carry no compiler- or backend-wide prefix; they
+ *  stay plain. This matcher keys only on the exact synthesised grammar, so it
+ *  defers on every other name. */
+export function loomKernelFamily(name: string): KernelNameInfo | null {
+  if (/^__command_launch_counts_\d+$/.test(name))
+    return {
+      family: "loom-internal",
+      base: name,
+      mangled: false,
+      internal: true,
+    };
+  return null;
+}
+
+registerKernelFamily(loomKernelFamily);

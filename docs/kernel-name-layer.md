@@ -98,6 +98,9 @@ grid/workgroup fix aside).
    (`hrxKernelFamily`) for the two producer-observed prefixes — `ggml_*` → `hrx-ggml`
    and `iree_hal_amdgpu_device_*` → `hrx-runtime` (internal). Model-specific fused
    kernels (`qwen*`, `llm_attention_*`) stay plain, having no stable backend prefix.
+   A second matcher (`loomKernelFamily`) marks the `__command_launch_counts_N`
+   kernels the Loom compiler synthesises as `loom-internal`; authored Loom kernels
+   are named by their own `kernel.def export("…")` and stay plain.
    No tuning path exists for HRX, so `canonical_kernel`/`kernel_base` are untouched.
 4. **Identity mechanism.** IRPF code-object identity is the session-local
    `code_object_id` (the hardware-trace marker id) plus the embedded ELF image and its

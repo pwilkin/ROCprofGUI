@@ -95,6 +95,33 @@ it("classifies the HRX/loom kernel families from their observed name prefixes", 
   }
 });
 
+it("marks Loom compiler-synthesised kernels internal and leaves authored Loom names plain", () => {
+  // Observed in native profiles of the Qwen3.8-27B hybrid Loom programs (gfx1151).
+  for (const name of ["__command_launch_counts_0", "__command_launch_counts_12"]) {
+    const info = classifyKernelName(name);
+    expect(info.family).toBe("loom-internal");
+    expect(info.internal).toBe(true);
+    expect(info.base).toBe(name);
+    expect(isInternalKernel(name)).toBe(true);
+  }
+  // Authored kernels are named by their own export; no backend-wide prefix exists.
+  for (const name of [
+    "g_mv_q4_k_k5120_t8_q8",
+    "g_gemm_q4_k_store_m256",
+    "g_gdn_recurrence",
+    "g16_attention_split_listed",
+    "increment",
+  ]) {
+    const info = classifyKernelName(name);
+    expect(info.family).toBe("plain");
+    expect(info.internal).toBe(false);
+  }
+  // Only the exact synthesised grammar matches.
+  for (const name of ["__command_launch_counts_", "__command_launch_counts_x", "command_launch_counts_0", "__command_program_normalization"]) {
+    expect(classifyKernelName(name).family).not.toBe("loom-internal");
+  }
+});
+
 it("lets a new backend family register a matcher that takes precedence", () => {
   const hrx: KernelNameInfo = {
     family: "plain",
