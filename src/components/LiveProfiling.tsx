@@ -6,13 +6,26 @@ import {
   liveProfileStatus,
   liveProfileStop,
 } from "../bridge";
+import {
+  HRX_DEFAULT_FAMILIES,
+  HRX_DEFAULT_FLUSH_MS,
+  HRX_LIMITS,
+  emptyHrxForm,
+  hrxBundleLines,
+  hrxOptions,
+  hrxStatusLine,
+  isHrxResult,
+  type HrxForm,
+} from "../liveProfileHrx";
 
 type Json = Record<string, unknown>;
 
 // Compact desktop surface for the four live-profiling commands. It drives the
 // same core the MCP tools use (profile_start/trigger/status/stop); the logic is
 // not forked. rocprofv3 windows can be timed (windowMs) or triggered (end on
-// demand), and carry the same stream/counter/att/kernel-filter selection.
+// demand), and carry the same stream/counter/att/kernel-filter selection. The
+// hrx tracer has no window: its options go with the start request, the target
+// records its whole run, and the collected bundle is summarised on stop.
 export default function LiveProfiling() {
   const [tracer, setTracer] = useState("rocprofv3");
   const [argv, setArgv] = useState("");
@@ -30,6 +43,7 @@ export default function LiveProfiling() {
   const [includeRegex, setIncludeRegex] = useState("");
   const [excludeRegex, setExcludeRegex] = useState("");
   const [iterationRange, setIterationRange] = useState("");
+  const [hrxForm, setHrxForm] = useState<HrxForm>(emptyHrxForm);
   const [profile, setProfile] = useState<Json | null>(null);
   const [status, setStatus] = useState<Json | null>(null);
   const [result, setResult] = useState<Json | null>(null);
@@ -49,6 +63,13 @@ export default function LiveProfiling() {
   }, []);
 
   const rocprofv3 = tracer === "rocprofv3";
+  const hrx = tracer === "hrx";
+  const setHrx = (patch: Partial<HrxForm>) => setHrxForm((form) => ({ ...form, ...patch }));
+  const toggleHrxFamily = (family: string, on: boolean) =>
+    setHrxForm((form) => ({
+      ...form,
+      families: on ? [...form.families, family] : form.families.filter((f) => f !== family),
+    }));
   const list = (s: string) => s.split(/[\s,]+/).filter(Boolean);
   // Parses a nonnegative-integer option field; blank means "not set".
   const intOption = (label: string, raw: string): number | undefined => {
@@ -76,6 +97,8 @@ export default function LiveProfiling() {
     run(async () => {
       const args: Json = { argv: list(argv), cwd, tracer };
       if (rocprofv3 && profiler.trim()) args.profiler = profiler.trim();
+      // Validated here so a bad field is reported before a process is started.
+      if (hrx) args.hrx = hrxOptions(hrxForm);
       const started = await liveProfileStart(args);
       if (!mounted.current) return;
       setProfile(started);
@@ -175,7 +198,8 @@ export default function LiveProfiling() {
       <p>
         Launch an application and gate GPU capture through the same core the MCP
         profile tools use. RADV captures RGP frames on a file trigger; rocprofv3
-        attaches for timed or triggered windows.
+        attaches for timed or triggered windows; hrx has an HRX/Loom application
+        record its own dispatch profile for its whole run.
       </p>
       {!profile ? (
         <section className="live-form">
@@ -184,6 +208,7 @@ export default function LiveProfiling() {
             <select value={tracer} onChange={(e) => setTracer(e.target.value)} disabled={busy}>
               <option value="rocprofv3">rocprofv3 (HIP/ROCm attach)</option>
               <option value="radv">radv (Vulkan RGP)</option>
+              <option value="hrx">hrx (HRX/Loom native profile)</option>
             </select>
           </label>
           <label>
@@ -209,6 +234,85 @@ export default function LiveProfiling() {
                 disabled={busy}
               />
             </label>
+          )}
+          {hrx && (
+            <>
+              <ul className="live-note" aria-label="What the hrx tracer records">
+                {HRX_LIMITS.map((limit) => (
+                  <li key={limit}>{limit}</li>
+                ))}
+              </ul>
+              <label>
+                Data families
+                <select
+                  value={hrxForm.familyMode}
+                  onChange={(e) => setHrx({ familyMode: e.target.value as HrxForm["familyMode"] })}
+                  disabled={busy}
+                >
+                  <option value="default">Default ({HRX_DEFAULT_FAMILIES.join(", ")})</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+              {hrxForm.familyMode === "custom" && (
+                <div className="live-att">
+                  {HRX_DEFAULT_FAMILIES.map((family) => (
+                    <label key={family} className="live-check">
+                      <input
+                        type="checkbox"
+                        checked={hrxForm.families.includes(family)}
+                        onChange={(e) => toggleHrxFamily(family, e.target.checked)}
+                        disabled={busy}
+                      />
+                      {family}
+                    </label>
+                  ))}
+                  <label>
+                    Other families
+                    <input
+                      value={hrxForm.extraFamilies}
+                      onChange={(e) => setHrx({ extraFamilies: e.target.value })}
+                      placeholder="host-execution, counters (XDNA only)"
+                      disabled={busy}
+                    />
+                  </label>
+                </div>
+              )}
+              <label>
+                Flush interval (ms)
+                <input
+                  type="number"
+                  min={0}
+                  max={60000}
+                  value={hrxForm.flushIntervalMs}
+                  onChange={(e) => setHrx({ flushIntervalMs: e.target.value })}
+                  placeholder={`${HRX_DEFAULT_FLUSH_MS} (0 turns the periodic flush off)`}
+                  disabled={busy}
+                />
+              </label>
+              <label>
+                Function filter (optional glob)
+                <input
+                  value={hrxForm.filterFunction}
+                  onChange={(e) => setHrx({ filterFunction: e.target.value })}
+                  placeholder="g_gemm_*"
+                  disabled={busy}
+                />
+              </label>
+              <label className="live-check">
+                <input
+                  type="checkbox"
+                  checked={hrxForm.allowPartial}
+                  onChange={(e) => setHrx({ allowPartial: e.target.checked })}
+                  disabled={busy}
+                />
+                Allow partial families per device
+              </label>
+              <p className="live-note">
+                Needed for a GPU + NPU group: each device keeps the families it implements instead of the
+                whole group failing. The application must define <code>--device_profiling_allow_partial</code>{" "}
+                (docs/hrx-device-profiling-allow-partial.patch).
+              </p>
+            </>
           )}
           <button onClick={start} disabled={busy || !argv.trim() || !cwd.trim()}>
             Start profiling
@@ -321,6 +425,27 @@ export default function LiveProfiling() {
                 </button>
               </div>
             </>
+          ) : hrx ? (
+            <>
+              {typeof profile.bundle === "string" && (
+                <p>
+                  Profile bundle: <code>{profile.bundle}</code>
+                </p>
+              )}
+              <p className="live-note">
+                The application is recording its whole run; there is no window to trigger. Wait for it to
+                become ready, send the workload, then stop and collect: the application is interrupted
+                (SIGINT) so it finalizes the bundle.
+              </p>
+              <div className="live-actions">
+                <button onClick={poll} disabled={busy}>
+                  Refresh status
+                </button>
+                <button onClick={stop} disabled={busy}>
+                  Stop and collect
+                </button>
+              </div>
+            </>
           ) : (
             <div className="live-actions">
               <button onClick={trigger} disabled={busy}>
@@ -346,7 +471,8 @@ export default function LiveProfiling() {
               </ul>
             </div>
           )}
-          {status && (
+          {status && hrx && <p className="live-status">{hrxStatusLine(status)}</p>}
+          {status && !hrx && (
             <p className="live-status">
               {status.windowRunning
                 ? "Window running…"
@@ -370,6 +496,13 @@ export default function LiveProfiling() {
             {Array.isArray(result.files) ? (result.files as unknown[]).length : 0} file(s) in{" "}
             <code>{String(result.directory)}</code>
           </p>
+          {isHrxResult(result) && (
+            <ul className="live-bundle" aria-label="Profile bundle summary">
+              {hrxBundleLines(result).map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+          )}
           {warnings(result).map((w, i) => (
             <p key={i} role="alert" className="live-warning">
               {w}

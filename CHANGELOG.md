@@ -11,11 +11,15 @@ Releases are recorded here without git tags. 0.3.0 is the current state of `main
 - Tracer `hrx` for `profile_run`, `profile_start` and `profile_stop`: collects the native IREE HAL profile of an HRX/Loom application that dispatches PM4 on its own KFD user queues (the native AMD driver used by `loom-serve`, `loom-run` and `loom-benchmark`), which rocprofv3 cannot observe in any trace, counter or ATT mode. The `hrx` object selects `families`, `flushIntervalMs`, `filterFunction` and `allowPartial`. `profile_stop` interrupts the application and waits for the bundle to be finalized; the report carries a bundle summary and a warning for each way it can fall short.
 - `docs/hrx-device-profiling-allow-partial.patch`, a hrx-system tooling patch that lets each device of a GPU + NPU device group keep the profiling families it implements. Without it a hybrid Loom deployment aborts when asked for dispatch timing.
 - Kernel family `loom-internal` for the `__command_launch_counts_N` kernels the Loom compiler synthesises.
+- Tracer `hrx` in the desktop Live profiling panel, with fields for the data families (the default set or a custom one), the flush interval, the function filter and partial families per device. The panel has no trigger for it, states that the bundle carries no waves, ISA or counters and that an XDNA device may record no dispatches, and on stop shows the bundle summary and every warning.
+- The bundle summary of an `hrx` run reports dispatch and queue event counts per device producer (`perProducer`), and the report warns when one device of a group recorded no dispatch while another did.
+- `tests/live-profiling-hrx-real.spec.ts`, a real-hardware click-through of the panel's `hrx` branch against a private headless instance. It runs only when `ROCPROF_HRX_PANEL_E2E` names its configuration.
 
 ### Changed
 
 - The IRPF importer attributes every chunk to its own session, physical device and queue, resolves function names inside the dispatch's session, keeps each device's clock domain apart, and names a device that recorded no dispatch. Agents now read `HRX device N (producer)` when the producer names itself, and multi-queue bundles read `HRX queue N`.
 - An IRPF bundle with no dispatch record is rejected with what it holds (sessions, producers, functions, queue events) instead of opening as a capture with 0 dispatches.
+- The desktop `live_profile_start` command validates its request against the MCP `profile_start` input schema before starting anything, for every tracer. Unknown keys and unsupported values that the desktop command used to ignore or reject later are now rejected up front with the schema's messages.
 
 ### Fixed
 

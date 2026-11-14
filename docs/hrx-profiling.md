@@ -262,9 +262,10 @@ window. `profile_stop` sends SIGINT, waits up to 90 s for the bundle to be
 finalized (the header's file length is written with the last session-end record),
 and kills the target only after that. The report carries the `.irpf` path, a
 structural summary (sessions, producers, functions, dispatch events, queue events,
-truncated families) and a warning for each way the bundle can fall short: not
-written, not finalized, truncated, no dispatch events, a device rejecting a
-family, or an unknown flag.
+truncated families, and the dispatch and queue event counts of each device
+producer under `perProducer`) and a warning for each way the bundle can fall
+short: not written, not finalized, truncated, no dispatch events at all, one
+device of a group recording none, a device rejecting a family, or an unknown flag.
 
 ```jsonc
 {"name":"profile_start","arguments":{
@@ -275,6 +276,39 @@ family, or an unknown flag.
 {"name":"capture_open","arguments":{"path":"<job>/hrx-profile.irpf"}}
 ```
 
+### In the desktop app: the Live profiling panel
+
+The panel (`src/components/LiveProfiling.tsx`) offers `hrx` beside `rocprofv3` and
+`radv`. Its `live_profile_*` commands call the same `profile_*_core` functions as
+the MCP tools, and `live_profile_start` checks its request against the
+`profile_start` input schema first, so both surfaces accept and reject the same
+requests (a tracer-only key on the wrong tracer, an unknown family, an unknown
+option).
+
+| Panel field | `hrx` option | Blank or default |
+|---|---|---|
+| Data families: Default / Custom (three checkboxes and "Other families") | `families` | Default sends no `families` |
+| Flush interval (ms) | `flushIntervalMs` | blank sends none; `0` turns the flush off |
+| Function filter (optional glob) | `filterFunction` | blank sends none |
+| Allow partial families per device | `allowPartial` | unticked sends none |
+
+With nothing touched the request is `{"tracer":"hrx","hrx":{}}` plus `argv` and
+`cwd`. Field errors use the core's own messages and are raised before a process
+is started.
+
+The panel states what the tracer cannot do, before and after a run:
+
+- There is no trigger. The running view has "Refresh status" (bundle size so far,
+  or the exit code) and "Stop and collect" only.
+- The collected view lists the bundle path, size and whether it is finalized, the
+  device sessions, the dispatch, queue-event and function counts, one line per
+  device producer when there is more than one (`xdna: no dispatch events, 2 queue
+  events`), any truncated family, and a fixed line that waves, ISA and hardware
+  counters are absent. Every warning of the report is shown as an alert.
+- A bundle that was not written or cannot be read is stated as such.
+
+The panel does not open the bundle. Use "Open capture" with the listed `.irpf`.
+
 ### A GPU + NPU device group needs a patched tool
 
 For a hybrid deployment, stock tooling cannot give GPU dispatch timing: the NPU
@@ -284,8 +318,11 @@ adds `--device_profiling_allow_partial` to `runtime/src/iree/tooling/device_prof
 unimplemented, it is retried with the largest subset of the requested families it
 accepts, and each reduction is printed on stderr. Drivers validate families before
 they touch the sink, so a rejected attempt leaves no session behind. The patch is
-not applied to hrx-system; build a patched `loom-serve` from a copy of the tree and
-pass `hrx.allowPartial: true`.
+not upstream. `device_profiling.c` is identical on `origin/main` (`626f84b3cb`), so
+it applies there unchanged. Apply it in the hrx-system tree, rebuild `loom-serve`
+the tree's own way (`make build` in the model project relinks it in seconds) and
+pass `hrx.allowPartial: true`; no scratch copy of the tree is needed. Without the
+flag a patched tool behaves exactly like a stock one.
 
 With it, the hybrid server prints `device_profiling: device 1 keeps data families
 0x21 of requested 0x29` and the GPU records dispatch events while the NPU records
@@ -320,6 +357,26 @@ Top kernels by total device time (`capture_analyze`, `kernels`):
 
 A dispatch row reads, for example, `g_gemm_q4_k_store_m256_rt`, grid `18432 × 4 ×
 1`, workgroup `256 × 1 × 1`, 3.17 ms.
+
+The same deployment was captured again with the patch built into the tree's own
+`loom-serve` (no scratch build), once through the MCP tools and once by clicking
+through the Live profiling panel, both against one private headless instance. The
+workload was one 60-token prompt with 48 generated tokens and one 5,134-token
+prompt with 24:
+
+| Fact | MCP `profile_start`/`profile_stop` | Panel click-through |
+|---|---:|---:|
+| Bundle | 7,715,313 bytes, finalized | 7,715,487 bytes, finalized |
+| Dispatches (`amd-gpu`) | 46,794 | 46,794 |
+| Dispatches (`xdna`) | 0 (2 queue events) | 0 (2 queue events) |
+| Kernel names | 111 distinct | 111 distinct |
+| Elapsed span | 11.087 s | 11.123 s |
+| Waves / ISA rows / counters | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The panel run is `tests/live-profiling-hrx-real.spec.ts`. The panel runs in
+Chromium there, and each `live_profile_*` command is forwarded to the `profile_*`
+MCP tool of the private instance, which is the same core behind the same schema.
+The webview-to-Rust IPC hop of the desktop app is not part of that run.
 
 ### What the importer does with these bundles
 
@@ -360,6 +417,15 @@ A dispatch row reads, for example, `g_gemm_q4_k_store_m256_rt`, grid `18432 × 4
   has its own `--profile-final-batch` / `--profile-artifacts-dir` flags and writes
   `.irpf` files that open directly.
 - **Host timeline.** Ticks are device-relative, as for hrx-b99 bundles.
+- **A trigger or window for `hrx`.** The target records from start to exit, on
+  both surfaces. A long-running server is profiled by starting it under the
+  tracer, not by attaching to one that already runs.
+- **Opening the bundle from the panel.** The panel reports the `.irpf` path; the
+  capture is opened separately.
+- **An automated click-through of the packaged desktop app.** The real-hardware
+  panel test drives the panel in a browser and reaches the core through MCP. The
+  Tauri IPC hop is covered only by the source-level registration check and the
+  Rust contract test.
 - **Published model cards from another compiler horizon.** The `loom-fun` cards in
   the Hugging Face cache (Qwen2.5-0.5B, Qwen3-4B) do not compile with this tree
   (`PARSE/006: unknown op 'vector.constant'`), so they could not be used as a
@@ -591,8 +657,16 @@ additionally sweeps the original `benchmark-live` bundle directory when present.
   on `ROCPROF_IRPF_DISPATCH_BUNDLE` / `ROCPROF_IRPF_QUEUE_BUNDLE` /
   `ROCPROF_IRPF_LOOM_HYBRID_BUNDLE` (README, "Tests that do not run by default").
 - Collection: tracer `hrx` in `src-tauri/src/mcp.rs` (`hrx_profiling_flags`,
-  `hrx_report`, `Gate::Hrx`) for `profile_run`, `profile_start` and
-  `profile_stop`, plus `native_kfd_hint` for an empty rocprofv3 result.
+  `hrx_report`, `hrx_silent_device_warning`, `Gate::Hrx`) for `profile_run`,
+  `profile_start` and `profile_stop`, plus `native_kfd_hint` for an empty
+  rocprofv3 result.
+- Desktop panel: `src/components/LiveProfiling.tsx` with the request and result
+  shaping in `src/liveProfileHrx.ts`; `live_profile_start_core` applies the
+  `profile_start` schema. Tests: `src/liveProfileHrx.test.ts` (which also pins the
+  family tables and messages to `mcp.rs`), the stubbed-IPC specs in
+  `tests/live-profiling.spec.ts`, `mcp::tests::desktop_start_applies_the_mcp_profile_start_contract`,
+  and the real-hardware `tests/live-profiling-hrx-real.spec.ts`, which runs only
+  with `ROCPROF_HRX_PANEL_E2E`.
 - Loom compile-report importer: `crates/profile-core/src/loom_report.rs`, reached
   through the same router by the `.compile-report.json` suffix or a
   `loom.compile_report` content sniff, so a report named `.summary.json` or

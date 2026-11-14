@@ -383,6 +383,19 @@ pub struct BundleSummary {
     pub truncated: Vec<TruncatedFamily>,
     /// Nonzero session-end status codes.
     pub failed_sessions: Vec<u32>,
+    /// Record counts per producer (one per device driver of a group), in
+    /// first-seen order, so a consumer can tell which device recorded dispatches.
+    pub per_producer: Vec<ProducerSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProducerSummary {
+    /// Producer name of the sessions counted here; empty when the bundle names none.
+    pub producer: String,
+    pub sessions: usize,
+    pub dispatch_events: usize,
+    pub queue_events: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -418,6 +431,7 @@ fn summarize_bytes(data: &[u8]) -> Result<BundleSummary, String> {
         queue_events: 0,
         truncated: Vec::new(),
         failed_sessions: Vec::new(),
+        per_producer: Vec::new(),
     };
     if data.len() >= FILE_HEADER_LEN && u32_at(data, 0)? == MAGIC && u64_at(data, 16)? == 0 {
         return Ok(summary);
@@ -426,10 +440,11 @@ fn summarize_bytes(data: &[u8]) -> Result<BundleSummary, String> {
     summary.finalized = true;
     let cap = crate::caps::max_records();
     let never = AtomicBool::new(false);
-    let mut sessions = Vec::new();
+    // Each session's producer is named by the session's first record.
+    let mut sessions: Vec<(u64, &str)> = Vec::new();
     for r in &records {
-        if !sessions.contains(&r.session_id) {
-            sessions.push(r.session_id);
+        if !sessions.iter().any(|(id, _)| *id == r.session_id) {
+            sessions.push((r.session_id, r.name));
             if !r.name.is_empty() && !summary.producers.iter().any(|p| p == r.name) {
                 summary.producers.push(r.name.to_owned());
             }
@@ -439,12 +454,32 @@ fn summarize_bytes(data: &[u8]) -> Result<BundleSummary, String> {
         }
     }
     summary.sessions = sessions.len();
-    let count = |family: &str, min: usize| -> Result<usize, String> {
-        Ok(walk_family(&records, family, min, cap, &never, |_, _| Ok(()))?.len())
+    // The session of every sub-record of a family, one entry per sub-record.
+    let owners = |family: &str, min: usize| -> Result<Vec<u64>, String> {
+        walk_family(&records, family, min, cap, &never, |chunk, _| Ok(chunk.session_id))
     };
-    summary.functions = count("executable-functions", FUNCTION_MIN)?;
-    summary.dispatch_events = count("dispatch-events", DISPATCH_EVENT_MIN)?;
-    summary.queue_events = count("queue-events", SUBRECORD_MIN)?;
+    summary.functions = owners("executable-functions", FUNCTION_MIN)?.len();
+    let dispatch_owners = owners("dispatch-events", DISPATCH_EVENT_MIN)?;
+    let queue_owners = owners("queue-events", SUBRECORD_MIN)?;
+    summary.dispatch_events = dispatch_owners.len();
+    summary.queue_events = queue_owners.len();
+    for (session, producer) in &sessions {
+        let owned = |owners: &[u64]| owners.iter().filter(|id| *id == session).count();
+        let (dispatch_events, queue_events) = (owned(&dispatch_owners), owned(&queue_owners));
+        match summary.per_producer.iter_mut().find(|p| p.producer == *producer) {
+            Some(entry) => {
+                entry.sessions += 1;
+                entry.dispatch_events += dispatch_events;
+                entry.queue_events += queue_events;
+            }
+            None => summary.per_producer.push(ProducerSummary {
+                producer: (*producer).to_owned(),
+                sessions: 1,
+                dispatch_events,
+                queue_events,
+            }),
+        }
+    }
     for family in chunk_families(&records) {
         let (truncated, dropped) = chunk_truncation(&records, family);
         if truncated {
@@ -1602,6 +1637,13 @@ mod tests {
         assert_eq!((s.sessions, s.functions, s.dispatch_events, s.queue_events), (2, 3, 3, 1));
         assert_eq!(s.producers, ["amd-gpu", "xdna"]);
         assert!(s.truncated.is_empty() && s.failed_sessions.is_empty());
+        let counts: Vec<(&str, usize, usize, usize)> = s
+            .per_producer
+            .iter()
+            .map(|p| (p.producer.as_str(), p.sessions, p.dispatch_events, p.queue_events))
+            .collect();
+        // The GPU session owns every dispatch; the NPU session only a queue event.
+        assert_eq!(counts, [("amd-gpu", 1, 3, 0), ("xdna", 1, 0, 1)]);
 
         let truncated = bundle(&[
             chunk("devices", device(100_000_000)),

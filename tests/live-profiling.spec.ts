@@ -215,6 +215,137 @@ test("live profiling RADV branch arms an RGP trigger", async ({ page }) => {
   expect(sent).toEqual({ id: "live-radv" });
 });
 
+// The hrx branch: its options travel with the start request as the MCP `hrx`
+// object, there is nothing to trigger, and stop renders the bundle summary and
+// warnings so a device that recorded no dispatch is visible.
+test("live profiling hrx branch starts with the hrx object and shows the bundle summary", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.isTauri = true;
+    w.calls = [];
+    w.__TAURI_INTERNALS__ = {
+      invoke: async (command: string, payload: any) => {
+        if (command === "mcp_status") return { active: null, revision: 0, workspace: {}, server: null };
+        const args = payload?.args ?? {};
+        w.calls.push({ command, args });
+        if (command === "live_profile_start")
+          return { id: "live-hrx", pid: 77, directory: "/jobs/live-hrx", bundle: "/jobs/live-hrx/hrx-profile.irpf", captureMode: "whole-run" };
+        if (command === "live_profile_status")
+          return { id: "live-hrx", running: true, exitCode: null, bundle: "/jobs/live-hrx/hrx-profile.irpf", bundleBytes: 4917850, directory: "/jobs/live-hrx" };
+        if (command === "live_profile_stop")
+          return {
+            status: "stopped",
+            exitCode: 0,
+            directory: "/jobs/live-hrx",
+            files: ["/jobs/live-hrx/hrx-profile.irpf"],
+            bundle: {
+              bytes: 4917850, finalized: true, sessions: 2, producers: ["amd-gpu", "xdna"], functions: 117,
+              dispatchEvents: 21490, queueEvents: 16406, truncated: [], failedSessions: [],
+              perProducer: [
+                { producer: "amd-gpu", sessions: 1, dispatchEvents: 21490, queueEvents: 16277 },
+                { producer: "xdna", sessions: 1, dispatchEvents: 0, queueEvents: 129 },
+              ],
+            },
+            warnings: ["No dispatch events were recorded for device session(s) xdna: work on that device is absent from the dispatch table and from per-kernel time."],
+          };
+        throw Error(command);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await page.getByLabel("Tracer").selectOption("hrx");
+
+  // The limits are stated before anything runs, and the rocprofv3 field is gone.
+  const limits = page.getByRole("list", { name: "What the hrx tracer records" });
+  await expect(limits).toContainText("no window to trigger");
+  await expect(limits).toContainText("No waves, no ISA, no hardware counters");
+  await expect(limits).toContainText("XDNA device may record no dispatches");
+  await expect(page.getByLabel("rocprofv3 path (optional)")).toHaveCount(0);
+
+  await page.getByLabel("Command").fill("/loom/loom-serve --devices=/i/devices.json --model=/i/deployment.json --listen=127.0.0.1:8093");
+  await page.getByLabel("Working directory").fill("/work");
+
+  // An out-of-range flush interval is rejected locally: nothing is started.
+  await page.getByLabel("Flush interval (ms)").fill("60001");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "hrx flushIntervalMs must be an integer between 0 and 60000" })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).calls.length)).toBe(0);
+
+  await page.getByLabel("Flush interval (ms)").fill("10");
+  await page.getByLabel("Data families").selectOption("custom");
+  await page.getByLabel("queue-events", { exact: true }).uncheck();
+  await page.getByLabel("Other families").fill("host-execution");
+  await page.getByLabel("Function filter (optional glob)").fill("g_gemm_*");
+  await page.getByLabel("Allow partial families per device").check();
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByText("Running live-hrx")).toBeVisible();
+  const started = await page.evaluate(() => (window as any).calls.at(-1));
+  expect(started.command).toBe("live_profile_start");
+  expect(started.args).toEqual({
+    argv: ["/loom/loom-serve", "--devices=/i/devices.json", "--model=/i/deployment.json", "--listen=127.0.0.1:8093"],
+    cwd: "/work",
+    tracer: "hrx",
+    hrx: { families: ["dispatch-events", "executable-metadata", "host-execution"], flushIntervalMs: 10, filterFunction: "g_gemm_*", allowPartial: true },
+  });
+
+  // Whole-run recording: no trigger of either kind, no rocprofv3 window fields.
+  await expect(page.getByText("/jobs/live-hrx/hrx-profile.irpf")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Trigger window" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Arm RGP trigger" })).toHaveCount(0);
+  await expect(page.getByLabel("Window mode")).toHaveCount(0);
+  await page.getByRole("button", { name: "Refresh status", exact: true }).click();
+  await expect(page.getByText("Recording the whole run · bundle 4,917,850 bytes so far")).toBeVisible();
+
+  await page.getByRole("button", { name: "Stop and collect", exact: true }).click();
+  const summary = page.getByRole("list", { name: "Profile bundle summary" });
+  await expect(summary).toContainText("/jobs/live-hrx/hrx-profile.irpf · 4,917,850 bytes · finalized");
+  await expect(summary).toContainText("Dispatch events: 21,490");
+  await expect(summary).toContainText("xdna: no dispatch events, 129 queue events");
+  await expect(summary).toContainText("Waves, ISA and hardware counters: none");
+  await expect(page.getByRole("alert").filter({ hasText: "device session(s) xdna" })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).calls.map((c: any) => c.command))).toEqual([
+    "live_profile_start",
+    "live_profile_status",
+    "live_profile_stop",
+  ]);
+});
+
+// With no option touched the request carries an empty hrx object (the core's
+// defaults), and a bundle that was never written is stated, not shown as empty.
+test("live profiling hrx defaults send an empty hrx object and report a missing bundle", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.isTauri = true;
+    w.calls = [];
+    w.__TAURI_INTERNALS__ = {
+      invoke: async (command: string, payload: any) => {
+        if (command === "mcp_status") return { active: null, revision: 0, workspace: {}, server: null };
+        w.calls.push({ command, args: payload?.args ?? {} });
+        if (command === "live_profile_start")
+          return { id: "live-hrx", pid: 78, directory: "/jobs/live-hrx", bundle: "/jobs/live-hrx/hrx-profile.irpf", captureMode: "whole-run" };
+        if (command === "live_profile_stop")
+          return { status: "exited", exitCode: 1, directory: "/jobs/live-hrx", files: [], bundle: null, warnings: ["A device rejected a requested data family and the target aborted profiling for the whole device group."] };
+        throw Error(command);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await page.getByLabel("Tracer").selectOption("hrx");
+  await page.getByLabel("Command").fill("/loom/loom-serve --listen=127.0.0.1:8093");
+  await page.getByLabel("Working directory").fill("/work");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByText("Running live-hrx")).toBeVisible();
+  const started = await page.evaluate(() => (window as any).calls.at(-1));
+  expect(started.args).toEqual({ argv: ["/loom/loom-serve", "--listen=127.0.0.1:8093"], cwd: "/work", tracer: "hrx", hrx: {} });
+
+  await page.getByRole("button", { name: "Stop and collect", exact: true }).click();
+  await expect(page.getByRole("list", { name: "Profile bundle summary" })).toContainText("No profile bundle was written.");
+  await expect(page.getByText("0 file(s)", { exact: false })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "rejected a requested data family" })).toBeVisible();
+});
+
 // Outside the desktop app the panel explains it is desktop-only and runs no IPC.
 test("live profiling is desktop-only in the browser preview", async ({ page }) => {
   await page.goto("/");
