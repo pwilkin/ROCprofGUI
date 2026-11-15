@@ -28,7 +28,7 @@ binary was built with. This decides everything else on this page.
 | Driver | How it dispatches | rocprofv3 | Native IRPF profile |
 |---|---|---|---|
 | **Legacy ROCr driver** (`legacy-amdgpu`, what hrx-b99 `libhrx` uses) | loads `libhsa-runtime64` and submits AQL packets to ROCr queues | visible: kernel trace, counters, ATT | `HRX_PROFILE_FILE` / `HRX_PROFILE_MODE` |
-| **Native AMD driver** (`amdgpu://`, `rdna://`; what current `loom-serve`, `loom-run` and `loom-benchmark` use) | opens `/dev/kfd` itself, creates its own KFD user queues and writes PM4 into them | **invisible in every mode** | `--device_profiling_mode` / `--device_profiling_output` |
+| **Native AMD driver** (`amdgpu://`, `rdna://`; what current `loom-serve`, `loom-run` and `loom-benchmark` use) | opens `/dev/kfd` itself, creates its own KFD user queues and writes PM4 into them | **invisible in every mode** | `--device_profiling_mode` / `--device_profiling_output`; waves and ISA with the `executable-traces` family on a patched driver |
 
 The second row is the current Loom tooling in hrx-system (verified at
 `23e9b32232`, branch `loom-working`, gfx1151). See
@@ -148,11 +148,14 @@ the full elapsed span of the dispatch bundle is 552.986 ms.
 
 ### What it is not
 
-These bundles carry dispatch metadata and timing, not microarchitecture: there
-are **no wave occupancy, ISA hotspots, PC samples or hardware counters** in the
-queue/dispatch IRPF streams. For waves and ISA on HRX, use the rocprofv3 ATT path
-above. Register/LDS/scratch are not part of the IRPF dispatch or function
-records, so those fields read "Not collected" rather than a guessed zero.
+The queue and dispatch streams carry dispatch metadata and timing, not
+microarchitecture: there are **no wave occupancy, ISA hotspots, PC samples or
+hardware counters** in them. For waves and ISA on the legacy ROCr driver, use the
+rocprofv3 ATT path above. On the native AMD driver, a bundle that also carries
+`executable-traces` chunks does give waves and ISA rows; see
+[Thread traces](#thread-traces-executable-traces). Register/LDS/scratch are not
+part of the IRPF dispatch or function records, so those fields read "Not
+collected" rather than a guessed zero.
 
 ### End-to-end acceptance (CPU-only, headless MCP service)
 
@@ -212,13 +215,19 @@ carries a warning that points at tracer `hrx`.
 
 ### What the native driver can record
 
-`iree_hal_amd_gpu_profile_begin` accepts exactly three data families
-(`runtime/src/iree/hal/driver/amd/gpu/profile.c:626-628`): `queue-events`,
+At `23e9b32232`, `iree_hal_amd_gpu_profile_begin` accepts exactly three data
+families (`runtime/src/iree/hal/driver/amd/gpu/profile.c`): `queue-events`,
 `dispatch-events` and `executable-metadata`. Anything else fails with
 `unsupported GPU profiling data families`; hardware counters fail with `GPU queue
-profiling does not support hardware counters`. There is **no ATT/SQTT, wave or
-counter path in the native driver**, so waves and ISA hotspots cannot be collected
-for these kernels by any tool today.
+profiling does not support hardware counters`. A stock driver has **no ATT/SQTT,
+wave or counter path**.
+
+The hrx-system branch `profiling/executable-traces` (four local commits on top of
+the allow-partial patch; not upstream, see
+[Thread traces](#thread-traces-executable-traces)) adds a fourth family,
+`executable-traces`: SQTT thread traces taken on the driver's own PM4 queue, with
+no ROCr, no aqlprofile and no kernel change. Hardware counters are still not
+implemented.
 
 `dispatch-events` gives one record per dispatch with the function, workgroup
 counts and sizes, and a start/end pair of raw device ticks at 99,810,000 Hz. The
@@ -256,16 +265,30 @@ argv that already carries one is rejected.
 | `flushIntervalMs` | `--device_profiling_flush_interval_ms` | 25 (0 disables) |
 | `filterFunction` | `--device_profiling_filter_function` | none |
 | `allowPartial` | `--device_profiling_allow_partial=true` | off |
+| `trace.targetCu` | `--device_profiling_trace_target_cu` | driver default: workgroup processor 0 |
+| `trace.simdSelect` | `--device_profiling_trace_simd_select` | driver default: SIMD 0 |
+| `trace.shaderEngineMask` | `--device_profiling_trace_shader_engine_mask` | driver default: every engine |
+| `trace.bufferSize` | `--device_profiling_trace_buffer_size` | driver default: 16 MiB per engine |
+| `trace.maxTraces` | `--device_profiling_trace_max_traces` | driver default: 1 |
+
+`trace` applies only when `families` includes `executable-traces`, and is
+rejected otherwise. Its values are range-checked before a process is started
+(`targetCu` 0-15, `simdSelect` 0-3, `shaderEngineMask` 1-255, `bufferSize` a
+4,096 multiple from 131,072 to below 512 MiB, `maxTraces` 1-4,096); the driver's
+own limits remain the authority.
 
 The target records for its whole lifetime, so there is no `profile_trigger`
 window. `profile_stop` sends SIGINT, waits up to 90 s for the bundle to be
 finalized (the header's file length is written with the last session-end record),
 and kills the target only after that. The report carries the `.irpf` path, a
 structural summary (sessions, producers, functions, dispatch events, queue events,
-truncated families, and the dispatch and queue event counts of each device
-producer under `perProducer`) and a warning for each way the bundle can fall
-short: not written, not finalized, truncated, no dispatch events at all, one
-device of a group recording none, a device rejecting a family, or an unknown flag.
+thread-trace partitions and their bytes, counter samples, truncated families, and
+the dispatch and queue event counts of each device producer under `perProducer`)
+and a warning for each way the bundle can fall short: not written, not finalized,
+truncated, no dispatch events at all, one device of a group recording none, a
+device rejecting a family, an unknown flag, or **a requested family that produced
+nothing** (`executable-traces` with no trace partition, `counters` with no
+sample).
 
 ```jsonc
 {"name":"profile_start","arguments":{
@@ -291,6 +314,18 @@ option).
 | Flush interval (ms) | `flushIntervalMs` | blank sends none; `0` turns the flush off |
 | Function filter (optional glob) | `filterFunction` | blank sends none |
 | Allow partial families per device | `allowPartial` | unticked sends none |
+| Thread trace (waves and ISA) | adds `executable-traces` to `families` | unticked sends neither the family nor `trace` |
+| Workgroup processor | `trace.targetCu` | blank sends none |
+| SIMD | `trace.simdSelect` | blank sends none |
+| Shader-engine mask | `trace.shaderEngineMask` | blank sends none |
+| Trace buffer per shader engine (MiB) | `trace.bufferSize` (bytes) | blank sends none |
+| Traces to take | `trace.maxTraces` | blank sends none |
+
+Ticking the thread-trace option with the default families sends
+`families: [queue-events, dispatch-events, executable-metadata, executable-traces]`.
+The trace fields appear only while it is ticked, beside three lines saying what
+a trace is: a sample, a bracket around whole recorded executions, and a
+driver-dependent family.
 
 With nothing touched the request is `{"tracer":"hrx","hrx":{}}` plus `argv` and
 `cwd`. Field errors use the core's own messages and are raised before a process
@@ -303,8 +338,10 @@ The panel states what the tracer cannot do, before and after a run:
 - The collected view lists the bundle path, size and whether it is finalized, the
   device sessions, the dispatch, queue-event and function counts, one line per
   device producer when there is more than one (`xdna: no dispatch events, 2 queue
-  events`), any truncated family, and a fixed line that waves, ISA and hardware
-  counters are absent. Every warning of the report is shown as an alert.
+  events`), any truncated family, and a last line that is either "waves, ISA and
+  hardware counters: none" or the number of thread-trace partitions and their
+  bytes, labelled as a sample to decode and never as a census. Every warning of
+  the report is shown as an alert.
 - A bundle that was not written or cannot be read is stated as such.
 
 The panel does not open the bundle. Use "Open capture" with the listed `.irpf`.
@@ -402,11 +439,139 @@ The webview-to-Rust IPC hop of the desktop app is not part of that run.
 - **Queue events are counted, not imported.** They are host-timestamped admission
   records with no kernel identity; the count is in `metadata.hrxQueueEventCount`.
 
+### Thread traces (`executable-traces`)
+
+This is how native-driver kernels report waves and ISA. It needs a `loom-serve`
+built from hrx-system branch `profiling/executable-traces` (local, not upstream;
+`git format-patch` output and a PR draft are in
+`.synagent/artifacts/hrx-loom-profiling/upstream/`). A stock tool rejects the
+family; the report says so.
+
+**What the driver does.** A session that requests the family owns one SQTT
+bracket per device, because the trace registers are device-wide:
+
+- At `profiling_begin` it allocates one finite buffer per traced shader engine,
+  selects the GFX11.5 register table and requests a stable GPU power state on the
+  device's own render node (`AMDGPU_CTX_OP_SET_STABLE_PSTATE`; no root). Other
+  GPU generations, AQL queues and KERNEL-published queues reject the family as
+  unimplemented.
+- Publication claims the bracket for the first operations matching the capture
+  filter, up to the trace bound. The start sequence, the traced work and the stop
+  sequence (finish event, in-ring waits for finish-done and not-busy, write
+  pointer / status / dropped-count readback, register restore) go out in one
+  publication.
+- **A direct dispatch is bracketed alone** and its trace names the dispatch
+  event.
+- **A recorded command buffer is bracketed whole.** A resident recording is
+  immutable, so its dispatches cannot be bracketed one at a time. The trace then
+  names the submission and the command buffer, not a dispatch. Every dispatch of
+  `loom-serve` on the hybrid model goes through recorded command buffers (46,794
+  of 46,794 in the capture above), so this is the case that matters. The function
+  filter selects a recording when any of its dispatches matches.
+- The bracket stays held until the next periodic flush has written the trace. A
+  matching operation that arrives meanwhile runs untraced and is counted.
+- Each traced engine gets one `executable-traces` chunk (raw bytes, format
+  `AMDGPU_ATT`) and one `executable-trace-captures` record stating the selected
+  workgroup processor and SIMD, the engine mask, the buffer size, the bytes
+  written, the hardware dropped-token count, whether the stable power state was
+  held and whether the trace covers one dispatch or a whole recording. A chunk is
+  flagged `TRUNCATED` when tokens were dropped, the buffer filled or the stop did
+  not finish.
+
+**What a trace is not.**
+
+- **It is a sample, not a census.** SQTT traces one SIMD of one workgroup
+  processor per shader engine: roughly 2% of a dispatch's waves on gfx1151. Wave
+  counts, instruction hit counts and the hotspot table describe the sampled waves
+  only. Per-kernel time still comes from every dispatch event.
+- **It is not the whole recording unless the buffer is large enough.** Dense
+  compute fills about 0.5 MiB per shader engine per millisecond. The default
+  16 MiB per engine covered 31 ms of a 577 ms recorded execution (5.4%); a small
+  21-dispatch recording (5.9 ms) fit in 2.2 MiB and was traced completely. The
+  capture states the covered window per trace. The buffer limit is below 512 MiB
+  per engine.
+- **It is not free to open.** `capture_open` runs the ROCm trace decoder on every
+  partition: about 1.5 s per MiB of trace (79 s for the 64 MiB capture below).
+
+**What the importer does** (`crates/profile-core/src/irpf_trace.rs`):
+
+- Writes each trace as `hrx_shader_engine_<SE>_0.att`, writes the bundle's
+  embedded ELF code objects, and builds the placed manifest the RADV arm uses
+  (`decode.py`, placed-manifest branch): each code object is placed at
+  `load_delta` plus its executable segment's extent, and kernels keep their own
+  ELF symbol names.
+- Places waves on the dispatch axis. A decoded trace runs on its own shader
+  clock; its realtime tokens pair that clock with the low 36 bits of the GPU
+  timestamp counter, which is the clock the dispatch events are stamped with. The
+  shader clock slows between dispatches (2.5 to 7.9 cycles per tick in one
+  trace), so the map is piecewise-linear through the anchors, about 6 µs apart,
+  not one line. The capture carries the map (`waveTimeMaps`) and applies it
+  wherever a wave file is read. Instruction latencies in the ISA table are
+  converted with each trace's mean clock rate and are approximate in ns.
+- States coverage in the capture, not only here: `metadata.coverage`,
+  `hrxTraceSelection`, `hrxTraceBufferBytes`, `hrxTraceWrittenBytes`,
+  `hrxTraceDroppedTokens`, `hrxTraceStablePstate`, `hrxTracePartitions` (one line
+  per engine), `hrxTraceWindow` (covered time and share of the traced operation),
+  `hrxTraceWaves`, `hrxTraceWavesAreASample`, `hrxTraceSkippedOperations`,
+  `hrxTraceLimit` and `hrxTraceClockPlacement`, plus a warning that waves and ISA
+  rows are a sample, and one for each kind of loss.
+- Imports a lossy trace with those warnings instead of rejecting it. A trace that
+  cannot be staged, decoded or placed is left out with the reason, and the
+  dispatch capture still opens. Only a malformed trace chunk rejects the bundle.
+- Honours the caps: `ROCPROF_MAX_ATT_TRACES`, `ROCPROF_MAX_ATT_CODE_OBJECTS`,
+  `ROCPROF_MAX_FILE_MIB` and `ROCPROF_MAX_RECORDS`. Other-SIMD activity records
+  (millions for a dense trace) are left out with a warning when they exceed the
+  record cap; waves, occupancy and instructions are unaffected.
+- A bundle without trace chunks imports exactly as before.
+
+**The real capture.** Hybrid Qwen3.8-27B (`amdgpu://0` + `xdna://0?columns=8`),
+`loom-serve` built from `profiling/executable-traces`, one 60-token prompt with
+24 generated tokens, families `queue-events, dispatch-events,
+executable-metadata, executable-traces`, `allowPartial`, through one private
+headless instance:
+
+| Fact | MCP `profile_start`/`profile_stop` | Panel click-through |
+|---|---:|---:|
+| `trace` options | `bufferSize` 16 MiB, `maxTraces` 2 | 8 MiB, 2 traces, WGP 0 |
+| Bundle | 70,821,972 bytes, finalized | 37,267,537 bytes, finalized |
+| Dispatches (`amd-gpu`) | 12,295 | 12,295 |
+| Trace partitions | 4 (67,108,736 bytes) | 4 (33,554,304 bytes) |
+| Waves | 3,464 | 1,879 |
+| ISA rows (with hits) | 38,964 (10,428) | 38,964 (9,446) |
+| Traced selection | WGP 0, SIMD 0, SE 0 and 1 | WGP 0, SIMD 0, SE 0 and 1 |
+| Dropped tokens | 337 | 290 |
+| Buffers filled | 4 of 4 | 4 of 4 |
+| Stable power state | held | held |
+| Trace 1 window | 31.1 ms, 5.4% of a 1,060-dispatch recording (576.9 ms) | 16.7 ms, 2.9% (579.3 ms) |
+| Trace 2 window | 12.1 ms, 5.5% of a 1,455-dispatch recording (218.2 ms) | 6.5 ms, 3.0% (220.1 ms) |
+| Matching operations left untraced | 3 | 4 |
+| Elapsed span | 2.355 s | 2.353 s |
+| `capture_open` | 79.0 s | 41.9 s |
+| Counters | 0 | 0 |
+
+No kernel message was logged during either run, and the user's own `loom-serve`
+kept serving next to the traced instance.
+
 ### What still does not work
 
 - **rocprofv3 on the native driver**, in any mode. Nothing to collect.
-- **Waves, ISA hotspots and hardware counters** for native-driver kernels. The
-  driver implements no executable-trace or counter family.
+- **Hardware counters** for native-driver kernels. The driver implements no
+  counter family; requesting one produces a warning, not data. The packet
+  sequence is known (see
+  [hrx-driver-waves-isa-counters.md](hrx-driver-waves-isa-counters.md)) but not
+  implemented.
+- **Waves and ISA on a stock driver.** They need the `profiling/executable-traces`
+  branch, a gfx11.5 GPU and USER-published PM4 queues.
+- **Tracing one dispatch inside a recording.** A recorded command buffer is
+  traced whole or not at all, so a long recording is covered only as far as the
+  buffer reaches. To cover more, raise `trace.bufferSize`; to choose which
+  recording, use `filterFunction`.
+- **A census of waves.** One SIMD of one workgroup processor per shader engine is
+  traced. `trace.targetCu` and `trace.simdSelect` move the sample; nothing widens
+  it.
+- **More than one trace in flight.** The device has one bracket, held until the
+  periodic flush has written it. With `flushIntervalMs: 0` only the first
+  matching operation is traced before the run ends.
 - **NPU work.** The XDNA driver records queue events and executable metadata only.
   Kernels placed on the NPU never appear as dispatches.
 - **Hybrid dispatch timing without the patch.** A stock `loom-serve` on a GPU +
@@ -645,6 +810,13 @@ additionally sweeps the original `benchmark-live` bundle directory when present.
 
 ## Where this is wired
 
+- Thread-trace arm: `crates/profile-core/src/irpf_trace.rs` (chunk and capture
+  record parsing, ELF placement, staging, the clock map, the merge and the
+  provenance text), `decode.py`'s placed-manifest branch (now with optional
+  `start` and `loads` per code object, and ELF symbol names when an entry has no
+  `name`), `model::WaveTimeMap` applied in `import.rs` where wave files are
+  read. Tests: the trace-arm tests in `irpf.rs` drive it with a stand-in decoder,
+  so they run without the ROCm library.
 - Importer: `crates/profile-core/src/irpf.rs`, reached through the shared import
   router (`project::load_input` → `import::load_capture_options`, the one
   cancellable, fingerprinted path the GUI, headless CLI and MCP all use) by the
@@ -657,7 +829,7 @@ additionally sweeps the original `benchmark-live` bundle directory when present.
   on `ROCPROF_IRPF_DISPATCH_BUNDLE` / `ROCPROF_IRPF_QUEUE_BUNDLE` /
   `ROCPROF_IRPF_LOOM_HYBRID_BUNDLE` (README, "Tests that do not run by default").
 - Collection: tracer `hrx` in `src-tauri/src/mcp.rs` (`hrx_profiling_flags`,
-  `hrx_report`, `hrx_silent_device_warning`, `Gate::Hrx`) for `profile_run`,
+  `HRX_TRACE_OPTIONS`, `hrx_report`, `hrx_silent_device_warning`, `Gate::Hrx`) for `profile_run`,
   `profile_start` and `profile_stop`, plus `native_kfd_hint` for an empty
   rocprofv3 result.
 - Desktop panel: `src/components/LiveProfiling.tsx` with the request and result

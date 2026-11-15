@@ -14,12 +14,19 @@ Releases are recorded here without git tags. 0.3.0 is the current state of `main
 - Tracer `hrx` in the desktop Live profiling panel, with fields for the data families (the default set or a custom one), the flush interval, the function filter and partial families per device. The panel has no trigger for it, states that the bundle carries no waves, ISA or counters and that an XDNA device may record no dispatches, and on stop shows the bundle summary and every warning.
 - The bundle summary of an `hrx` run reports dispatch and queue event counts per device producer (`perProducer`), and the report warns when one device of a group recorded no dispatch while another did.
 - `tests/live-profiling-hrx-real.spec.ts`, a real-hardware click-through of the panel's `hrx` branch against a private headless instance. It runs only when `ROCPROF_HRX_PANEL_E2E` names its configuration.
+- Waves and ISA rows for HRX/Loom kernels on the native AMD driver. The IRPF importer reads `executable-traces` chunks (SQTT thread traces the driver takes on its own PM4 queue) and their `executable-trace-captures` records: each trace is staged with the bundle's embedded ELF code objects as a placed manifest, decoded by the worker the RADV arm uses, and attached to the dispatch capture. Waves are placed on the dispatch axis through the trace's realtime anchors, which carry the same GPU timestamp counter as the dispatch events. This needs a Loom tool built from hrx-system branch `profiling/executable-traces` (not upstream) on a gfx11.5 GPU.
+- The capture states what a thread trace covers: the traced workgroup processor, SIMD and shader engines, the buffer size, bytes written, dropped tokens, whether a stable power state was held, each trace's covered window and share of its traced operation, and that wave and instruction counts are a sample of about 2% of waves, not a census (`metadata.coverage`, the `hrxTrace*` keys and warnings).
+- `hrx.trace` for the `hrx` tracer (`targetCu`, `simdSelect`, `shaderEngineMask`, `bufferSize`, `maxTraces`), valid only with `executable-traces` in `hrx.families`, and the same fields behind a "Thread trace (waves and ISA)" option in the Live profiling panel.
+- The `hrx` report warns when a requested family produced nothing (`executable-traces` with no trace partition, counter families with no sample), names a truncated thread trace, and counts trace partitions and their bytes in the bundle summary (`executableTraces`, `executableTraceBytes`, `counterSamples`).
 
 ### Changed
 
 - The IRPF importer attributes every chunk to its own session, physical device and queue, resolves function names inside the dispatch's session, keeps each device's clock domain apart, and names a device that recorded no dispatch. Agents now read `HRX device N (producer)` when the producer names itself, and multi-queue bundles read `HRX queue N`.
 - An IRPF bundle with no dispatch record is rejected with what it holds (sessions, producers, functions, queue events) instead of opening as a capture with 0 dispatches.
 - The desktop `live_profile_start` command validates its request against the MCP `profile_start` input schema before starting anything, for every tracer. Unknown keys and unsupported values that the desktop command used to ignore or reject later are now rejected up front with the schema's messages.
+
+- `decode.py`'s placed-manifest branch accepts an optional `start` and a `loads` list per code object and keeps a kernel's own ELF symbol name when an entry has no `name`. RADV manifests carry neither and decode as before.
+- `capture_query` and the desktop capture gain `waveTimeMaps`: piecewise-linear maps from a decoded wave file's own clock onto the capture axis, applied wherever wave files are read. Captures without them are unchanged.
 
 ### Fixed
 
