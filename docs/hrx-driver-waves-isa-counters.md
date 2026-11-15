@@ -13,9 +13,13 @@ rows and hardware counters?
 the driver producer on hrx-system branch `profiling/executable-traces` (local,
 four commits, not upstream) and the importer arm in this repo. See
 [hrx-profiling.md, "Thread traces"](hrx-profiling.md#thread-traces-executable-traces)
-for what it does, the real capture and its limits. Hardware counters are **not**
-implemented; the validated sequence below is still the recipe. Two things this
-study got wrong or did not know, found while building it:
+for what it does, the real capture and its limits. **Hardware counters are
+implemented and verified end to end as well**: the driver producer on hrx-system
+branch `profiling/counters` (local, five commits on top of the trace branch, not
+upstream) and the importer arm in this repo. What was built, and what building it
+found, is under [Counters: done](#counters-done-2026-11-15); what a capture shows
+is in [hrx-profiling.md, "Hardware counters"](hrx-profiling.md#hardware-counters-counters).
+Two things this study got wrong or did not know, found while building the traces:
 
 - `loom-serve` dispatches everything through recorded command buffers, so the
   whole-recording bracket is the main path, not a first cut.
@@ -435,11 +439,112 @@ size; it removes the risk. Of the three blockers listed before it:
 What remains is ordinary driver work: deciding which dispatches to trace,
 buffer sizing and full-buffer handling, and the recorded-buffer variant.
 
-## Minimum viable path: counters
+## Counters: done (2026-11-15)
+
+Built on hrx-system branch `profiling/counters` (`91dd9b8ddd`), on top of
+`profiling/executable-traces`. Evidence:
+`.synagent/artifacts/hrx-loom-profiling/61-counters/README.md`.
+
+**What the driver does.**
+
+- **Encoder** (`D/queue/pm4/perf_counters.{h,c}`): the GFX11.5 register table,
+  an event catalog (eight `SQG_*` events per shader engine, four `SQ_*` events
+  per workgroup processor) and three sequences taken from
+  [the validated sequence](#the-validated-sequence): start, sample, stop. It
+  reuses the trace work's packet writers. Start also copies `CP_PERFMON_CNTL`,
+  `SQG_PERFCOUNTER_CTRL` and `SQG_PERFCOUNTER0_SELECT` before it writes
+  anything, so a capture can tell when another collector was there. Both
+  `CTRL2` filters are written to `0x1fffe`, so `FORCE_EN` is clear whatever was
+  left behind. Stop restores every register it wrote to its reset default.
+  `RLC_CGTT_MGCG_OVERRIDE` is not touched.
+- **Every sampled operation is self-contained.** Its publication runs start,
+  the dispatch bracket samples before the start tick and after the end tick,
+  and the publication runs stop. Between sampled operations the device is at
+  reset defaults and the queue's `COMPUTE_PERFCOUNT_ENABLE` is 0.
+- **Per dispatch, also inside recordings.** `loom-serve` dispatches everything
+  through recorded command buffers, so the whole-recording bracket would have
+  given one value per 1,000 dispatches. Instead a recording created while a
+  session samples counters carries the two sample sequences at each dispatch,
+  relocated through the fixups that already place the clock samples; an
+  execution that is not sampled replaces each sequence with one NOP. Raw
+  samples follow the dispatch's timestamp pair in the queue's sample storage
+  and are subtracted at retirement.
+- **One queue in a sampled range at a time.** The hardware counts every enabled
+  queue of the process, so the session admits one queue (its operations share
+  the range, since one ring serializes them) and each stop clears the enable. A
+  sample then holds exactly its dispatch among the device's queues.
+- **Options.** `--device_profiling_mode=...,counters`,
+  `--device_profiling_counter=<name>` (an event name, or the sets `sqg` and
+  `instructions`; default `sqg`), `--device_profiling_counter_max_samples=<n>`
+  (default 4,096 sampled dispatches). Traces and counters combine in one
+  session and share one render-node context for the stable power state.
+- **Records.** `counter-sets`, `counters`, `counter-samples` (scope DISPATCH,
+  joined by `dispatch_event_id`, with command buffer, command index and tick
+  range) and a new cumulative family `counter-captures` that states the scope
+  and the totals: bound, operations and dispatches sampled, operations
+  skipped, samples dropped or invalid, foreign perfmon state.
+- **Device groups.** A device that has none of the named counters loses its
+  counter families under `--device_profiling_allow_partial` instead of failing
+  the group, and the XDNA driver now rejects an unknown counter name before it
+  opens a sink session.
+
+**What building it found.**
+
+- **The enable isolates event counts, not cycles.** With the driver's own
+  packets, a second queue of the same process dispatching 5,000 workgroups
+  inside a window left `SQG_WAVES` and `SQG_ITEMS` exact (1,000 of 1,000) and
+  raised `SQG_BUSY_CYCLES` from about 40,000 to about 215,000. With that queue's
+  own enable set, the same window read 6,000 waves: every enabled queue of the
+  process is counted together, as the spike predicted. Cycle counters therefore
+  describe the shader engine during the window, whoever kept it busy.
+- **Loom kernels are 32-lane waves** on this GPU: `SQG_WAVES_32` carries every
+  wave. The expected count is workgroups times `ceil(threads / 32)`.
+- **A direct dispatch's sequences live in the ring.** With both sets that is
+  about 1,500 DWORDs, more than half of a small ring, and a publication that
+  cannot fit waits forever. The first native test run hung that way (no kernel
+  message, nothing published). The publisher now checks the body against the
+  ring before it reserves, runs such an operation unsampled and counts it as
+  skipped; a native test pins that.
+- **The sample pool must stay a power of two.** Widening the per-dispatch
+  sample made the first server start fail in memory creation.
+- **Cost of a sample pair**, measured inside one capture on a 1,455-dispatch
+  recording: about 44 microseconds per dispatch with the five `SQG_*` counters,
+  about 210 with the per-workgroup-processor set added. Dispatch intervals
+  moved about 2%.
+- **`COMPUTE_PERFCOUNT_ENABLE` inside an indirect buffer** behaves as on the
+  ring: set by the start sequence on the ring, it counts dispatches of the
+  recording the ring then calls.
+- **No GPU reset and no kernel message** in any counter run: 7 harness runs,
+  25 native test cases and 8 server captures with counters. The one hang was
+  the host-side wait above; the GPU was untouched by it.
+
+**Measured.** Harness (driver encoders on libamdf's queue): 256, 4 x 1,000 in
+an indirect buffer, 500 x 64 threads, and 1,000 with the per-WGP set, all exact
+(waves, items, 130,000 VALU, 129,000 SALU, 325,000 instructions per 1,000
+waves). Native tests on the real queue: one wave and 32 work items per sampled
+dispatch, direct and recorded. `loom-serve` on the Qwen3.8-27B hybrid: 4,096
+sampled dispatches, `SQG_WAVES` equal to the geometry in all 4,064 with a
+recorded grid; 1,968 of 1,968 and 1,468 of 1,468 in the captures with the
+instruction set and with a thread trace alongside.
+
+**Not done.**
+
+- Other GPU generations, AQL queues and KERNEL publication: rejected as
+  UNIMPLEMENTED.
+- GRBM counters (`GUI_ACTIVE`) and `counter-ranges`.
+- Restricting the `CTRL2` filters to the process's own VMID. The default mask
+  plus the per-queue enable isolates the session's own queues; a privileged
+  profiler that forces the enable on every queue would still be counted, and
+  the capture can only report foreign perfmon state, not foreign waves.
+- Sampling a recording that was recorded before the session began.
+
+## Minimum viable path: counters (the plan, kept for reference)
 
 **Go, with conditions.** The sequence is proven on this GPU and the open
 questions that sized the estimate are answered (see
-[Counters spike result](#counters-spike-result-2026-11-15)).
+[Counters spike result](#counters-spike-result-2026-11-15)). This is the plan
+as written before the work; [Counters: done](#counters-done-2026-11-15) says
+what was built.
 
 1. Reuse the packet writers from the trace work: `SET_UCONFIG_REG`,
    register-source `COPY_DATA`, `GRBM_GFX_INDEX` select and restore. Counters
@@ -512,7 +617,10 @@ Still open:
   selector.** Not tried after the first attempt reset the GPU.
 - **What the cycle counters mean in time.** They were not compared with a
   clock, and they differ between `auto` and the stable pstate.
-- **The time cost of a sample**, and counter behaviour on a real Loom kernel.
+- **The time cost of a sample**, and counter behaviour on a real Loom kernel:
+  both measured since, see [Counters: done](#counters-done-2026-11-15).
+- **Whether the cycle counters see other processes.** They see other queues of
+  the same process. A second process was not measured.
 - **Which blocks besides GRBM need the perfmon clock.** Only SQ, SQG and one
   GRBM event were programmed.
 - **Why stable pstate reduces SQTT data loss**: the perfmon clock, or the fixed
@@ -563,6 +671,4 @@ It is **not** a route to waves for Loom on this SDK.
    register-source `COPY_DATA`, `EVENT_WRITE`, register-space `WAIT_REG_MEM`)
    to `D/queue/pm4/commands.{h,c}` and a thread-trace module that brackets one
    direct-path dispatch with the spike's sequence.
-3. Counters. The spike passed, so this is now ordinary driver work on top of
-   the packet writers from step 2: a counters module that emits the validated
-   start, sample and stop sequence at the same bracket.
+3. Counters. Done: see [Counters: done](#counters-done-2026-11-15).

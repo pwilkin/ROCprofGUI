@@ -153,7 +153,9 @@ microarchitecture: there are **no wave occupancy, ISA hotspots, PC samples or
 hardware counters** in them. For waves and ISA on the legacy ROCr driver, use the
 rocprofv3 ATT path above. On the native AMD driver, a bundle that also carries
 `executable-traces` chunks does give waves and ISA rows; see
-[Thread traces](#thread-traces-executable-traces). Register/LDS/scratch are not
+[Thread traces](#thread-traces-executable-traces). A bundle that carries the
+counter families gives hardware counter values for the sampled dispatches; see
+[Hardware counters](#hardware-counters-counters). Register/LDS/scratch are not
 part of the IRPF dispatch or function records, so those fields read "Not
 collected" rather than a guessed zero.
 
@@ -226,8 +228,13 @@ The hrx-system branch `profiling/executable-traces` (four local commits on top o
 the allow-partial patch; not upstream, see
 [Thread traces](#thread-traces-executable-traces)) adds a fourth family,
 `executable-traces`: SQTT thread traces taken on the driver's own PM4 queue, with
-no ROCr, no aqlprofile and no kernel change. Hardware counters are still not
-implemented.
+no ROCr, no aqlprofile and no kernel change. The branch `profiling/counters` on
+top of it (five more local commits, not upstream) adds the PM4 counter producer
+and with it a fifth family, `counters`: hardware
+counters sampled around dispatches on the same queue (see
+[Hardware counters](#hardware-counters-counters) and
+[hrx-driver-waves-isa-counters.md](hrx-driver-waves-isa-counters.md)). A tool
+built without that branch still refuses counters.
 
 `dispatch-events` gives one record per dispatch with the function, workgroup
 counts and sizes, and a start/end pair of raw device ticks at 99,810,000 Hz. The
@@ -270,6 +277,8 @@ argv that already carries one is rejected.
 | `trace.shaderEngineMask` | `--device_profiling_trace_shader_engine_mask` | driver default: every engine |
 | `trace.bufferSize` | `--device_profiling_trace_buffer_size` | driver default: 16 MiB per engine |
 | `trace.maxTraces` | `--device_profiling_trace_max_traces` | driver default: 1 |
+| `counters.names` | `--device_profiling_counter=<name>`, once per name | `["sqg"]`, always sent |
+| `counters.maxSamples` | `--device_profiling_counter_max_samples` | driver default: 4,096 sampled dispatches |
 
 `trace` applies only when `families` includes `executable-traces`, and is
 rejected otherwise. Its values are range-checked before a process is started
@@ -277,18 +286,38 @@ rejected otherwise. Its values are range-checked before a process is started
 4,096 multiple from 131,072 to below 512 MiB, `maxTraces` 1-4,096); the driver's
 own limits remain the authority.
 
+`counters` applies only when `families` includes `counters`, and is rejected
+otherwise. `names` takes the set aliases `sqg` (`SQG_WAVES`, `SQG_WAVES_32`,
+`SQG_WAVES_64`, `SQG_ITEMS`, `SQG_BUSY_CYCLES`) and `instructions` (the
+per-workgroup-processor `SQ_WAVES`, `SQ_INSTS_VALU`, `SQ_INSTS_SALU`,
+`SQ_INSTS_ALL`), or single counter names: those nine plus `SQG_WAVE_CYCLES`,
+`SQG_CYCLES` and `SQG_WAVES_SAVED`. Anything else is rejected before a process is
+started, as is a `maxSamples` outside 1-1,000,000. With `counters` in `families`
+and no name, the tracer still sends `--device_profiling_counter=sqg`: the flag
+list goes to every device of a group, and with no name the XDNA driver would
+start a counter set of its own. One consequence: the XDNA driver's own
+`invocation_cycles` set is not collected through this tracer. `counters` and
+`trace` combine in one request, which then yields waves, ISA rows and counters in
+one bundle.
+
 The target records for its whole lifetime, so there is no `profile_trigger`
 window. `profile_stop` sends SIGINT, waits up to 90 s for the bundle to be
 finalized (the header's file length is written with the last session-end record),
 and kills the target only after that. The report carries the `.irpf` path, a
 structural summary (sessions, producers, functions, dispatch events, queue events,
-thread-trace partitions and their bytes, counter samples, truncated families, and
+thread-trace partitions and their bytes, counter sets, counter names and counter
+samples, the driver's statement about how the counters were sampled under
+`counterCapture`, truncated families, and
 the dispatch and queue event counts of each device producer under `perProducer`)
 and a warning for each way the bundle can fall short: not written, not finalized,
 truncated, no dispatch events at all, one device of a group recording none, a
 device rejecting a family, an unknown flag, or **a requested family that produced
 nothing** (`executable-traces` with no trace partition, `counters` with no
-sample).
+sample). When counters were produced it also warns when the bundle has no
+`counter-captures` record or reports no exclusive sample window (the capture then
+cannot tell what a window held), when another collector reprogrammed the
+counters, when the sample bound was reached, and when matching operations ran
+unsampled or samples were lost.
 
 ```jsonc
 {"name":"profile_start","arguments":{
@@ -320,12 +349,22 @@ option).
 | Shader-engine mask | `trace.shaderEngineMask` | blank sends none |
 | Trace buffer per shader engine (MiB) | `trace.bufferSize` (bytes) | blank sends none |
 | Traces to take | `trace.maxTraces` | blank sends none |
+| Hardware counters (per sampled dispatch) | adds `counters` to `families` and sends `counters.names` | unticked sends neither the family nor `counters` |
+| Counter set | `counters.names`: `["sqg"]` or `["sqg","instructions"]` | the default set, `["sqg"]` |
+| Dispatches to sample | `counters.maxSamples` | blank sends none |
 
 Ticking the thread-trace option with the default families sends
 `families: [queue-events, dispatch-events, executable-metadata, executable-traces]`.
 The trace fields appear only while it is ticked, beside three lines saying what
 a trace is: a sample, a bracket around whole recorded executions, and a
 driver-dependent family.
+
+Ticking the hardware-counters option adds `counters` to the families and always
+names the set. Its fields appear only while it is ticked, beside three lines
+saying what a counter value is (a window sum, exact for event counts only among
+the device's queues and only when the capture reports an exclusive window, never
+per-dispatch for cycle counters) and a line listing the counters of the chosen
+set with that classification. Both options can be ticked together.
 
 With nothing touched the request is `{"tracer":"hrx","hrx":{}}` plus `argv` and
 `cwd`. Field errors use the core's own messages and are raised before a process
@@ -338,9 +377,14 @@ The panel states what the tracer cannot do, before and after a run:
 - The collected view lists the bundle path, size and whether it is finalized, the
   device sessions, the dispatch, queue-event and function counts, one line per
   device producer when there is more than one (`xdna: no dispatch events, 2 queue
-  events`), any truncated family, and a last line that is either "waves, ISA and
-  hardware counters: none" or the number of thread-trace partitions and their
-  bytes, labelled as a sample to decode and never as a census. Every warning of
+  events`), any truncated family, and then either "waves, ISA and hardware
+  counters: none" or the number of thread-trace partitions and their bytes,
+  labelled as a sample to decode and never as a census. A bundle with counter
+  samples adds three lines: the sample count and counter names as window sums
+  (naming the cycle counters as never per-dispatch), what the driver said about
+  the sample window (exclusive among its device's queues, not reported, unknown
+  because the bundle has no capture record, or another collector), and the
+  sampled dispatches against the bound with what ran unsampled. Every warning of
   the report is shown as an alert.
 - A bundle that was not written or cannot be read is stated as such.
 
@@ -552,16 +596,212 @@ headless instance:
 No kernel message was logged during either run, and the user's own `loom-serve`
 kept serving next to the traced instance.
 
+### Hardware counters (`counters`)
+
+This is how native-driver kernels report hardware counters. It needs a
+`loom-serve` built from the hrx-system branch `profiling/counters` (local, not
+upstream; the driver side is described in
+[hrx-driver-waves-isa-counters.md](hrx-driver-waves-isa-counters.md)), a gfx11.5
+GPU and USER-published PM4 queues. A stock tool rejects the family; the report
+says so.
+
+**Accepted input.** Four chunk families, read by
+`crates/profile-core/src/irpf_counters.rs`:
+
+| Family | Record | What the importer takes from it |
+|---|---|---|
+| `counter-sets` | 32 bytes + name | set id, name, device, value slots per sample |
+| `counters` | 48 bytes + block name, name, description | name, unit (count, cycles, bytes), block, and which value slots of a sample belong to the counter |
+| `counter-samples` | 112 bytes + 8 per value | one vector of deltas per measured dispatch, with the dispatch event id (flag `DISPATCH_EVENT`), command buffer and index, executable and function |
+| `counter-captures` | 88 bytes, cumulative | how the set was sampled: the bound, operations bracketed, samples emitted, operations that ran unsampled, dropped and invalid samples, foreign perfmon state, and the flags for a stable power state, an exclusive window, process scope and a reached bound |
+
+Nothing about a set is assumed from its id. A bundle may hold sets of several
+producers (the XDNA driver emits a set `xdna` with one counter,
+`invocation_cycles`, and no `counter-captures` record); each is imported under
+its own device.
+
+**What it becomes.** The existing counter model, twice:
+
+- **Event counters** (`capture_query` dataset `eventCounters`, the
+  "Event-associated counters" table): one row per sample and counter. The value
+  is the **sum of the counter's value slots** (one per shader engine for `SQG_*`,
+  one per workgroup processor for `SQ_*`). A sample is joined to its dispatch by
+  session, stream and dispatch event id; the row then links that dispatch and its
+  scope names the device, queue, block, instance count, kernel, grid and
+  workgroup size.
+- **Counter series** (dataset `counters`, the Counters view, `capture_analyze`
+  `scalar`): one series per counter, each joined sample's value at its dispatch
+  midpoint. They are per-dispatch measurements, not time samples, and a dispatch
+  without a sample has no point.
+
+`metadata` carries `hrxCounterSets`, `hrxCounters` (name, block, unit, instances,
+description), `hrxCounterSamples`, `hrxCounterSampledDispatches` (`N of M`),
+`hrxCounterTotals` and `hrxCounterKernels` (sums over the sampled dispatches, per
+counter and for the kernels with the most samples), `hrxCounterCapture` (the
+capture record in words), `hrxCounterWindowExclusive`,
+`hrxCounterValuesAreWindowSums` and `hrxCounterImport`; `metadata.coverage` gains
+a clause with the sampled share and the window statement. `summarize` (the hrx
+report's `bundle`) carries `counterSets`, `counterNames`, `counterSamples` and
+`counterCapture`.
+
+**The per-dispatch caveat.** A counter value is the counter's increase between a
+read just before a dispatch and a read just after it. Inside that window the
+hardware counts every queue of the process that has counting enabled, not only
+the dispatch. So:
+
+| What the bundle says | How the importer presents event counts (waves, work items, instructions) |
+|---|---|
+| `counter-captures` with `EXCLUSIVE_WINDOW`, no foreign state | The driver let one queue of its device into a sampled window at a time and enabled counting only inside sampled operations, so each window holds exactly its dispatch **among that device's queues**. Stated as exact about that, with the limit: queues of the same process outside the device session (a second device instance, a privileged profiler forcing counting on) would be counted too, and the capture cannot see them. |
+| `counter-captures` without `EXCLUSIVE_WINDOW` | Warning: the capture cannot tell which windows overlapped other queues. Values are upper bounds on the dispatch's own count. |
+| No `counter-captures` record | Warning: the capture cannot tell. Values are upper bounds. |
+| `foreign_state_count > 0` | Warning: another collector (rocprofv3 `--pmc`, a RADV performance query, a second profiling session) was programming the same device-wide registers. Values are not to be read as per-dispatch counts. |
+
+**Cycle counters are never per-dispatch**, whatever the bundle says. The queue
+enable that isolates event counts does not isolate cycles. Measured on gfx1151
+with the driver's own packets: a second queue of the same process dispatching
+5,000 workgroups inside a window left the wave and item counts exact (1,000 of
+1,000) and raised `SQG_BUSY_CYCLES` from about 40,000 to about 215,000. A counter
+whose unit is cycles (`SQG_BUSY_CYCLES`, `SQG_WAVE_CYCLES`, `SQG_CYCLES`)
+describes the hardware during the window, whoever kept it busy; other processes
+were not measured. Its rows say "hardware-wide during the window" in their scope,
+a warning names the cycle counters, and they were not calibrated against a clock.
+
+**Coverage is a sample of the dispatches.** Only the first dispatches matching
+the capture filter are sampled, up to the bound (`counters.maxSamples`, driver
+default 4,096). The capture warns with the sampled share (`N of M dispatches carry
+counter values`) and with every reason a dispatch has none: the bound was
+reached, a matching operation ran unsampled, samples were dropped for lack of
+host capacity or had no hardware values. Totals in `metadata` cover the sampled
+dispatches only. As with the roughly 2% wave sample of a thread trace, nothing
+here is presented as a census.
+
+**What the importer refuses to do.**
+
+- It does not present a sample without a dispatch join as belonging to a
+  dispatch: a sample with no dispatch event id (the `dispatch-events` family was
+  not captured, or the producer emits none) or one naming a dispatch event that
+  is not in the capture is listed without a dispatch link, left out of the
+  series, and counted in a warning.
+- A counter with no sample, or a sample with fewer values than its set lays out,
+  reads "not collected", never zero.
+- Structural damage in a counter family (a record shorter than its fixed fields,
+  a record or a string running past its extent, sample values past the record)
+  leaves all counters out with a warning naming the reason. The dispatch capture
+  still opens.
+- Samples times counters above `ROCPROF_MAX_RECORDS` leaves the counters out
+  whole, with the two numbers and both remedies. Nothing is thinned.
+- Bundles without counter families import exactly as before.
+
+**Reading it over MCP.**
+
+```jsonc
+{"name":"profile_start","arguments":{
+  "tracer":"hrx","cwd":"/path/to/run",
+  "argv":["/path/to/loom-serve","--devices=devices.json","--model=deployment.json","--listen=127.0.0.1:8093"],
+  "hrx":{"families":["queue-events","dispatch-events","executable-metadata","executable-traces","counters"],
+         "allowPartial":true,
+         "trace":{"bufferSize":4194304,"maxTraces":1},
+         "counters":{"names":["sqg"],"maxSamples":4096}}}}
+// ... workload, then profile_stop and capture_open as above ...
+// Per-dispatch rows of one counter, each with kernel, grid and workgroup in "scope":
+{"name":"capture_query","arguments":{"captureId":"<id>","dataset":"eventCounters","query":"\"name\":\"sqg_waves\"","limit":1000}}
+// The capture record, sampled share, totals and per-kernel sums (the hrxCounter* keys):
+{"name":"capture_query","arguments":{"captureId":"<id>","dataset":"metadata"}}
+// Work items per wave for every sampled dispatch (C<n> is the index in dataset counters):
+{"name":"capture_analyze","arguments":{"captureId":"<id>","analysis":"scalar","name":"items per wave","formula":"C3 / C0"}}
+// Counter inventory, dispatch links and every warning:
+{"name":"capture_analyze","arguments":{"captureId":"<id>","analysis":"diagnostics"}}
+```
+
+`query` is a case-insensitive substring of the row's compact JSON, so
+`"name":"sqg_waves"` selects that counter alone (a bare `sqg_waves` would also
+match `SQG_WAVES_32` and `SQG_WAVES_64`), and adding a kernel name narrows it to
+that kernel's rows.
+
+A check that is worth doing on a kernel whose geometry is known: `SQG_WAVES`
+equals workgroups times `ceil(threads per workgroup / wave size)`, where the
+workgroups are grid over workgroup size per dimension and the wave size is the
+one whose counter (`SQG_WAVES_32` or `SQG_WAVES_64`) is nonzero. The env-gated
+test `real_counters_bundle_joins_wave_counts_to_dispatch_geometry` prints that
+comparison for a real bundle.
+
+**The real captures (2026-11-15).** `loom-serve` on the Qwen3.8-27B hybrid
+(`amdgpu://0` + `xdna://0?columns=8`), built from `profiling/counters`, one
+60-token prompt with 16 generated tokens, through a private headless instance.
+Evidence: `.synagent/artifacts/hrx-loom-profiling/61-counters/README.md`.
+
+| Run | Request | Dispatches | Counter samples | `SQG_WAVES` against geometry | Also in the bundle |
+|---|---|---:|---:|---|---|
+| MCP | `counters: {maxSamples: 4096}` | 7,489 | 4,096 in 7 operations | 4,064 of 4,064 exact, largest difference 0; 32 with no recorded grid | - |
+| MCP | `trace` (4 MiB, 1 trace) + `counters: {names: [sqg, instructions], maxSamples: 1500}` | 7,489 | 1,500 in 4 operations, 9 counters | 1,468 of 1,468 exact | 755 waves, 38,964 ISA rows (4,350 with hits) |
+| Panel | thread trace (4 MiB, 1 trace) + counters, set "Default + instruction counts", 2,000 dispatches | 7,489 | 2,000 in 4 operations, 9 counters | 1,968 of 1,968 exact | 758 waves, 38,964 ISA rows |
+
+What these runs showed:
+
+- **Every sample joined its dispatch**, and every sampled dispatch with a
+  recorded grid had exactly the predicted wave count. `SQG_ITEMS` equalled
+  workgroups times workgroup size in the same dispatches, and the
+  per-workgroup-processor `SQ_WAVES` equalled `SQG_WAVES` in every one.
+- **Loom's kernels run as 32-lane waves.** `SQG_WAVES_32` carried every wave and
+  `SQG_WAVES_64` was 0, so the expected count is workgroups times
+  `ceil(threads / 32)`: a 256-thread workgroup is 8 waves, not 4. `capture_analyze`
+  `scalar` with `C3 / C0` (items per wave) reads 32 for every sampled dispatch
+  whose workgroup is a multiple of 32.
+- **The counters give the grid the dispatch events lack.** The 32 dispatches
+  without a recorded grid take their workgroup counts from a buffer
+  (`INDIRECT_PARAMETERS`), so their rows read "grid Not recorded"; their counters
+  still say what ran (for example 6,144 waves and 196,608 work items for
+  `g16_attention_split_listed`, a 192-thread workgroup: 1,024 workgroups).
+- **Identical dispatches count identically**: two dispatches of
+  `g_mv_f32_k5120_t4` with the same grid both read 1,174,416 instructions,
+  655,152 VALU and 89,904 SALU.
+- **The capture record matched**: bound reached, no operation skipped, no sample
+  dropped or invalid, no foreign perfmon state, stable power state held, window
+  exclusive among the device's queues. The XDNA device kept queue events and
+  executable metadata and dropped the counter family, in one session.
+- **Cost.** Inside the same capture, a recorded execution of 1,455 dispatches
+  took 280 ms sampled against 217 ms unsampled with the default set (about 44
+  microseconds per dispatch for its two samples), and 530 ms against 224 ms with
+  the instruction set (about 210 microseconds per dispatch, 20 workgroup
+  processors read each time). The dispatch intervals themselves moved by about
+  2%: the samples sit outside the clock pair. So counters stretch the run, not
+  the per-dispatch times, and the bound keeps the stretch finite.
+- **No kernel message** in any run, and a second `loom-serve` kept serving on the
+  same GPU.
+
 ### What still does not work
 
 - **rocprofv3 on the native driver**, in any mode. Nothing to collect.
-- **Hardware counters** for native-driver kernels. The driver implements no
-  counter family; requesting one produces a warning, not data. The packet
-  sequence is known (see
-  [hrx-driver-waves-isa-counters.md](hrx-driver-waves-isa-counters.md)) but not
-  implemented.
-- **Waves and ISA on a stock driver.** They need the `profiling/executable-traces`
-  branch, a gfx11.5 GPU and USER-published PM4 queues.
+- **Waves, ISA and hardware counters on a stock driver.** They need the local
+  hrx-system branches with the PM4 thread-trace and counter producers, a gfx11.5
+  GPU and USER-published PM4 queues.
+- **A census of counter values.** Counters cover the sampled dispatches only, up
+  to the bound, and each value is a window sum (see
+  [Hardware counters](#hardware-counters-counters)).
+- **Per-dispatch cycle counts.** `SQG_BUSY_CYCLES` and the other cycle counters
+  are not isolated to a dispatch.
+- **Counter ranges.** The `counter-ranges` family is accepted by the tracer's
+  family list but the native GPU driver does not implement it.
+- **Instruction counts above 2^32 for one dispatch.** The per-workgroup-processor
+  `SQ_*` registers are 32 bits wide. The driver subtracts modulo 2^32, so a wrap
+  between a dispatch's two samples is harmless, but a single workgroup processor
+  issuing more than 4,294,967,295 instructions inside one dispatch reads low.
+  The largest sampled dispatch here issued 699 million on all 20 together.
+- **Counters for a direct dispatch on a small ring.** A direct dispatch carries
+  its counter sequences in the queue's ring (about 400 words for the default
+  set, 1,500 with the instruction set). When they cannot fit, the dispatch runs
+  unsampled and the capture counts it as a matching operation that ran
+  unsampled. `loom-serve` dispatches through recordings, which carry their
+  sample sequences themselves.
+- **Counters for a recording made before the session.** A recording carries the
+  sample sequences of the counter selection that was active when it was
+  recorded. One recorded earlier, or for another selection, runs unsampled and
+  is counted the same way.
+- **The XDNA driver's own counter set through this tracer.** The tracer always
+  names GPU counters, which the XDNA driver rejects.
+- **Per-kernel counter columns in `capture_analyze` `kernels`.** Counter sums per
+  kernel are in `metadata.hrxCounterKernels` and in the event-counter rows; the
+  kernels analysis itself still aggregates dispatch time only.
 - **Tracing one dispatch inside a recording.** A recorded command buffer is
   traced whole or not at all, so a long recording is covered only as far as the
   buffer reaches. To cover more, raise `trace.bufferSize`; to choose which
@@ -817,6 +1057,19 @@ additionally sweeps the original `benchmark-live` bundle directory when present.
   `name`), `model::WaveTimeMap` applied in `import.rs` where wave files are
   read. Tests: the trace-arm tests in `irpf.rs` drive it with a stand-in decoder,
   so they run without the ROCm library.
+- Counter arm: `crates/profile-core/src/irpf_counters.rs` (set, counter, sample
+  and capture-record parsing, the dispatch join, the event-counter rows and
+  series, and the provenance and warning text); `irpf.rs` hands it the chunks and
+  the dispatch index and writes the closing coverage sentence. Tests: the
+  counter tests in `irpf.rs` (rows and joins, the capture-record cases, another
+  producer's set, missing slots, malformed records, the record cap, the
+  summary), `fixtures/irpf/synthetic-hrx-counters.irpf` (synthetic, built by
+  `scripts/make-irpf-counter-fixture.py`) through the shared router, and
+  `tests/fixtures/hrx-counters-capture.json`, the importer's output for it, which
+  a Rust test keeps current (and rewrites under `ROCPROF_UPDATE_FIXTURES=1`) and
+  `src/hrxCounters.test.ts` reads. A real counters
+  bundle is checked by the `#[ignore]` test gated on
+  `ROCPROF_IRPF_COUNTERS_BUNDLE`.
 - Importer: `crates/profile-core/src/irpf.rs`, reached through the shared import
   router (`project::load_input` → `import::load_capture_options`, the one
   cancellable, fingerprinted path the GUI, headless CLI and MCP all use) by the
@@ -829,7 +1082,7 @@ additionally sweeps the original `benchmark-live` bundle directory when present.
   on `ROCPROF_IRPF_DISPATCH_BUNDLE` / `ROCPROF_IRPF_QUEUE_BUNDLE` /
   `ROCPROF_IRPF_LOOM_HYBRID_BUNDLE` (README, "Tests that do not run by default").
 - Collection: tracer `hrx` in `src-tauri/src/mcp.rs` (`hrx_profiling_flags`,
-  `HRX_TRACE_OPTIONS`, `hrx_report`, `hrx_silent_device_warning`, `Gate::Hrx`) for `profile_run`,
+  `HRX_TRACE_OPTIONS`, `HRX_COUNTER_NAMES` / `HRX_COUNTER_SETS`, `hrx_report`, `hrx_silent_device_warning`, `Gate::Hrx`) for `profile_run`,
   `profile_start` and `profile_stop`, plus `native_kfd_hint` for an empty
   rocprofv3 result.
 - Desktop panel: `src/components/LiveProfiling.tsx` with the request and result
