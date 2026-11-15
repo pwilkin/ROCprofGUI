@@ -42,3 +42,22 @@ loom-serve --devices=devices.json --model=deployment.json --listen=127.0.0.1:809
 
 `devices.json` names `amdgpu://0` and `xdna://0?columns=8`
 (`loom/models/qwen3.8-27b-hybrid`).
+
+## `synthetic-hrx-counters.irpf` (synthetic, not a capture)
+
+Not written by a driver. `scripts/make-irpf-counter-fixture.py` builds it byte by
+byte from the record layouts in hrx-system `runtime/src/iree/hal/profile_file.h`
+and `profile_schema.h`, so the importer's hardware-counter arm and the hrx
+collection report can be tested without a GPU. Every number in it is made up.
+2,935 bytes, SHA-256 `33b8f1a76e819d283b5d5bb0f8c828728658d0c5d1e1abb0c3a77273c5bd8341`.
+
+One `amd-gpu` session with three dispatch events of `g_gemm_q4_k_store_m256`
+(4, 8 and 2 workgroups of 64 × 1 × 1), a counter set `amdgpu.perfmon` of the
+driver's five default counters (two value slots each, one per shader engine),
+two counter samples joined to the first two dispatch events, and one
+`counter-captures` record: bound 2 (reached), exclusive window, stable power
+state.
+
+```shell
+python3 scripts/make-irpf-counter-fixture.py fixtures/irpf/synthetic-hrx-counters.irpf
+```

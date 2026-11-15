@@ -385,6 +385,14 @@ pub struct BundleSummary {
     pub executable_trace_bytes: u64,
     /// `counter-samples` records of every producer.
     pub counter_samples: usize,
+    /// `counter-sets` records and the names of the counters they define, in
+    /// first-seen order. Empty when no producer emitted hardware counters.
+    pub counter_sets: usize,
+    pub counter_names: Vec<String>,
+    /// What the producers said about how the counters were sampled, summed over
+    /// the bundle's `counter-captures` records; absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counter_capture: Option<CounterCaptureSummary>,
     /// Families with a TRUNCATED chunk, with the producer's dropped-record count.
     pub truncated: Vec<TruncatedFamily>,
     /// Nonzero session-end status codes.
@@ -392,6 +400,29 @@ pub struct BundleSummary {
     /// Record counts per producer (one per device driver of a group), in
     /// first-seen order, so a consumer can tell which device recorded dispatches.
     pub per_producer: Vec<ProducerSummary>,
+}
+
+/// The bundle's `counter-captures` records, one per counter set, combined.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CounterCaptureSummary {
+    /// Counter sets that have a capture record.
+    pub records: usize,
+    /// Every record reports an exclusive sample window among its device's queues.
+    pub exclusive_window: bool,
+    /// Every record reports a stable GPU power state.
+    pub stable_power_state: bool,
+    /// A record reports its sample bound was reached.
+    pub limit_reached: bool,
+    /// Largest sample bound, in dispatches.
+    pub sample_limit: u64,
+    pub sampled_operations: u64,
+    pub sampled_dispatches: u64,
+    pub skipped_operations: u64,
+    pub dropped_samples: u64,
+    pub invalid_samples: u64,
+    /// Sampled operations that found another collector's perfmon state.
+    pub foreign_state: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -438,6 +469,9 @@ fn summarize_bytes(data: &[u8]) -> Result<BundleSummary, String> {
         executable_traces: 0,
         executable_trace_bytes: 0,
         counter_samples: 0,
+        counter_sets: 0,
+        counter_names: Vec::new(),
+        counter_capture: None,
         truncated: Vec::new(),
         failed_sessions: Vec::new(),
         per_producer: Vec::new(),
@@ -473,6 +507,45 @@ fn summarize_bytes(data: &[u8]) -> Result<BundleSummary, String> {
     summary.dispatch_events = dispatch_owners.len();
     summary.queue_events = queue_owners.len();
     summary.counter_samples = owners("counter-samples", SUBRECORD_MIN)?.len();
+    summary.counter_sets = owners("counter-sets", SUBRECORD_MIN)?.len();
+    // Counter metadata is descriptive here: damage in it is the import's to
+    // report, not a reason to refuse the summary.
+    let counter_chunks = |family: &str| -> Vec<crate::irpf_counters::Chunk<'_>> {
+        records
+            .iter()
+            .filter(|r| r.record_type == RECORD_TYPE_CHUNK && r.family == Some(family))
+            .map(|r| crate::irpf_counters::Chunk {
+                session: r.session_id,
+                device: r.physical_device_ordinal,
+                queue: r.queue_ordinal,
+                stream: r.stream_id,
+                payload: r.payload,
+            })
+            .collect()
+    };
+    summary.counter_names =
+        crate::irpf_counters::counter_names(&counter_chunks("counters"), &never).unwrap_or_default();
+    let captures =
+        crate::irpf_counters::parse_captures(&counter_chunks("counter-captures"), &never).unwrap_or_default();
+    if !captures.is_empty() {
+        use crate::irpf_counters::{CAPTURE_LIMIT_REACHED, CAPTURE_STABLE_POWER_STATE};
+        let sum = |field: fn(&crate::irpf_counters::CaptureFacts) -> u64| -> u64 {
+            captures.values().map(field).fold(0u64, u64::saturating_add)
+        };
+        summary.counter_capture = Some(CounterCaptureSummary {
+            records: captures.len(),
+            exclusive_window: captures.values().all(|c| c.exclusive()),
+            stable_power_state: captures.values().all(|c| c.flags & CAPTURE_STABLE_POWER_STATE != 0),
+            limit_reached: captures.values().any(|c| c.flags & CAPTURE_LIMIT_REACHED != 0),
+            sample_limit: captures.values().map(|c| c.sample_limit).max().unwrap_or(0),
+            sampled_operations: sum(|c| c.sampled_operation_count),
+            sampled_dispatches: sum(|c| c.sampled_dispatch_count),
+            skipped_operations: sum(|c| c.skipped_operation_count),
+            dropped_samples: sum(|c| c.dropped_sample_count),
+            invalid_samples: sum(|c| c.invalid_sample_count),
+            foreign_state: sum(|c| c.foreign_state_count),
+        });
+    }
     for r in &records {
         if r.record_type == RECORD_TYPE_CHUNK && r.family == Some("executable-traces") {
             // Counted from the chunk extent; the import validates the record.
@@ -1221,13 +1294,56 @@ fn build_with(
             .collect()
     };
     crate::irpf_trace::attach(&mut out, trace, &ticks_of, cancelled, decode)?;
+
+    // Hardware counters: rows joined to dispatches by dispatch event id.
+    let counter_chunks = |family: &str| -> Vec<crate::irpf_counters::Chunk<'_>> {
+        records
+            .iter()
+            .filter(|r| r.record_type == RECORD_TYPE_CHUNK && r.family == Some(family))
+            .map(|r| crate::irpf_counters::Chunk {
+                session: r.session_id,
+                device: r.physical_device_ordinal,
+                queue: r.queue_ordinal,
+                stream: r.stream_id,
+                payload: r.payload,
+            })
+            .collect()
+    };
+    let mut counters = crate::irpf_counters::Context {
+        sets: counter_chunks("counter-sets"),
+        counters: counter_chunks("counters"),
+        samples: counter_chunks("counter-samples"),
+        captures: counter_chunks("counter-captures"),
+        dispatches: BTreeMap::new(),
+        cap,
+    };
+    // Only dispatch events carry the event ids counter samples refer to.
+    if counters.present() && dispatch_source == "dispatch-events" {
+        for (index, d) in dispatches.iter().enumerate() {
+            counters.dispatches.insert((d.session, d.stream, d.event_id), index);
+        }
+    }
+    let counter_outcome = crate::irpf_counters::attach(
+        &mut out,
+        counters,
+        &device_label,
+        &queue_label,
+        &|session, executable, ordinal| functions.get(&(session, executable, ordinal)).cloned(),
+        cancelled,
+    )?;
+    use crate::irpf_counters::Outcome;
+    let traced = !out.waves.is_empty() || !out.instructions.is_empty();
     out.warnings.push(
-        if !out.waves.is_empty() || !out.instructions.is_empty() {
-            "Hardware counters are not part of this IRPF bundle; the thread trace above is its only microarchitectural data."
-        } else if has_traces {
-            "This bundle carries thread traces, but none was imported (see the warnings above), so wave occupancy and ISA hotspots are absent; hardware counters are not part of these IRPF bundles."
-        } else {
-            "Coverage is unknown from a native dispatch stream alone: wave occupancy, ISA hotspots and hardware counters are not part of these IRPF bundles."
+        match (counter_outcome, traced, has_traces) {
+            (Outcome::Absent, true, _) => "Hardware counters are not part of this IRPF bundle; the thread trace above is its only microarchitectural data.",
+            (Outcome::Absent, false, true) => "This bundle carries thread traces, but none was imported (see the warnings above), so wave occupancy and ISA hotspots are absent; hardware counters are not part of these IRPF bundles.",
+            (Outcome::Absent, false, false) => "Coverage is unknown from a native dispatch stream alone: wave occupancy, ISA hotspots and hardware counters are not part of these IRPF bundles.",
+            (Outcome::Imported, true, _) => "This bundle's microarchitectural data are the thread trace above, a sample of waves, and the hardware counters above, window sums for the sampled dispatches. Neither is a census of the capture.",
+            (Outcome::Imported, false, true) => "This bundle carries thread traces, but none was imported (see the warnings above), so wave occupancy and ISA hotspots are absent; its hardware counters cover the sampled dispatches only, as window sums.",
+            (Outcome::Imported, false, false) => "Wave occupancy and ISA hotspots are not part of this bundle; its hardware counters cover the sampled dispatches only, as window sums (see the counter warnings above).",
+            (Outcome::NotImported, true, _) => "The thread trace above is this capture's only microarchitectural data: the bundle's hardware counters were not imported (see the warnings above).",
+            (Outcome::NotImported, false, true) => "This bundle carries thread traces and hardware counters, but neither was imported (see the warnings above), so wave occupancy, ISA hotspots and counter values are absent.",
+            (Outcome::NotImported, false, false) => "Wave occupancy and ISA hotspots are not part of this bundle, and its hardware counters were not imported (see the warnings above).",
         }
         .into(),
     );
@@ -2088,5 +2204,449 @@ mod tests {
         let s = summarize_bytes(&open).unwrap();
         assert!(!s.finalized);
         assert_eq!(s.dispatch_events, 0);
+    }
+
+    // ---- hardware counters -------------------------------------------------
+
+    fn counter_set(set_id: u64, counters: u32, values: u32, name: &str) -> Vec<u8> {
+        let mut r = vec![0u8; 32];
+        r[0..4].copy_from_slice(&le_u32(32 + name.len() as u32));
+        r[8..16].copy_from_slice(&le_u64(set_id));
+        r[16..20].copy_from_slice(&le_u32(0)); // physical device ordinal
+        r[20..24].copy_from_slice(&le_u32(counters));
+        r[24..28].copy_from_slice(&le_u32(values));
+        r[28..32].copy_from_slice(&le_u32(name.len() as u32));
+        r.extend_from_slice(name.as_bytes());
+        r
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn counter(
+        set_id: u64,
+        ordinal: u32,
+        unit: u32,
+        offset: u32,
+        count: u32,
+        block: &str,
+        name: &str,
+        description: &str,
+    ) -> Vec<u8> {
+        let mut r = vec![0u8; 48];
+        let total = 48 + block.len() + name.len() + description.len();
+        r[0..4].copy_from_slice(&le_u32(total as u32));
+        r[4..8].copy_from_slice(&le_u32(1)); // RAW
+        r[8..12].copy_from_slice(&le_u32(unit));
+        r[16..24].copy_from_slice(&le_u64(set_id));
+        r[24..28].copy_from_slice(&le_u32(ordinal));
+        r[28..32].copy_from_slice(&le_u32(offset));
+        r[32..36].copy_from_slice(&le_u32(count));
+        r[36..40].copy_from_slice(&le_u32(block.len() as u32));
+        r[40..44].copy_from_slice(&le_u32(name.len() as u32));
+        r[44..48].copy_from_slice(&le_u32(description.len() as u32));
+        r.extend_from_slice(block.as_bytes());
+        r.extend_from_slice(name.as_bytes());
+        r.extend_from_slice(description.as_bytes());
+        r
+    }
+    /// `flags`: bit 0 DISPATCH_EVENT, bit 1 COMMAND_OPERATION.
+    fn counter_sample(sample_id: u64, set_id: u64, flags: u32, event_id: u64, values: &[u64]) -> Vec<u8> {
+        let mut r = vec![0u8; 112];
+        r[0..4].copy_from_slice(&le_u32(112 + 8 * values.len() as u32));
+        r[4..8].copy_from_slice(&le_u32(flags));
+        r[8..12].copy_from_slice(&le_u32(1)); // scope DISPATCH
+        r[16..24].copy_from_slice(&le_u64(sample_id));
+        r[24..32].copy_from_slice(&le_u64(set_id));
+        r[32..40].copy_from_slice(&le_u64(event_id));
+        r[48..56].copy_from_slice(&le_u64(7)); // command buffer
+        r[56..64].copy_from_slice(&le_u64(1)); // executable
+        r[64..72].copy_from_slice(&le_u64(1)); // stream
+        r[88..92].copy_from_slice(&le_u32(3)); // command index
+        r[92..96].copy_from_slice(&le_u32(0)); // function ordinal
+        r[96..100].copy_from_slice(&le_u32(0));
+        r[100..104].copy_from_slice(&le_u32(0));
+        r[104..108].copy_from_slice(&le_u32(values.len() as u32));
+        for v in values {
+            r.extend_from_slice(&le_u64(*v));
+        }
+        r
+    }
+    /// `counts`: limit, operations, dispatches, skipped, dropped, invalid, foreign.
+    fn counter_capture(set_id: u64, flags: u32, counts: [u64; 7]) -> Vec<u8> {
+        let mut r = vec![0u8; 88];
+        r[0..4].copy_from_slice(&le_u32(88));
+        r[4..8].copy_from_slice(&le_u32(flags));
+        r[8..16].copy_from_slice(&le_u64(set_id));
+        r[20..24].copy_from_slice(&le_u32(2)); // shader engines
+        for (i, v) in counts.iter().enumerate() {
+            r[32 + i * 8..40 + i * 8].copy_from_slice(&le_u64(*v));
+        }
+        r
+    }
+    const STABLE: u32 = 1;
+    const EXCLUSIVE: u32 = 2;
+    const PROCESS_SCOPE: u32 = 4;
+    const LIMIT_REACHED: u32 = 8;
+
+    /// One GPU session: three dispatches, a five-slot counter set (two
+    /// per-engine counters and one single-slot counter) and four samples: two
+    /// joined, one naming a dispatch event the bundle lacks, one with no event.
+    fn counter_chunks(samples: Vec<u8>, capture: Option<Vec<u8>>) -> Vec<Chunk> {
+        let gpu = |family: &str, payload: Vec<u8>, queue: u32, stream: u64| {
+            chunk_on(family, payload, "amd-gpu", 1, 0, queue, stream)
+        };
+        let mut events = dispatch_event(1, 1, 0, [4, 1, 1], [64, 1, 1], 1000, 1200);
+        events.extend(dispatch_event(2, 1, 0, [8, 1, 1], [64, 1, 1], 1400, 1800));
+        events.extend(dispatch_event(3, 1, 0, [2, 1, 1], [64, 1, 1], 2000, 2100));
+        let mut counters = counter(1, 0, 1, 0, 2, "SQG", "SQG_WAVES", "Waves launched");
+        counters.extend(counter(1, 1, 2, 2, 2, "SQG", "SQG_BUSY_CYCLES", "Busy cycles"));
+        counters.extend(counter(1, 2, 1, 4, 1, "SQ", "SQ_INSTS_ALL", ""));
+        let mut chunks = vec![
+            gpu("devices", device_at(0, 100_000_000), u32::MAX, 0),
+            gpu("queues", queue(0, 0, 1), 0, 1),
+            gpu("executable-functions", function(1, 0, "g_gemm_q4"), u32::MAX, 0),
+            gpu("dispatch-events", events, 0, 1),
+            gpu("counter-sets", counter_set(1, 3, 5, "amdgpu.perfmon"), u32::MAX, 0),
+            gpu("counters", counters, u32::MAX, 0),
+            gpu("counter-samples", samples, 0, 1),
+        ];
+        if let Some(capture) = capture {
+            chunks.push(gpu("counter-captures", capture, u32::MAX, 0));
+        }
+        chunks
+    }
+    fn counter_samples() -> Vec<u8> {
+        let mut samples = counter_sample(1, 1, 1, 1, &[3, 1, 100, 50, 7]);
+        samples.extend(counter_sample(2, 1, 1, 2, &[5, 3, 400, 20, 9]));
+        samples.extend(counter_sample(3, 1, 1, 99, &[1, 1, 1, 1, 1]));
+        samples.extend(counter_sample(4, 1, 2, 0, &[2, 0, 6, 0, 1]));
+        samples
+    }
+    fn counter_bundle(capture: Option<Vec<u8>>) -> Capture {
+        let d = bundle(&counter_chunks(counter_samples(), capture));
+        build(&d, "counters.irpf".into(), &AtomicBool::new(false)).unwrap()
+    }
+    fn warned(c: &Capture, needle: &str) -> bool {
+        c.warnings.iter().any(|w| w.contains(needle))
+    }
+
+    #[test]
+    fn counter_samples_become_rows_joined_to_dispatches_by_event_id() {
+        let c = counter_bundle(Some(counter_capture(
+            1,
+            STABLE | EXCLUSIVE | PROCESS_SCOPE,
+            [4096, 1, 4, 0, 0, 0, 0],
+        )));
+        assert_eq!(c.dispatches.len(), 3);
+        // Four samples × three counters, in sample order.
+        assert_eq!(c.event_counters.len(), 12);
+        let waves = &c.event_counters[0];
+        assert_eq!((waves.name.as_str(), waves.unit.as_str()), ("SQG_WAVES", "count"));
+        // Two shader-engine slots summed: 3 + 1.
+        assert_eq!(waves.value, Some(4.0));
+        assert_eq!(waves.dispatches, [c.dispatches[0].id.clone()]);
+        assert_eq!(waves.event.as_deref(), Some(c.dispatches[0].id.as_str()));
+        assert_eq!(
+            waves.scope,
+            "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4 · grid 256 × 1 × 1 · workgroup 64 × 1 × 1"
+        );
+        let cycles = &c.event_counters[1];
+        assert_eq!((cycles.name.as_str(), cycles.unit.as_str(), cycles.value), ("SQG_BUSY_CYCLES", "cycles", Some(150.0)));
+        assert!(cycles.scope.contains("hardware-wide during the window"), "{}", cycles.scope);
+        assert_eq!(c.event_counters[2].value, Some(7.0));
+        assert_eq!(c.event_counters[2].scope.matches("sum of 1 instance ").count(), 1);
+        // The sample naming event 99: flagged, but that dispatch is not here.
+        let lost = &c.event_counters[6];
+        assert!(lost.dispatches.is_empty());
+        assert_eq!(lost.event.as_deref(), Some("dispatch event 99 of stream 1 (not in this capture)"));
+        assert!(lost.scope.ends_with("g_gemm_q4 · dispatch not in this capture"), "{}", lost.scope);
+        // The sample with no dispatch event id keeps its command location.
+        let unflagged = &c.event_counters[9];
+        assert!(unflagged.dispatches.is_empty());
+        assert_eq!(unflagged.event.as_deref(), Some("command buffer 7 operation 3"));
+        assert_eq!(unflagged.value, Some(2.0));
+        // Row ids are unique.
+        let mut ids: Vec<&str> = c.event_counters.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 12);
+
+        // One series per counter, joined samples only, at the dispatch midpoints.
+        assert_eq!(c.counters.len(), 3);
+        assert_eq!(c.counters[0].name, "SQG_WAVES");
+        assert_eq!(c.counters[0].scope, "HRX device 0 (amd-gpu) · dispatch counters · amdgpu.perfmon");
+        assert_eq!(c.counters[0].points, [[1000.0, 4.0], [6000.0, 8.0]]);
+        assert_eq!(c.counters[1].unit, "cycles");
+        assert!(c.counters.iter().all(|s| s.scope == c.counters[0].scope));
+
+        assert_eq!(c.metadata["hrxCounterImport"], "imported");
+        assert_eq!(c.metadata["hrxCounterSampledDispatches"], "2 of 3");
+        assert_eq!(c.metadata["hrxCounterSamples"], "4 sample(s): 2 joined to a dispatch, 2 not joined");
+        assert_eq!(
+            c.metadata["hrxCounterTotals"],
+            "over 4 sample(s): SQG_WAVES 16 · SQG_BUSY_CYCLES 578 · SQ_INSTS_ALL 18"
+        );
+        // Per-kernel sums over the joined samples only (samples 1 and 2).
+        assert_eq!(
+            c.metadata["hrxCounterKernels"],
+            "g_gemm_q4: 2 sampled dispatch(es), SQG_WAVES 12, SQG_BUSY_CYCLES 570, SQ_INSTS_ALL 16"
+        );
+        assert_eq!(c.metadata["hrxCounterValuesAreWindowSums"], "true");
+        assert_eq!(
+            c.metadata["hrxCounterWindowExclusive"],
+            "HRX device 0 (amd-gpu) set 1: true (among the producing device's queues, per the producer)"
+        );
+        assert!(c.metadata["hrxCounterCapture"].contains("bound 4096 sampled dispatch(es), 1 operation(s) bracketed, 4 sample(s) emitted"));
+        assert!(c.metadata["hrxCounterCapture"].contains("stable power state held, window exclusive among the device's queues, hardware scope: every counting-enabled queue of the process"));
+        assert!(c.metadata["hrxCounters"].contains("SQG_WAVES [SQG, count, 2 instances]: Waves launched"));
+        assert!(c.metadata["coverage"].ends_with(
+            "; plus hardware counters for 2 of 3 dispatches, as window sums (exclusive among the device's queues, per the producer)"
+        ));
+
+        assert!(warned(&c, "Hardware counter values of amdgpu.perfmon (HRX device 0 (amd-gpu)) are window sums."));
+        assert!(warned(&c, "The producer reports an exclusive window for this capture"));
+        assert!(warned(&c, "That is exact about this device session's queues only"));
+        assert!(warned(&c, "2 of 3 dispatches in this capture carry counter values"));
+        assert!(warned(&c, "2 counter sample(s) are not joined to a dispatch: 1 carry no dispatch event id"));
+        assert!(warned(&c, "Cycle counters (SQG_BUSY_CYCLES) are never a per-dispatch count"));
+        assert!(warned(&c, "its hardware counters cover the sampled dispatches only, as window sums"));
+        assert!(!warned(&c, "hardware counters are not part of these IRPF bundles"));
+        assert!(!warned(&c, "cannot tell"));
+    }
+
+    #[test]
+    fn counters_without_a_capture_record_warn_that_the_window_is_unknown() {
+        let c = counter_bundle(None);
+        assert_eq!(c.event_counters.len(), 12);
+        assert!(warned(&c, "has no counter-captures record for this set, so this capture cannot tell"));
+        assert!(warned(&c, "read every value as an upper bound"));
+        assert!(!warned(&c, "The producer reports an exclusive window"));
+        assert_eq!(
+            c.metadata["hrxCounterWindowExclusive"],
+            "HRX device 0 (amd-gpu) set 1: unknown (no counter-captures record)"
+        );
+        assert!(c.metadata["coverage"].ends_with("(no capture record, window exclusivity unknown)"));
+    }
+
+    #[test]
+    fn counter_capture_facts_drive_the_warnings() {
+        // No exclusivity claim, bound reached, skipped, dropped and invalid.
+        let c = counter_bundle(Some(counter_capture(1, LIMIT_REACHED, [2, 1, 2, 5, 3, 1, 0])));
+        assert!(warned(&c, "The producer did not report an exclusive window, so this capture cannot tell"));
+        assert!(warned(&c, "The counter sample bound of 2 dispatch(es) was reached"));
+        assert!(warned(&c, "5 matching operation(s) on HRX device 0 (amd-gpu) ran unsampled"));
+        assert!(warned(&c, "3 counter sample(s) on HRX device 0 (amd-gpu) were lost to host capacity"));
+        assert!(warned(&c, "1 counter sample(s) on HRX device 0 (amd-gpu) were discarded"));
+        assert!(warned(&c, "No stable GPU power state was held"));
+        assert_eq!(c.metadata["hrxCounterWindowExclusive"], "HRX device 0 (amd-gpu) set 1: not reported");
+
+        // Another collector overrides an exclusivity claim.
+        let c = counter_bundle(Some(counter_capture(1, STABLE | EXCLUSIVE, [4096, 1, 4, 0, 0, 0, 2])));
+        assert!(warned(&c, "2 sampled operation(s) on HRX device 0 (amd-gpu) found the perfmon registers away from their reset defaults"));
+        assert!(warned(&c, "so the values cannot be read as per-dispatch counts"));
+        assert!(!warned(&c, "The producer reports an exclusive window for this capture"));
+        assert!(c.metadata["hrxCounterWindowExclusive"].ends_with("false (another collector was active)"));
+
+        // A later capture record replaces an earlier one: the record is cumulative.
+        let mut records = counter_capture(1, 0, [4096, 1, 1, 0, 0, 0, 0]);
+        records.extend(counter_capture(1, STABLE | EXCLUSIVE, [4096, 2, 4, 0, 0, 0, 0]));
+        let c = counter_bundle(Some(records));
+        assert!(c.metadata["hrxCounterCapture"].contains("2 operation(s) bracketed, 4 sample(s) emitted"));
+        assert!(warned(&c, "The producer reports an exclusive window for this capture"));
+    }
+
+    #[test]
+    fn truncated_counter_samples_are_imported_and_flagged() {
+        let mut chunks = counter_chunks(counter_samples(), None);
+        let samples = chunks.iter_mut().find(|c| c.family.ends_with("counter-samples")).unwrap();
+        samples.flags = CHUNK_FLAG_TRUNCATED;
+        samples.dropped = 37;
+        let c = build(&bundle(&chunks), "counters.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(c.event_counters.len(), 12);
+        assert!(warned(&c, "IRPF counter-samples chunk is TRUNCATED: the producer dropped 37 record(s)"));
+    }
+
+    #[test]
+    fn malformed_counter_records_leave_the_counters_out_and_keep_the_capture() {
+        // A sample that claims more values than its record holds.
+        let mut short = counter_sample(1, 1, 1, 1, &[3, 1, 100, 50, 7]);
+        short[104..108].copy_from_slice(&le_u32(9));
+        // A sample record shorter than the fixed sample header.
+        let mut stub = vec![0u8; 16];
+        stub[0..4].copy_from_slice(&le_u32(16));
+        // A record length that runs past the chunk.
+        let mut overrun = counter_sample(1, 1, 1, 1, &[1, 2, 3, 4, 5]);
+        overrun[0..4].copy_from_slice(&le_u32(4096));
+        for (samples, reason) in [
+            (short, "a counter sample's values extend past its record"),
+            (stub, "a counter-samples record is 16 bytes, below the 112-byte minimum"),
+            (overrun, "a counter-samples record extends past its chunk"),
+        ] {
+            let d = bundle(&counter_chunks(samples, None));
+            let c = build(&d, "counters.irpf".into(), &AtomicBool::new(false)).unwrap();
+            assert_eq!(c.dispatches.len(), 3);
+            assert!(c.event_counters.is_empty() && c.counters.is_empty());
+            assert!(warned(&c, &format!("Hardware counters not imported: {reason}.")), "{:?}", c.warnings);
+            assert_eq!(c.metadata["hrxCounterImport"], "not imported");
+            assert!(warned(&c, "its hardware counters were not imported"));
+        }
+        // A counter record whose name runs past its record.
+        let mut chunks = counter_chunks(counter_samples(), None);
+        let counters = chunks.iter_mut().find(|c| c.family.ends_with(".counters")).unwrap();
+        counters.payload[40..44].copy_from_slice(&le_u32(4000));
+        let c = build(&bundle(&chunks), "counters.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert!(warned(&c, "Hardware counters not imported: a counter name extends past its record."));
+        assert_eq!(c.dispatches.len(), 3);
+    }
+
+    #[test]
+    fn samples_with_missing_slots_and_sets_without_counters_are_stated() {
+        // A sample with three values where the set lays out five: the per-engine
+        // SQG_WAVES fits, the other two counters do not.
+        let mut samples = counter_sample(1, 1, 1, 1, &[3, 1, 100]);
+        // A sample of a set the bundle does not define.
+        samples.extend(counter_sample(2, 9, 1, 2, &[1]));
+        let c = build(&bundle(&counter_chunks(samples, None)), "c.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(c.event_counters.len(), 3);
+        assert_eq!(c.event_counters[0].value, Some(4.0));
+        assert_eq!(c.event_counters[1].value, None);
+        assert_eq!(c.event_counters[2].value, None);
+        assert!(warned(&c, "1 counter sample(s) carry fewer values than their counter set declares"));
+        assert!(warned(&c, "1 counter sample(s) reference a counter set the bundle does not define"));
+        assert!(warned(&c, "Counter(s) with no sample in this bundle: SQG_BUSY_CYCLES, SQ_INSTS_ALL. A missing value is not zero."));
+        // Only the counter with values gets a series.
+        assert_eq!(c.counters.len(), 1);
+
+        // Counter metadata but no sample at all.
+        let c = build(&bundle(&counter_chunks(Vec::new(), None)), "c.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert!(c.event_counters.is_empty());
+        assert!(warned(&c, "defines hardware counters but carries no counter sample"));
+        assert_eq!(c.metadata["hrxCounterImport"], "no samples");
+
+        // A set with no counter records.
+        let mut chunks = counter_chunks(counter_samples(), None);
+        chunks.retain(|c| !c.family.ends_with(".counters"));
+        let c = build(&bundle(&chunks), "c.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert!(c.event_counters.is_empty());
+        assert!(warned(&c, "Counter set amdgpu.perfmon (HRX device 0 (amd-gpu)) declares 3 counters but the bundle defines none"));
+    }
+
+    #[test]
+    fn another_producers_counter_set_is_imported_under_its_own_device() {
+        // The XDNA driver's own set in a second session of the same bundle: one
+        // cycle counter, one slot, no dispatch event ids and no capture record.
+        let mut chunks = counter_chunks(
+            counter_samples(),
+            Some(counter_capture(1, STABLE | EXCLUSIVE, [4096, 1, 4, 0, 0, 0, 0])),
+        );
+        let npu = |family: &str, payload: Vec<u8>| chunk_on(family, payload, "xdna", 2, 1, 0, 1);
+        let mut set = counter_set(1, 1, 1, "xdna");
+        set[16..20].copy_from_slice(&le_u32(1));
+        chunks.push(npu("devices", device_at(1, 0)));
+        chunks.push(npu("counter-sets", set));
+        chunks.push(npu("counters", counter(1, 0, 2, 0, 1, "partition_shim", "invocation_cycles", "")));
+        chunks.push(npu("counter-samples", counter_sample(1, 1, 0, 0, &[1234])));
+        let c = build(&bundle(&chunks), "hybrid.irpf".into(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(c.event_counters.len(), 13);
+        let npu_row = c.event_counters.last().unwrap();
+        assert_eq!((npu_row.name.as_str(), npu_row.unit.as_str(), npu_row.value), ("invocation_cycles", "cycles", Some(1234.0)));
+        assert!(npu_row.scope.starts_with("HRX device 1 (xdna) · "), "{}", npu_row.scope);
+        assert!(npu_row.dispatches.is_empty() && npu_row.event.is_none());
+        // Two sessions carry samples: row ids are session-qualified.
+        assert!(npu_row.id.starts_with("counter-samples:session2:"), "{}", npu_row.id);
+        // Each set gets its own statement; the GPU's claim is not lent to the NPU.
+        assert!(warned(&c, "Hardware counter values of amdgpu.perfmon (HRX device 0 (amd-gpu)) are window sums."));
+        assert!(warned(&c, "Hardware counter values of xdna (HRX device 1 (xdna)) are window sums."));
+        assert!(warned(&c, "has no counter-captures record for this set, so this capture cannot tell"));
+        assert_eq!(
+            c.metadata["hrxCounterWindowExclusive"],
+            "HRX device 0 (amd-gpu) set 1: true (among the producing device's queues, per the producer) | HRX device 1 (xdna) set 1: unknown (no counter-captures record)"
+        );
+        assert!(c.metadata["coverage"].ends_with("(no capture record, window exclusivity unknown)"));
+    }
+
+    #[test]
+    fn counter_rows_above_the_record_cap_are_refused_whole() {
+        fn chunk_of(payload: &[u8]) -> crate::irpf_counters::Chunk<'_> {
+            crate::irpf_counters::Chunk { session: 1, device: 0, queue: 0, stream: 1, payload }
+        }
+        let sets = counter_set(1, 2, 2, "amdgpu.perfmon");
+        let mut counters = counter(1, 0, 1, 0, 1, "SQG", "SQG_WAVES", "");
+        counters.extend(counter(1, 1, 1, 1, 1, "SQG", "SQG_ITEMS", ""));
+        let mut samples = Vec::new();
+        for id in 1..=3 {
+            samples.extend(counter_sample(id, 1, 0, 0, &[1, 2]));
+        }
+        let run = |cap: usize| {
+            let mut out = Capture::empty("c".into(), "HRX native profile · IRPF 2.0", "ns");
+            let outcome = crate::irpf_counters::attach(
+                &mut out,
+                crate::irpf_counters::Context {
+                    sets: vec![chunk_of(&sets)],
+                    counters: vec![chunk_of(&counters)],
+                    samples: vec![chunk_of(&samples)],
+                    captures: Vec::new(),
+                    dispatches: BTreeMap::new(),
+                    cap,
+                },
+                &|_, _| "HRX device 0".into(),
+                &|_| "HRX queue 0".into(),
+                &|_, _, _| None,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            (outcome, out)
+        };
+        // Three samples × two counters = six rows.
+        let (outcome, out) = run(6);
+        assert_eq!(outcome, crate::irpf_counters::Outcome::Imported);
+        assert_eq!(out.event_counters.len(), 6);
+        let (outcome, out) = run(5);
+        assert_eq!(outcome, crate::irpf_counters::Outcome::NotImported);
+        assert!(out.event_counters.is_empty());
+        assert!(
+            out.warnings[0].contains("3 counter sample(s) expand to 6 counter value(s), above the 5 record limit"),
+            "{:?}",
+            out.warnings
+        );
+        // Cancellation is the one error that propagates.
+        let cancelled = AtomicBool::new(true);
+        let mut out = Capture::empty("c".into(), "HRX native profile · IRPF 2.0", "ns");
+        let result = crate::irpf_counters::attach(
+            &mut out,
+            crate::irpf_counters::Context {
+                sets: vec![chunk_of(&sets)],
+                counters: Vec::new(),
+                samples: Vec::new(),
+                captures: Vec::new(),
+                dispatches: BTreeMap::new(),
+                cap: 10,
+            },
+            &|_, _| String::new(),
+            &|_| String::new(),
+            &|_, _, _| None,
+            &cancelled,
+        );
+        assert_eq!(result.unwrap_err(), "Import cancelled");
+    }
+
+    #[test]
+    fn summary_reports_counter_sets_names_and_capture_facts() {
+        let d = bundle(&counter_chunks(
+            counter_samples(),
+            Some(counter_capture(1, STABLE | EXCLUSIVE | LIMIT_REACHED, [4, 1, 4, 2, 0, 0, 0])),
+        ));
+        let s = summarize_bytes(&d).unwrap();
+        assert_eq!((s.counter_sets, s.counter_samples), (1, 4));
+        assert_eq!(s.counter_names, ["SQG_WAVES", "SQG_BUSY_CYCLES", "SQ_INSTS_ALL"]);
+        let capture = s.counter_capture.unwrap();
+        assert!(capture.exclusive_window && capture.stable_power_state && capture.limit_reached);
+        assert_eq!(
+            (capture.records, capture.sample_limit, capture.sampled_operations, capture.sampled_dispatches, capture.skipped_operations, capture.foreign_state),
+            (1, 4, 1, 4, 2, 0)
+        );
+        // A bundle without counters says so and keeps its summary shape.
+        let s = summarize_bytes(&dispatch_bundle()).unwrap();
+        assert_eq!((s.counter_sets, s.counter_samples), (0, 0));
+        assert!(s.counter_names.is_empty() && s.counter_capture.is_none());
+        assert!(!serde_json::to_string(&s).unwrap().contains("counterCapture"));
     }
 }

@@ -1,0 +1,299 @@
+{
+  "architecture": "Unknown",
+  "codeObjects": [],
+  "counters": [
+    {
+      "name": "SQG_WAVES",
+      "points": [
+        [
+          1000.0,
+          4.0
+        ],
+        [
+          6000.0,
+          8.0
+        ]
+      ],
+      "scope": "HRX device 0 (amd-gpu) · dispatch counters · amdgpu.perfmon",
+      "unit": "count"
+    },
+    {
+      "name": "SQG_WAVES_32",
+      "points": [
+        [
+          1000.0,
+          0.0
+        ],
+        [
+          6000.0,
+          0.0
+        ]
+      ],
+      "scope": "HRX device 0 (amd-gpu) · dispatch counters · amdgpu.perfmon",
+      "unit": "count"
+    },
+    {
+      "name": "SQG_WAVES_64",
+      "points": [
+        [
+          1000.0,
+          4.0
+        ],
+        [
+          6000.0,
+          8.0
+        ]
+      ],
+      "scope": "HRX device 0 (amd-gpu) · dispatch counters · amdgpu.perfmon",
+      "unit": "count"
+    },
+    {
+      "name": "SQG_ITEMS",
+      "points": [
+        [
+          1000.0,
+          256.0
+        ],
+        [
+          6000.0,
+          512.0
+        ]
+      ],
+      "scope": "HRX device 0 (amd-gpu) · dispatch counters · amdgpu.perfmon",
+      "unit": "count"
+    },
+    {
+      "name": "SQG_BUSY_CYCLES",
+      "points": [
+        [
+          1000.0,
+          8209.0
+        ],
+        [
+          6000.0,
+          18109.0
+        ]
+      ],
+      "scope": "HRX device 0 (amd-gpu) · dispatch counters · amdgpu.perfmon",
+      "unit": "cycles"
+    }
+  ],
+  "decoderEvents": [],
+  "dispatches": [
+    {
+      "agent": "HRX device 0 (amd-gpu)",
+      "end": 2000.0,
+      "grid": "256 × 1 × 1",
+      "id": "dispatch-events:1",
+      "kernel": "g_gemm_q4_k_store_m256",
+      "lds": null,
+      "queue": "HRX stream 1",
+      "scratch": null,
+      "sgpr": null,
+      "start": 0.0,
+      "vgpr": null,
+      "workgroup": "64 × 1 × 1"
+    },
+    {
+      "agent": "HRX device 0 (amd-gpu)",
+      "end": 8000.0,
+      "grid": "512 × 1 × 1",
+      "id": "dispatch-events:2",
+      "kernel": "g_gemm_q4_k_store_m256",
+      "lds": null,
+      "queue": "HRX stream 1",
+      "scratch": null,
+      "sgpr": null,
+      "start": 4000.0,
+      "vgpr": null,
+      "workgroup": "64 × 1 × 1"
+    },
+    {
+      "agent": "HRX device 0 (amd-gpu)",
+      "end": 11000.0,
+      "grid": "128 × 1 × 1",
+      "id": "dispatch-events:3",
+      "kernel": "g_gemm_q4_k_store_m256",
+      "lds": null,
+      "queue": "HRX stream 1",
+      "scratch": null,
+      "sgpr": null,
+      "start": 10000.0,
+      "vgpr": null,
+      "workgroup": "64 × 1 × 1"
+    }
+  ],
+  "end": 11000.0,
+  "eventCounters": [
+    {
+      "counterId": "counters:1:1:0",
+      "dispatches": [
+        "dispatch-events:1"
+      ],
+      "event": "dispatch-events:1",
+      "id": "counter-samples:s1:1:c0",
+      "name": "SQG_WAVES",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 256 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 4.0
+    },
+    {
+      "counterId": "counters:1:1:1",
+      "dispatches": [
+        "dispatch-events:1"
+      ],
+      "event": "dispatch-events:1",
+      "id": "counter-samples:s1:1:c1",
+      "name": "SQG_WAVES_32",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 256 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 0.0
+    },
+    {
+      "counterId": "counters:1:1:2",
+      "dispatches": [
+        "dispatch-events:1"
+      ],
+      "event": "dispatch-events:1",
+      "id": "counter-samples:s1:1:c2",
+      "name": "SQG_WAVES_64",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 256 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 4.0
+    },
+    {
+      "counterId": "counters:1:1:3",
+      "dispatches": [
+        "dispatch-events:1"
+      ],
+      "event": "dispatch-events:1",
+      "id": "counter-samples:s1:1:c3",
+      "name": "SQG_ITEMS",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 256 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 256.0
+    },
+    {
+      "counterId": "counters:1:1:4",
+      "dispatches": [
+        "dispatch-events:1"
+      ],
+      "event": "dispatch-events:1",
+      "id": "counter-samples:s1:1:c4",
+      "name": "SQG_BUSY_CYCLES",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · hardware-wide during the window · g_gemm_q4_k_store_m256 · grid 256 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "cycles",
+      "value": 8209.0
+    },
+    {
+      "counterId": "counters:1:1:0",
+      "dispatches": [
+        "dispatch-events:2"
+      ],
+      "event": "dispatch-events:2",
+      "id": "counter-samples:s1:2:c0",
+      "name": "SQG_WAVES",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 512 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 8.0
+    },
+    {
+      "counterId": "counters:1:1:1",
+      "dispatches": [
+        "dispatch-events:2"
+      ],
+      "event": "dispatch-events:2",
+      "id": "counter-samples:s1:2:c1",
+      "name": "SQG_WAVES_32",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 512 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 0.0
+    },
+    {
+      "counterId": "counters:1:1:2",
+      "dispatches": [
+        "dispatch-events:2"
+      ],
+      "event": "dispatch-events:2",
+      "id": "counter-samples:s1:2:c2",
+      "name": "SQG_WAVES_64",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 512 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 8.0
+    },
+    {
+      "counterId": "counters:1:1:3",
+      "dispatches": [
+        "dispatch-events:2"
+      ],
+      "event": "dispatch-events:2",
+      "id": "counter-samples:s1:2:c3",
+      "name": "SQG_ITEMS",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · g_gemm_q4_k_store_m256 · grid 512 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "count",
+      "value": 512.0
+    },
+    {
+      "counterId": "counters:1:1:4",
+      "dispatches": [
+        "dispatch-events:2"
+      ],
+      "event": "dispatch-events:2",
+      "id": "counter-samples:s1:2:c4",
+      "name": "SQG_BUSY_CYCLES",
+      "scope": "HRX device 0 (amd-gpu) · HRX stream 1 · SQG · sum of 2 instances · hardware-wide during the window · g_gemm_q4_k_store_m256 · grid 512 × 1 × 1 · workgroup 64 × 1 × 1",
+      "unit": "cycles",
+      "value": 18109.0
+    }
+  ],
+  "format": "HRX native profile · IRPF 2.0",
+  "hostCalls": [],
+  "id": "",
+  "instructions": [],
+  "intervals": [],
+  "markers": [],
+  "metadata": {
+    "coverage": "HRX native IRPF dispatch stream; raw device ticks, no host-timeline alignment; plus hardware counters for 2 of 3 dispatches, as window sums (exclusive among the device's queues, per the producer)",
+    "gridConvention": "grid = workgroup count × workgroup size (global work-items), matching rocprofv3 Grid_Size",
+    "hrxCodeObjectCount": "0",
+    "hrxCounterCapture": "HRX device 0 (amd-gpu) set 1: bound 2 sampled dispatch(es) (reached), 1 operation(s) bracketed, 2 sample(s) emitted, 0 matching operation(s) ran unsampled, 0 sample(s) dropped, 0 sample(s) without hardware values, 0 operation(s) found foreign perfmon state, 2 shader engine(s), stable power state held, window exclusive among the device's queues, hardware scope: every counting-enabled queue of the process",
+    "hrxCounterImport": "imported",
+    "hrxCounterKernels": "g_gemm_q4_k_store_m256: 2 sampled dispatch(es), SQG_WAVES 12, SQG_WAVES_32 0, SQG_WAVES_64 12, SQG_ITEMS 768, SQG_BUSY_CYCLES 26318",
+    "hrxCounterSampledDispatches": "2 of 3",
+    "hrxCounterSamples": "2 sample(s): 2 joined to a dispatch, 0 not joined",
+    "hrxCounterSets": "amdgpu.perfmon (HRX device 0 (amd-gpu), set 1): 5 counters, 10 value slots per sample",
+    "hrxCounterTotals": "over 2 sample(s): SQG_WAVES 12 · SQG_WAVES_32 0 · SQG_WAVES_64 12 · SQG_ITEMS 768 · SQG_BUSY_CYCLES 26318",
+    "hrxCounterValuesAreWindowSums": "true",
+    "hrxCounterWindowExclusive": "HRX device 0 (amd-gpu) set 1: true (among the producing device's queues, per the producer)",
+    "hrxCounters": "SQG_WAVES [SQG, count, 2 instances]: Waves launched | SQG_WAVES_32 [SQG, count, 2 instances]: Wave32 waves launched | SQG_WAVES_64 [SQG, count, 2 instances]: Wave64 waves launched | SQG_ITEMS [SQG, count, 2 instances]: Work items launched | SQG_BUSY_CYCLES [SQG, cycles, 2 instances]: Cycles with a wave in the shader engine",
+    "hrxDevices": "HRX device 0 (amd-gpu)",
+    "hrxDispatchCount": "3",
+    "hrxFunctionCount": "1",
+    "hrxProfileFormat": "IRPF 2.0",
+    "hrxProfileMode": "dispatch (device-timestamped dispatch events)",
+    "hrxQueueEventCount": "0",
+    "hrxSessionCount": "1",
+    "hrxTimestampFrequencyHz": "100000000"
+  },
+  "monitorIntervals": [],
+  "name": "synthetic-hrx-counters.irpf",
+  "origin": "1000",
+  "otherSimd": [],
+  "pcSamplingObservations": null,
+  "realtime": null,
+  "sourceFiles": [],
+  "sources": {},
+  "start": 0.0,
+  "unit": "ns",
+  "warnings": [
+    "HRX native profile (IRPF 2.0). Dispatch names, workgroup counts and sizes are the producer's own records.",
+    "Timestamps are raw device ticks converted to elapsed nanoseconds using the device timestamp frequency (100000000 Hz). Only relative timing within this capture is meaningful.",
+    "Hardware counter values of amdgpu.perfmon (HRX device 0 (amd-gpu)) are window sums. Each value is the counter's increase between a read just before a dispatch and a read just after it, summed over the counter's hardware instances. Inside that window the hardware counts every queue of the profiled process that has counting enabled, not only the dispatch, so a value is the dispatch's own count only when nothing else of the process was counted in the window. The producer reports an exclusive window for this capture: it let one queue of its device into a sampled window at a time and enabled counting only inside sampled operations. For event counts (waves, work items, instructions) each window therefore holds exactly its dispatch among that device's queues. That is exact about this device session's queues only; queues of the same process outside the session (a second device instance, or a privileged profiler that forces counting on) would be counted as well, and this capture cannot see them. It does not hold for cycle counters at all (see the warning about cycles).",
+    "The counter sample bound of 2 dispatch(es) was reached on HRX device 0 (amd-gpu): later matching dispatches ran unsampled (2 of 3 dispatches in this capture carry values). Raise hrx.counters.maxSamples or narrow hrx.filterFunction to move the sampled set.",
+    "Hardware counters are a sample of the dispatches: 2 of 3 dispatches in this capture carry counter values. Per-counter totals in metadata.hrxCounterTotals cover those sampled dispatches only, not the capture; per-kernel time still comes from every dispatch event.",
+    "Cycle counters (SQG_BUSY_CYCLES) are never a per-dispatch count, with or without an exclusive window. They count hardware cycles during the sample window, whoever kept the hardware busy: the queue enable that isolates event counts does not isolate them. Measured on gfx1151, a second queue of the same process raised SQG_BUSY_CYCLES about fivefold inside a window whose wave and item counts stayed exact; other processes were not measured. They were not calibrated against a clock and depend on the device's clock level, so compare them with each other, not with the nanosecond axis.",
+    "Counter series place each sampled dispatch's value at the dispatch midpoint: they are per-dispatch measurements, not continuous time samples, and dispatches without a sample have no point.",
+    "Wave occupancy and ISA hotspots are not part of this bundle; its hardware counters cover the sampled dispatches only, as window sums (see the counter warnings above)."
+  ],
+  "waves": []
+}
