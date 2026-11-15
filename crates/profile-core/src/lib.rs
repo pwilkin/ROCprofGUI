@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod hidden;
 mod import;
 pub mod irpf;
+mod irpf_trace;
 mod wave_stream;
 pub mod input_fingerprint;
 pub mod loom_report;

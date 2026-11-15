@@ -96,6 +96,9 @@ export interface CodeObjectRecord {
 export interface Capture {
   pcSamplingObservations?: { columns: string[]; rows: string[][] } | null;
   seTimeOffsets?: Record<string, number>;
+  // Present when decoded waves were placed on another time base (HRX IRPF thread
+  // traces on the dispatch axis). The core applies them; the UI only reports them.
+  waveTimeMaps?: { prefix: string; se: number; knots: [number, number][] }[];
   codeObjects?: CodeObjectRecord[];
   otherSimd?: OtherSimd[];
   decoderEvents?: DecoderEvent[];

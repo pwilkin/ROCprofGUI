@@ -379,6 +379,12 @@ pub struct BundleSummary {
     pub functions: usize,
     pub dispatch_events: usize,
     pub queue_events: usize,
+    /// `executable-traces` chunks (one per traced shader engine) and their raw
+    /// trace bytes. Zero when the family was not requested or produced nothing.
+    pub executable_traces: usize,
+    pub executable_trace_bytes: u64,
+    /// `counter-samples` records of every producer.
+    pub counter_samples: usize,
     /// Families with a TRUNCATED chunk, with the producer's dropped-record count.
     pub truncated: Vec<TruncatedFamily>,
     /// Nonzero session-end status codes.
@@ -429,6 +435,9 @@ fn summarize_bytes(data: &[u8]) -> Result<BundleSummary, String> {
         functions: 0,
         dispatch_events: 0,
         queue_events: 0,
+        executable_traces: 0,
+        executable_trace_bytes: 0,
+        counter_samples: 0,
         truncated: Vec::new(),
         failed_sessions: Vec::new(),
         per_producer: Vec::new(),
@@ -463,6 +472,15 @@ fn summarize_bytes(data: &[u8]) -> Result<BundleSummary, String> {
     let queue_owners = owners("queue-events", SUBRECORD_MIN)?;
     summary.dispatch_events = dispatch_owners.len();
     summary.queue_events = queue_owners.len();
+    summary.counter_samples = owners("counter-samples", SUBRECORD_MIN)?.len();
+    for r in &records {
+        if r.record_type == RECORD_TYPE_CHUNK && r.family == Some("executable-traces") {
+            // Counted from the chunk extent; the import validates the record.
+            summary.executable_traces += 1;
+            summary.executable_trace_bytes +=
+                r.payload.len().saturating_sub(crate::irpf_trace::TRACE_MIN) as u64;
+        }
+    }
     for (session, producer) in &sessions {
         let owned = |owners: &[u64]| owners.iter().filter(|id| *id == session).count();
         let (dispatch_events, queue_events) = (owned(&dispatch_owners), owned(&queue_owners));
@@ -509,6 +527,17 @@ pub fn load_cancellable(path: &Path, cancelled: &AtomicBool) -> Result<Capture, 
 }
 
 fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, String> {
+    build_with(data, name, cancelled, &crate::irpf_trace::run_decoder(cancelled))
+}
+
+/// `build` with the thread-trace decoder supplied by the caller, so the trace
+/// arm can be exercised without the ROCm decoder library.
+fn build_with(
+    data: &[u8],
+    name: String,
+    cancelled: &AtomicBool,
+    decode: &crate::irpf_trace::Decode,
+) -> Result<Capture, String> {
     let (major, minor) = (u16_at(data, 4)?, u16_at(data, 6)?);
     let records = parse_records(data)?;
     let cap = crate::caps::max_records();
@@ -646,6 +675,8 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
             .entry((session, co.executable_id, co.code_object_id))
             .or_insert(co);
     }
+    // Every distinct placement of every image, for placing thread traces.
+    let mut load_deltas: BTreeMap<(u64, u64, u64), Vec<i64>> = BTreeMap::new();
     for (session, exe, co_id, delta, load_size) in walk_family(
         &records,
         "executable-code-object-loads",
@@ -662,6 +693,10 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
             ))
         },
     )? {
+        let deltas = load_deltas.entry((session, exe, co_id)).or_default();
+        if !deltas.contains(&delta) {
+            deltas.push(delta);
+        }
         if let Some(co) = code_objects.get_mut(&(session, exe, co_id)) {
             if co.load_count == 0 {
                 co.load_delta = Some(delta);
@@ -726,6 +761,7 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
                     queue: chunk.queue_ordinal,
                     stream: chunk.stream_id,
                     event_id: u64_at(r, 8)?,
+                    submission: u64_at(r, 16)?,
                     executable_id: u64_at(r, 32)?,
                     function_ordinal: u32_at(r, 44)?,
                     workgroup_count: [u32_at(r, 48)?, u32_at(r, 52)?, u32_at(r, 56)?],
@@ -754,6 +790,7 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
                     queue: chunk.queue_ordinal,
                     stream: chunk.stream_id,
                     event_id: u64_at(r, 16)?, // command_buffer_id
+                    submission: 0,
                     executable_id: u64_at(r, 32)?,
                     function_ordinal: u32_at(r, 40)?,
                     workgroup_count: [u32_at(r, 48)?, u32_at(r, 52)?, u32_at(r, 56)?],
@@ -1033,6 +1070,11 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
     // (empty+truncated is rejected); a non-empty-but-truncated dispatch stream is
     // imported but still warned here.
     for family in chunk_families(&records) {
+        // A truncated thread trace is not a dropped-record ring: its capture
+        // records say what was lost, and the trace arm reports that.
+        if family == "executable-traces" {
+            continue;
+        }
         let (truncated, dropped) = chunk_truncation(&records, family);
         if truncated {
             out.warnings.push(format!(
@@ -1065,8 +1107,129 @@ fn build(data: &[u8], name: String, cancelled: &AtomicBool) -> Result<Capture, S
             "{unresolved} dispatches reference an executable/function the bundle does not define; their names are kept explicitly unresolved rather than guessed."
         ));
     }
+    // Thread traces: stage, decode and place them on the dispatch axis.
+    let mut trace = crate::irpf_trace::TraceContext {
+        chunks: Vec::new(),
+        captures: Vec::new(),
+        objects: Vec::new(),
+        submissions: BTreeMap::new(),
+        events: BTreeMap::new(),
+        clocks: BTreeMap::new(),
+        foreign_format_chunks: 0,
+        unit,
+    };
+    for r in &records {
+        if r.record_type != RECORD_TYPE_CHUNK || r.family != Some("executable-traces") {
+            continue;
+        }
+        match crate::irpf_trace::parse_trace_chunk(
+            r.session_id,
+            r.physical_device_ordinal,
+            r.stream_id,
+            r.chunk_flags & CHUNK_FLAG_TRUNCATED != 0,
+            r.dropped_record_count,
+            r.payload,
+        )? {
+            Some(chunk) => trace.chunks.push(chunk),
+            None => trace.foreign_format_chunks += 1,
+        }
+    }
+    trace.captures = walk_family(
+        &records,
+        "executable-trace-captures",
+        crate::irpf_trace::TRACE_CAPTURE_MIN,
+        cap,
+        cancelled,
+        |chunk, r| crate::irpf_trace::parse_trace_capture(chunk.session_id, r),
+    )?;
+    let has_traces = !trace.chunks.is_empty();
+    if has_traces {
+        // The embedded images, borrowed straight from the bundle.
+        for r in &records {
+            if r.record_type != RECORD_TYPE_CHUNK || r.family != Some("executable-code-objects") {
+                continue;
+            }
+            let mut off = 0;
+            while off < r.payload.len() {
+                cancelled_err(cancelled)?;
+                let length = u32_at(r.payload, off)? as usize;
+                let end = off
+                    .checked_add(length)
+                    .filter(|end| length >= CODE_OBJECT_MIN && *end <= r.payload.len())
+                    .ok_or("IRPF executable-code-objects sub-record extends past its chunk")?;
+                let sub = &r.payload[off..end];
+                let (exe, co_id) = (u64_at(sub, 8)?, u64_at(sub, 16)?);
+                let data_length = u64_at(sub, 24)? as usize;
+                let elf = CODE_OBJECT_MIN
+                    .checked_add(data_length)
+                    .and_then(|end| sub.get(CODE_OBJECT_MIN..end))
+                    .ok_or("IRPF code object image extends past its record")?;
+                let known = trace.objects.iter().any(|o| {
+                    o.session == r.session_id && o.executable_id == exe && o.code_object_id == co_id
+                });
+                if !known {
+                    trace.objects.push(crate::irpf_trace::PlacedObject {
+                        session: r.session_id,
+                        executable_id: exe,
+                        code_object_id: co_id,
+                        elf,
+                        load_deltas: load_deltas
+                            .get(&(r.session_id, exe, co_id))
+                            .cloned()
+                            .unwrap_or_default(),
+                    });
+                }
+                off = end;
+            }
+        }
+        for d in &dispatches {
+            let (Some(start), Some(end)) = (d.start_tick, d.end_tick) else { continue };
+            let window = crate::irpf_trace::OperationWindow {
+                first_tick: start,
+                last_tick: end.max(start),
+                dispatches: 1,
+            };
+            trace.events.insert((d.session, d.stream, d.event_id), window);
+            trace
+                .submissions
+                .entry((d.session, d.stream, d.submission))
+                .and_modify(|w| {
+                    w.first_tick = w.first_tick.min(window.first_tick);
+                    w.last_tick = w.last_tick.max(window.last_tick);
+                    w.dispatches += 1;
+                })
+                .or_insert(window);
+        }
+        for (key, origin) in &origins {
+            trace.clocks.insert(
+                *key,
+                crate::irpf_trace::DeviceClock {
+                    origin_tick: *origin,
+                    axis_per_tick: match frequency_of(key.0, key.1) {
+                        Some(freq) if in_ns => 1e9 / freq as f64,
+                        _ => 1.,
+                    },
+                },
+            );
+        }
+    }
+    let ticks_of = |session: u64, stream: u64, submission: u64| -> Vec<(u64, u64)> {
+        dispatches
+            .iter()
+            .filter(|d| d.session == session && d.stream == stream && d.submission == submission)
+            .filter_map(|d| Some((d.start_tick?, d.end_tick?)))
+            .collect()
+    };
+    crate::irpf_trace::attach(&mut out, trace, &ticks_of, cancelled, decode)?;
     out.warnings.push(
-        "Coverage is unknown from a native dispatch stream alone: wave occupancy, ISA hotspots and hardware counters are not part of these IRPF bundles.".into(),
+        if !out.waves.is_empty() || !out.instructions.is_empty() {
+            "Hardware counters are not part of this IRPF bundle; the thread trace above is its only microarchitectural data."
+        } else if has_traces {
+            "This bundle carries thread traces, but none was imported (see the warnings above), so wave occupancy and ISA hotspots are absent; hardware counters are not part of these IRPF bundles."
+        } else {
+            "Coverage is unknown from a native dispatch stream alone: wave occupancy, ISA hotspots and hardware counters are not part of these IRPF bundles."
+        }
+        .into(),
     );
     Ok(out)
 }
@@ -1098,6 +1261,8 @@ struct RawDispatch {
     /// Stream id of the chunk header; `event_id` is unique only within it.
     stream: u64,
     event_id: u64,
+    /// Queue submission epoch of a dispatch event; 0 for a command operation.
+    submission: u64,
     executable_id: u64,
     function_ordinal: u32,
     workgroup_count: [u32; 3],
@@ -1334,6 +1499,271 @@ mod tests {
             chunk("clock-correlations", correlations),
             chunk("dispatch-events", events),
         ])
+    }
+
+    // ---- executable traces -------------------------------------------------
+
+    /// A minimal ELF64 with one executable load segment at `vaddr`.
+    fn elf_image(vaddr: u64, memsz: u64) -> Vec<u8> {
+        let mut elf = vec![0u8; 64 + 56];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[0x20..0x28].copy_from_slice(&le_u64(64));
+        elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&le_u32(1));
+        elf[68..72].copy_from_slice(&le_u32(5));
+        elf[64 + 16..64 + 24].copy_from_slice(&le_u64(vaddr));
+        elf[64 + 40..64 + 48].copy_from_slice(&le_u64(memsz));
+        elf
+    }
+    fn trace_record(trace_id: u64, se: u32, flags: u32, event: u64, submission: u64, bytes: &[u8]) -> Vec<u8> {
+        let mut r = vec![0u8; 88];
+        r[0..4].copy_from_slice(&le_u32(88));
+        r[4..8].copy_from_slice(&le_u32(1));
+        r[8..12].copy_from_slice(&le_u32(flags));
+        r[12..16].copy_from_slice(&le_u32(se));
+        r[16..24].copy_from_slice(&le_u64(trace_id));
+        r[24..32].copy_from_slice(&le_u64(event));
+        r[32..40].copy_from_slice(&le_u64(submission));
+        r[40..48].copy_from_slice(&le_u64(22));
+        r[80..88].copy_from_slice(&le_u64(bytes.len() as u64));
+        r.extend_from_slice(bytes);
+        r
+    }
+    fn trace_capture(trace_id: u64, se: u32, flags: u32, written: u64, dropped: u64) -> Vec<u8> {
+        let mut r = vec![0u8; 80];
+        r[0..4].copy_from_slice(&le_u32(80));
+        r[4..8].copy_from_slice(&le_u32(flags));
+        r[8..16].copy_from_slice(&le_u64(trace_id));
+        r[16..20].copy_from_slice(&le_u32(se));
+        r[24..28].copy_from_slice(&le_u32(1)); // shader_engine_mask
+        r[28..32].copy_from_slice(&le_u32(4)); // target_compute_unit
+        r[32..36].copy_from_slice(&le_u32(1)); // simd_select
+        r[36..40].copy_from_slice(&le_u32(2)); // dispatch_count
+        r[40..48].copy_from_slice(&le_u64(1 << 20));
+        r[48..56].copy_from_slice(&le_u64(written));
+        r[56..64].copy_from_slice(&le_u64(dropped));
+        r[72..76].copy_from_slice(&le_u32(1)); // trace_limit
+        r[76..80].copy_from_slice(&le_u32(3)); // skipped_count
+        r
+    }
+    /// Two dispatch events of submission 10 at ticks 1000..1100 and 1200..1500
+    /// (100 MHz, so 10 ns per tick), one placed code object, and `extra` chunks.
+    fn traced_bundle(extra: Vec<Chunk>) -> Vec<u8> {
+        let mut events = dispatch_event(1, 1, 0, [32, 1, 1], [32, 1, 1], 1000, 1100);
+        events.extend(dispatch_event(2, 1, 0, [3, 2, 1], [256, 1, 1], 1200, 1500));
+        for event in events.chunks_mut(88) {
+            event[16..24].copy_from_slice(&le_u64(10));
+        }
+        let mut chunks = vec![
+            chunk("devices", device(100_000_000)),
+            chunk("executable-functions", function(1, 0, "kernel_a")),
+            chunk("executable-code-objects", code_object(1, 1, &elf_image(0x1000, 0x240))),
+            chunk("executable-code-object-loads", code_object_load(1, 1, 0x7000_0000, 0x2000)),
+            chunk("dispatch-events", events),
+        ];
+        chunks.extend(extra);
+        bundle(&chunks)
+    }
+    /// Stand-in for the trace decoder: records the staged manifest and writes a
+    /// one-wave decoded directory whose shader clock runs 10 cycles per tick and
+    /// starts 10 ticks before the first dispatch (tick 990).
+    fn fake_decoder<'a>(
+        seen: &'a std::cell::RefCell<Vec<serde_json::Value>>,
+        log: &'static str,
+    ) -> impl Fn(&tempfile::TempDir, &Path, std::time::Duration) -> Result<crate::decoder::DecodedRun, String> + 'a {
+        move |workspace, input, _| {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(input.join("radv-manifest.json")).unwrap()).unwrap();
+            let att = std::fs::read(manifest["traces"][0]["path"].as_str().unwrap()).unwrap();
+            manifest["attBytes"] = serde_json::json!(att);
+            seen.borrow_mut().push(manifest);
+            let out = workspace.path().join("output");
+            std::fs::create_dir(&out).unwrap();
+            let write = |name: &str, value: serde_json::Value| {
+                std::fs::write(out.join(name), serde_json::to_vec(&value).unwrap()).unwrap()
+            };
+            write("filenames.json", serde_json::json!({
+                "gfxip": 11, "gfxv": "navi", "counter_names": [],
+                "wave_filenames": {"0": {"0": {"0": {"0": ["se0_sm0_sl0_wv0.json", 100, 300]}}}},
+            }));
+            write("se0_sm0_sl0_wv0.json", serde_json::json!({"wave": {
+                "cu": 0, "id": 0, "simd": 0, "slot": 0, "begin": 100, "end": 300,
+                "instructions": [[150, 1, 0, 20, 1], [200, 1, 10, 40, 2]],
+                "timeline": [[1, 50], [2, 150]],
+                "waitcnt": [],
+            }}));
+            write("realtime.json", serde_json::json!({
+                "metadata": {"frequency": 0},
+                "SE0": [[0, 990], [1000, 1090], [3000, 1290]],
+            }));
+            write("code.json", serde_json::json!({
+                "header": ["ISA", "_", "LineNumber", "Source", "Codeobj", "Vaddr", "Hit", "Latency", "Stall", "Idle"],
+                "code": [
+                    ["; kernel_a", 0, 1, "", 1, 4096, 0, 0, 0, 0],
+                    ["v_add_f32 v0, v0, v1", 0, 2, "", 1, 4100, 1, 20, 0, 0],
+                    ["s_endpgm", 0, 3, "", 1, 4104, 1, 40, 10, 5],
+                ],
+            }));
+            write("occupancy.json", serde_json::json!({
+                "0": [[100, 0, 0, 0, 1, "2", 0, 0], [300, 0, 0, 0, 0, "2", 0, 0]],
+                "dispatches": {"2": "kernel_a"},
+            }));
+            Ok(crate::decoder::DecodedRun { root: out, log: log.into(), python_package: None })
+        }
+    }
+    const NEVER: &dyn Fn(&tempfile::TempDir, &Path, std::time::Duration) -> Result<crate::decoder::DecodedRun, String> =
+        &|_, _, _| panic!("a bundle without thread traces must not start the decoder");
+
+    #[test]
+    fn bundles_without_traces_never_start_the_decoder() {
+        let flag = AtomicBool::new(false);
+        let plain = build_with(&dispatch_bundle(), "trace.irpf".into(), &flag, NEVER).unwrap();
+        assert!(plain.waves.is_empty() && plain.instructions.is_empty() && plain.wave_time_maps.is_empty());
+        assert!(plain.workspace.is_none());
+        assert_eq!(
+            plain.warnings.last().unwrap(),
+            "Coverage is unknown from a native dispatch stream alone: wave occupancy, ISA hotspots and hardware counters are not part of these IRPF bundles."
+        );
+        assert!(!plain.metadata.keys().any(|k| k.starts_with("hrxTrace")), "{:?}", plain.metadata);
+        assert_eq!(plain.metadata["coverage"], "HRX native IRPF dispatch stream; raw device ticks, no host-timeline alignment");
+    }
+
+    #[test]
+    fn trace_is_staged_placed_and_decoded_onto_the_dispatch_axis() {
+        let payload = [7u8; 96];
+        let b = traced_bundle(vec![
+            chunk_truncated("executable-traces", trace_record(1, 0, 0, 0, 10, &payload), 5),
+            chunk("executable-trace-captures", trace_capture(1, 0, 1 | 2 | 16, 96, 5)),
+        ]);
+        let seen = std::cell::RefCell::new(vec![]);
+        let decode = fake_decoder(&seen, "DECODER-WARNING: hrx_shader_engine_0_0.att: Data Lost: bandwidth\n");
+        let c = build_with(&b, "trace.irpf".into(), &AtomicBool::new(false), &decode).unwrap();
+
+        // Staging: the raw bytes under the decoder's file-name convention, and
+        // the ELF placed by its load delta and executable extent.
+        let manifest = seen.borrow()[0].clone();
+        assert!(manifest["traces"][0]["path"].as_str().unwrap().ends_with("hrx_shader_engine_0_0.att"));
+        assert_eq!(manifest["traces"][0]["shaderEngine"], 0);
+        assert_eq!(manifest["attBytes"].as_array().unwrap().len(), 96);
+        let object = &manifest["codeObjects"][0];
+        assert_eq!((object["id"].as_u64(), object["base"].as_u64()), (Some(1), Some(0x7000_0000)));
+        assert_eq!((object["start"].as_u64(), object["size"].as_u64()), (Some(0x1000), Some(0x1240)));
+        assert_eq!(object["loads"], serde_json::json!([{"base": 0x7000_0000u64, "start": 0x1000, "size": 0x1240}]));
+        assert!(object.get("name").is_none(), "kernels keep their ELF symbol names");
+        assert_eq!(&std::fs::read(object["path"].as_str().unwrap()).unwrap()[..4], b"\x7fELF");
+
+        // The dispatch capture is intact and the trace sits on its axis: shader
+        // cycles 100..300 are ticks 1000..1020, i.e. 0..200 ns after the origin.
+        assert_eq!((c.unit.as_str(), c.dispatches.len()), ("ns", 2));
+        assert_eq!(c.dispatches[0].start, 0.);
+        assert_eq!(c.waves.len(), 1);
+        let wave = &c.waves[0];
+        assert!(wave.id.ends_with("/output/se0_sm0_sl0_wv0.json") && wave.id.starts_with("trace1-"), "{}", wave.id);
+        assert!((wave.start - 0.).abs() < 1e-6 && (wave.end - 200.).abs() < 1e-6, "{wave:?}");
+        assert_eq!(c.intervals.len(), 1);
+        assert_eq!(c.intervals[0].kernel, "kernel_a");
+        assert!((c.intervals[0].end - 200.).abs() < 1e-6);
+        // Lazily loaded tokens and states use the same map: 10 cycles are 1 tick.
+        let loaded = crate::load_wave(&c, &wave.id).unwrap();
+        assert!((loaded.start - 0.).abs() < 1e-6 && (loaded.end - 200.).abs() < 1e-6);
+        assert!((loaded.tokens[0].start - 50.).abs() < 1e-6 && (loaded.tokens[0].duration - 20.).abs() < 1e-6);
+        assert!((loaded.tokens[1].stall - 10.).abs() < 1e-6 && (loaded.tokens[1].duration - 40.).abs() < 1e-6);
+        assert!((loaded.states[1][0] - 50.).abs() < 1e-6 && (loaded.states[1][1] - 150.).abs() < 1e-6);
+        assert_eq!(c.instructions.len(), 3);
+        assert_eq!((c.instructions[2].hits, c.instructions[2].latency), (1, 40.));
+        assert_eq!(c.wave_time_maps.len(), 1);
+        assert!(c.workspace.is_some() && c.root.is_dir());
+
+        // Provenance: the selection, what was dropped, the covered window.
+        assert_eq!(c.metadata["hrxTraceSelection"], "workgroup processor 4, SIMD 1, shader engine(s) 0");
+        assert_eq!(c.metadata["hrxTraceStablePstate"], "held");
+        assert_eq!(c.metadata["hrxTraceDroppedTokens"], "5");
+        assert_eq!(c.metadata["hrxTraceBufferBytes"], "1048576 per shader engine");
+        assert_eq!(c.metadata["hrxTraceSkippedOperations"], "3");
+        assert_eq!(c.metadata["hrxTraceWaves"], "1");
+        assert_eq!(c.metadata["hrxTraceWavesAreASample"], "true");
+        assert!(c.metadata["hrxTracePartitions"].contains("whole recorded execution of 2 dispatches"));
+        assert!(c.metadata["hrxTraceWindow"].contains("2 of 2 dispatch event(s) start inside the traced window"), "{}", c.metadata["hrxTraceWindow"]);
+        assert!(c.metadata["coverage"].contains("The trace is a sample") && c.metadata["coverage"].contains("roughly 2% of waves"));
+        let said = |needle: &str| c.warnings.iter().any(|w| w.contains(needle));
+        assert!(said("a hardware sample, not a census"));
+        assert!(said("dropped 5 trace token(s)"));
+        assert!(said("Trace decoder (trace 1): hrx_shader_engine_0_0.att: Data Lost"));
+        assert!(said("lost data"));
+        assert!(said("3 matching operation(s) ran untraced"));
+        assert!(said("Hardware counters are not part of this IRPF bundle"));
+        // The ring-buffer advice is for dropped records, not for a truncated trace.
+        assert!(!said("IRPF executable-traces chunk is TRUNCATED"));
+    }
+
+    #[test]
+    fn trace_that_cannot_be_decoded_or_placed_leaves_the_dispatch_capture_open() {
+        let flag = AtomicBool::new(false);
+        let traced = |submission: u64| {
+            traced_bundle(vec![
+                chunk("executable-traces", trace_record(1, 0, 0, 0, submission, &[1u8; 64])),
+                chunk("executable-trace-captures", trace_capture(1, 0, 2 | 16, 64, 0)),
+            ])
+        };
+        // The decoder is missing or fails.
+        let failing = |_: &tempfile::TempDir, _: &Path, _: std::time::Duration| -> Result<crate::decoder::DecodedRun, String> {
+            Err("Cannot start decoder Python: not found\nsecond line".into())
+        };
+        let c = build_with(&traced(10), "trace.irpf".into(), &flag, &failing).unwrap();
+        assert_eq!(c.dispatches.len(), 2);
+        assert!(c.waves.is_empty() && c.instructions.is_empty() && c.workspace.is_none());
+        assert!(c.warnings.iter().any(|w| w == "Thread trace not imported: the trace decoder failed (Cannot start decoder Python: not found)"), "{:?}", c.warnings);
+        assert!(c.warnings.last().unwrap().contains("none was imported"));
+        assert_eq!(c.metadata["hrxTraceImport"], "not imported");
+        // The capture records are reported even so.
+        assert_eq!(c.metadata["hrxTraceSelection"], "workgroup processor 4, SIMD 1, shader engine(s) 0");
+        assert!(c.metadata["hrxTraceStablePstate"] == "not held" && c.warnings.iter().any(|w| w.contains("No stable GPU power state")));
+
+        // A trace naming a submission with no dispatch event cannot be placed;
+        // the decoder is not even started.
+        let c = build_with(&traced(99), "trace.irpf".into(), &flag, NEVER).unwrap();
+        assert!(c.warnings.iter().any(|w| w.contains("no dispatch event of the submission it names is in the bundle")), "{:?}", c.warnings);
+        assert!(c.waves.is_empty());
+
+        // A malformed trace chunk is an explicit rejection, never a panic.
+        let mut lying = trace_record(1, 0, 0, 0, 10, &[1u8; 64]);
+        lying[80..88].copy_from_slice(&le_u64(1 << 40));
+        let e = build_with(&traced_bundle(vec![chunk("executable-traces", lying)]), "x".into(), &flag, NEVER).unwrap_err();
+        assert!(e.contains("declares 1099511627776 trace bytes but carries 64"), "{e}");
+        let e = build_with(&traced_bundle(vec![chunk("executable-traces", vec![1, 2, 3])]), "x".into(), &flag, NEVER).unwrap_err();
+        assert!(e.contains("shorter than its 88-byte record"), "{e}");
+    }
+
+    #[test]
+    fn trace_import_honours_cancellation() {
+        let b = traced_bundle(vec![
+            chunk("executable-traces", trace_record(1, 0, 0, 0, 10, &[1u8; 64])),
+            chunk("executable-trace-captures", trace_capture(1, 0, 2 | 16, 64, 0)),
+        ]);
+        let flag = AtomicBool::new(false);
+        let cancelling = |_: &tempfile::TempDir, _: &Path, _: std::time::Duration| -> Result<crate::decoder::DecodedRun, String> {
+            flag.store(true, Ordering::Relaxed);
+            Err("Raw trace import cancelled".into())
+        };
+        assert_eq!(build_with(&b, "x".into(), &flag, &cancelling).unwrap_err(), "Import cancelled");
+    }
+
+    #[test]
+    fn summary_counts_trace_partitions_and_their_bytes() {
+        let b = traced_bundle(vec![
+            chunk_truncated("executable-traces", trace_record(1, 0, 0, 0, 10, &[7u8; 96]), 5),
+            chunk("executable-traces", trace_record(1, 1, 0, 0, 10, &[7u8; 32])),
+        ]);
+        let summary = summarize_bytes(&b).unwrap();
+        assert_eq!((summary.executable_traces, summary.executable_trace_bytes), (2, 128));
+        assert_eq!(summary.counter_samples, 0);
+        assert_eq!(summary.truncated.len(), 1);
+        assert_eq!((summary.truncated[0].family.as_str(), summary.truncated[0].dropped), ("executable-traces", 5));
+        let plain = summarize_bytes(&dispatch_bundle()).unwrap();
+        assert_eq!((plain.executable_traces, plain.executable_trace_bytes), (0, 0));
     }
 
     #[test]

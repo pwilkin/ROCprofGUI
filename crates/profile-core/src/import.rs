@@ -208,6 +208,35 @@ fn att_selection(name: &str) -> Option<AttCounterSelection> {
     })
 }
 fn load_ui(root: &Path, load_wave_states: bool) -> Result<Capture, String> {
+    let mut c = load_ui_unaligned(root, load_wave_states, false)?;
+    if c.realtime.as_ref().is_some_and(|r| {
+        r.anchors
+            .iter()
+            .map(|a| a.se)
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1
+    }) {
+        match crate::se_clock::normalize(&c) {
+            Ok(aligned) => c = aligned,
+            Err(error) => c
+                .warnings
+                .push(format!("Cross-SE alignment not applied: {error}")),
+        }
+    }
+    Ok(c)
+}
+/// A decoded directory with every shader engine left on its own shader clock.
+/// Callers that place the engines themselves (the IRPF arm maps each engine onto
+/// the dispatch axis through its realtime anchors) start from this.
+/// `other_simd_optional` leaves out the other-SIMD activity records, with a
+/// warning, when they cannot be loaded within the caps: they describe SIMDs the
+/// trace did not target, and a dense trace carries millions of them.
+pub(crate) fn load_ui_unaligned(
+    root: &Path,
+    load_wave_states: bool,
+    other_simd_optional: bool,
+) -> Result<Capture, String> {
     let names = sidecar(root, "filenames.json")?;
     let mut c = Capture::empty(
         root.file_name()
@@ -519,13 +548,24 @@ fn load_ui(root: &Path, load_wave_states: bool) -> Result<Capture, String> {
         }
     }
     if let Some(engines) = names["other_simd_filenames"].as_object() {
-        for (se, _) in engines {
-            let se = se
-                .parse::<u32>()
-                .map_err(|_| "Invalid other-SIMD shader engine")?;
-            let records = read_other_simd(&c, &names, se)?;
-            check_rows(c.other_simd.len().saturating_add(records.len()))?;
-            c.other_simd.extend(records);
+        let loaded = (|| -> Result<Vec<OtherSimd>, String> {
+            let mut all = vec![];
+            for (se, _) in engines {
+                let se = se
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid other-SIMD shader engine")?;
+                let records = read_other_simd(&c, &names, se)?;
+                check_rows(all.len().saturating_add(records.len()))?;
+                all.extend(records);
+            }
+            Ok(all)
+        })();
+        match loaded {
+            Ok(records) => c.other_simd = records,
+            Err(reason) if other_simd_optional => c.warnings.push(format!(
+                "Other-SIMD activity records were not imported: {reason}. Waves, occupancy and instructions of the traced SIMD are unaffected."
+            )),
+            Err(reason) => return Err(reason),
         }
     }
     if c.waves.is_empty()
@@ -558,21 +598,6 @@ fn load_ui(root: &Path, load_wave_states: bool) -> Result<Capture, String> {
         .unwrap_or(1.)
         .max(c.start + 1.);
     crate::markers::load(&mut c, &names)?;
-    if c.realtime.as_ref().is_some_and(|r| {
-        r.anchors
-            .iter()
-            .map(|a| a.se)
-            .collect::<BTreeSet<_>>()
-            .len()
-            > 1
-    }) {
-        match crate::se_clock::normalize(&c) {
-            Ok(aligned) => c = aligned,
-            Err(error) => c
-                .warnings
-                .push(format!("Cross-SE alignment not applied: {error}")),
-        }
-    }
     Ok(c)
 }
 fn occupancy(v: &Value, c: &mut Capture) -> Result<(), String> {
@@ -816,7 +841,14 @@ pub(crate) fn load_wave_at_cancellable(
     index: usize,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<Wave, String> {
-    load_wave_using(c, index, cancelled, |file| read_wave_json(file, cancelled))
+    let map = c.wave_time_map(index);
+    load_wave_using(c, index, cancelled, |file| {
+        let mut document: WaveDocument = read_wave_json(file, cancelled)?;
+        if let Some(map) = map {
+            document.wave.instructions.iter_mut().for_each(|token| map.token(token));
+        }
+        Ok(document)
+    })
 }
 pub(crate) fn load_wave_filtered(
     c: &Capture,
@@ -824,10 +856,15 @@ pub(crate) fn load_wave_filtered(
     cancelled: &std::sync::atomic::AtomicBool,
     mut accept: impl FnMut(&Token) -> Result<bool, String>,
 ) -> Result<Wave, String> {
+    // Tokens reach every consumer already on the capture axis.
+    let map = c.wave_time_map(index);
     load_wave_using(c, index, cancelled, |file| {
         let mut instructions = Vec::new();
-        let fields = crate::wave_stream::read(file, cancelled, |token| {
+        let fields = crate::wave_stream::read(file, cancelled, |mut token| {
             check_wave_cancelled(cancelled)?;
+            if let Some(map) = map {
+                map.token(&mut token);
+            }
             if accept(&token)? {
                 instructions.push(token);
             }
@@ -864,21 +901,27 @@ fn load_wave_using(
     let data = read(fs::File::open(&path).map_err(err)?)?;
     let tokens = data.wave.instructions;
     let w = Value::Object(data.wave.fields);
-    let start = required_number(&w["begin"], "wave begin")?;
-    let end = required_number(&w["end"], "wave end")?;
+    // The readers above have mapped the tokens; the wave's own fields follow.
+    let map = c.wave_time_map(index);
+    let place = |clock: f64| map.map_or(clock, |m| m.at(clock));
+    let begin = required_number(&w["begin"], "wave begin")?;
+    let start = place(begin);
+    let end = place(required_number(&w["end"], "wave end")?);
     if end < start {
         return Err("Invalid wave duration".into());
     }
     let mut states = vec![];
-    let mut time = start;
+    // States chain on the file's own clock; each boundary is placed on its own.
+    let mut clock = begin;
     for row in arr(&w["timeline"]) {
         check_wave_cancelled(cancelled)?;
         let duration = required_number(&row[1], "state duration")?;
         if duration < 0. {
             return Err("Negative state duration".into());
         }
-        states.push([time, duration, num(&row[0])]);
-        time += duration;
+        let time = place(clock);
+        states.push([time, place(clock + duration) - time, num(&row[0])]);
+        clock += duration;
     }
     if !w["waitcnt"].is_null() {
         // Resolve the cap once for the per-wait / per-source checks in this loop.

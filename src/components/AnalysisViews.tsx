@@ -1481,7 +1481,9 @@ export function EvidenceView({
               "Cross-SE clock alignment",
               Object.keys(capture.seTimeOffsets ?? {}).length
                 ? `Applied (${Object.keys(capture.seTimeOffsets ?? {}).length} engines)`
-                : "Not applied",
+                : capture.waveTimeMaps?.length
+                  ? `Waves placed on the dispatch axis through realtime anchors (${capture.waveTimeMaps.length} trace partitions)`
+                  : "Not applied",
             ],
             ["REALTIME anchors", String(capture.realtime?.anchors.length ?? 0)],
             [

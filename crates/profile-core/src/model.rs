@@ -33,6 +33,11 @@ pub struct Capture {
     pub realtime: Option<RealtimeCalibration>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub se_time_offsets: BTreeMap<u32, i64>,
+    /// Affine maps from decoded wave files' own clocks onto this capture's axis.
+    /// Empty unless waves were attached to a capture with another time base
+    /// (HRX IRPF: SQTT shader-clock cycles placed on the dispatch tick axis).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wave_time_maps: Vec<WaveTimeMap>,
     #[serde(default)]
     pub decoder_events: Vec<DecoderEvent>,
     #[serde(default)]
@@ -83,6 +88,7 @@ impl Capture {
             code_objects: self.code_objects.clone(),
             realtime: self.realtime.clone(),
             se_time_offsets: self.se_time_offsets.clone(),
+            wave_time_maps: self.wave_time_maps.clone(),
             decoder_events: self.decoder_events.clone(),
             other_simd: self.other_simd.clone(),
             sources: self.sources.clone(),
@@ -120,6 +126,7 @@ impl Capture {
             code_objects: vec![],
             realtime: None,
             se_time_offsets: BTreeMap::new(),
+            wave_time_maps: vec![],
             decoder_events: vec![],
             other_simd: vec![],
             sources: BTreeMap::new(),
@@ -133,6 +140,62 @@ impl Capture {
             input_fingerprint: None,
             workspace: None,
         }
+    }
+}
+/// Places the waves of one decoded trace partition on the capture axis. `knots`
+/// are `[clock, axis]` pairs sorted by clock, at least two; the map is linear
+/// between neighbours and continues the first and last segment outside them. A
+/// wave belongs to the map whose `prefix` starts its id and whose `se` is its
+/// shader engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WaveTimeMap {
+    pub prefix: String,
+    pub se: u32,
+    pub knots: Vec<[f64; 2]>,
+}
+impl WaveTimeMap {
+    pub fn at(&self, clock: f64) -> f64 {
+        let knots = &self.knots;
+        if knots.len() < 2 {
+            return knots.first().map_or(clock, |k| k[1] + (clock - k[0]));
+        }
+        // The segment whose left knot is the last one at or before `clock`.
+        let right = knots.partition_point(|k| k[0] <= clock).clamp(1, knots.len() - 1);
+        let (a, b) = (knots[right - 1], knots[right]);
+        if b[0] == a[0] {
+            return a[1];
+        }
+        a[1] + (clock - a[0]) * (b[1] - a[1]) / (b[0] - a[0])
+    }
+    /// A duration that starts at `clock`, on the capture axis.
+    pub fn span(&self, clock: f64, duration: f64) -> f64 {
+        self.at(clock + duration) - self.at(clock)
+    }
+    /// Axis units per clock unit over the whole map.
+    pub fn mean_scale(&self) -> f64 {
+        match (self.knots.first(), self.knots.last()) {
+            (Some(a), Some(b)) if b[0] > a[0] => (b[1] - a[1]) / (b[0] - a[0]),
+            _ => 1.,
+        }
+    }
+    pub fn token(&self, token: &mut Token) {
+        let start = self.at(token.start);
+        token.duration = self.at(token.start + token.duration) - start;
+        token.stall = self.at(token.start + token.stall) - start;
+        token.start = start;
+    }
+}
+impl Capture {
+    /// The time map of the wave at `index`, when its file uses another clock.
+    pub fn wave_time_map(&self, index: usize) -> Option<&WaveTimeMap> {
+        if self.wave_time_maps.is_empty() {
+            return None;
+        }
+        let wave = self.waves.get(index)?;
+        self.wave_time_maps
+            .iter()
+            .find(|map| map.se == wave.se && wave.id.starts_with(&map.prefix))
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

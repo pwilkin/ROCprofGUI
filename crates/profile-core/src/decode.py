@@ -40,21 +40,38 @@ source = Path(args.input).resolve()
 root = source if source.is_dir() else source.parent
 radv_manifest = source / 'radv-manifest.json' if source.is_dir() else None
 if radv_manifest is not None and radv_manifest.is_file():
-    # RADV captures carry no in-trace code-object load markers, so each code object
-    # is placed at the base address its RGP loader event recorded.
+    # RADV and HRX captures carry no in-trace code-object load markers, so each
+    # code object is placed at the base address its loader event recorded. An
+    # entry may narrow the placed range with "start" (the first executable
+    # virtual address) and list several placements under "loads"; without them
+    # the range is [base, base + size), as RADV writes it.
     from rocprof_trace_decoder.att import generate_code_artifacts, RcvOutputWriter, write_code_json
     from rocprof_trace_decoder.bindings import Decoder
     from rocprof_trace_decoder.records import Pc
     manifest = json.loads(radv_manifest.read_text())
     objects = [CodeObject(path=Path(o['path']), code_object_id=int(o['id'])) for o in manifest['codeObjects']]
-    ranges = tuple((int(o['base']), int(o['size']), int(o['id'])) for o in manifest['codeObjects'])
+    def _loads(o):
+        return [(int(l['base']), int(l.get('start', 0)), int(l['size'])) for l in (o.get('loads') or [o])]
+    # (first address, end address, base, id), searched by first address.
+    ranges = sorted((base + start, base + size, base, int(o['id']))
+                    for o in manifest['codeObjects'] for base, start, size in _loads(o))
+    range_starts = [r[0] for r in ranges]
+    longest_range = max((high - low for low, high, _, _ in ranges), default=0)
+    import bisect
 
     class RadvIndex(CodeIndex):
         def _translate(self, pc):
             if pc.code_object_id == 0:
-                for base, size, identity in ranges:
-                    if base <= pc.address < base + size:
+                at = bisect.bisect_right(range_starts, pc.address) - 1
+                # No range starting further below than the longest one can
+                # still hold the address, so the walk back ends at once.
+                while at >= 0:
+                    low, high, base, identity = ranges[at]
+                    if low <= pc.address < high:
                         return Pc(pc.address - base, identity)
+                    if pc.address - low >= longest_range:
+                        break
+                    at -= 1
             return pc
         def isa_for_pc(self, pc): return super().isa_for_pc(self._translate(pc))
         def get_or_create(self, pc): return super().get_or_create(self._translate(pc))
@@ -65,11 +82,14 @@ if radv_manifest is not None and radv_manifest.is_file():
     output.mkdir(parents=True, exist_ok=True)
     writer = RcvOutputWriter(output, index, formats='json')
     # Dispatch entry points arrive untranslated, as (0, VA), so kernels are named there.
-    placed = {int(o['id']): (int(o['base']), o.get('name')) for o in manifest['codeObjects']}
+    # An entry without a "name" keeps each kernel's own ELF symbol name.
+    placed = {int(o['id']): ([base for base, _, _ in _loads(o)], o.get('name')) for o in manifest['codeObjects']}
     for kernel in index.document.get('kernels', []):
-        base, name = placed.get(int(kernel.get('codeobj', -1)), (None, None))
-        if base is not None and name:
-            writer.kernel_names[Pc(base + int(kernel['address']), 0)] = name
+        bases, name = placed.get(int(kernel.get('codeobj', -1)), ([], None))
+        name = name or kernel.get('name')
+        if name:
+            for base in bases:
+                writer.kernel_names[Pc(base + int(kernel['address']), 0)] = name
     with Decoder(args.lib) as decoder:
         for trace in manifest['traces']:
             records = decoder.parse(Path(trace['path']).read_bytes(), isa=index)
