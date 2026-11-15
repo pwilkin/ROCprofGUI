@@ -2,16 +2,20 @@
 
 All notable changes to rocprof studio are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0/).
 
-Releases are recorded here without git tags. 0.3.0 is the current state of `main`.
+Releases are recorded here without git tags. 0.4.0 is the current state of `main`.
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-11-15
+
+A feature release for HRX/Loom applications on the native AMD driver, which dispatch PM4 on their own KFD user queues and are invisible to rocprofv3. A new tracer, `hrx`, has the application record its own IREE HAL profile bundle, on the MCP profile tools and in the desktop Live profiling panel; the IRPF importer attributes device groups and, from a Loom tool built with the driver's thread-trace and counter producers, attaches sampled waves, ISA rows and per-dispatch hardware counters. Everything is additive except the stricter `live_profile_start` validation and the rejection of dispatch-less bundles noted below.
 
 ### Added
 
 - Tracer `hrx` for `profile_run`, `profile_start` and `profile_stop`: collects the native IREE HAL profile of an HRX/Loom application that dispatches PM4 on its own KFD user queues (the native AMD driver used by `loom-serve`, `loom-run` and `loom-benchmark`), which rocprofv3 cannot observe in any trace, counter or ATT mode. The `hrx` object selects `families`, `flushIntervalMs`, `filterFunction` and `allowPartial`. `profile_stop` interrupts the application and waits for the bundle to be finalized; the report carries a bundle summary and a warning for each way it can fall short.
 - `docs/hrx-device-profiling-allow-partial.patch`, a hrx-system tooling patch that lets each device of a GPU + NPU device group keep the profiling families it implements. Without it a hybrid Loom deployment aborts when asked for dispatch timing.
 - Kernel family `loom-internal` for the `__command_launch_counts_N` kernels the Loom compiler synthesises.
-- Tracer `hrx` in the desktop Live profiling panel, with fields for the data families (the default set or a custom one), the flush interval, the function filter and partial families per device. The panel has no trigger for it, states that the bundle carries no waves, ISA or counters and that an XDNA device may record no dispatches, and on stop shows the bundle summary and every warning.
+- Tracer `hrx` in the desktop Live profiling panel, with fields for the data families (the default set or a custom one), the flush interval, the function filter and partial families per device. The panel has no trigger for it, states that the bundle is dispatch-level by default (waves and ISA need the thread-trace option, hardware counters the counters option) and that an XDNA device may record no dispatches, and on stop shows the bundle summary and every warning.
 - The bundle summary of an `hrx` run reports dispatch and queue event counts per device producer (`perProducer`), and the report warns when one device of a group recorded no dispatch while another did.
 - `tests/live-profiling-hrx-real.spec.ts`, a real-hardware click-through of the panel's `hrx` branch against a private headless instance. It runs only when `ROCPROF_HRX_PANEL_E2E` names its configuration.
 - Waves and ISA rows for HRX/Loom kernels on the native AMD driver. The IRPF importer reads `executable-traces` chunks (SQTT thread traces the driver takes on its own PM4 queue) and their `executable-trace-captures` records: each trace is staged with the bundle's embedded ELF code objects as a placed manifest, decoded by the worker the RADV arm uses, and attached to the dispatch capture. Waves are placed on the dispatch axis through the trace's realtime anchors, which carry the same GPU timestamp counter as the dispatch events. This needs a Loom tool built from hrx-system branch `profiling/executable-traces` (not upstream) on a gfx11.5 GPU.
@@ -29,13 +33,34 @@ Releases are recorded here without git tags. 0.3.0 is the current state of `main
 - The IRPF importer attributes every chunk to its own session, physical device and queue, resolves function names inside the dispatch's session, keeps each device's clock domain apart, and names a device that recorded no dispatch. Agents now read `HRX device N (producer)` when the producer names itself, and multi-queue bundles read `HRX queue N`.
 - An IRPF bundle with no dispatch record is rejected with what it holds (sessions, producers, functions, queue events) instead of opening as a capture with 0 dispatches.
 - The desktop `live_profile_start` command validates its request against the MCP `profile_start` input schema before starting anything, for every tracer. Unknown keys and unsupported values that the desktop command used to ignore or reject later are now rejected up front with the schema's messages.
-
 - `decode.py`'s placed-manifest branch accepts an optional `start` and a `loads` list per code object and keeps a kernel's own ELF symbol name when an entry has no `name`. RADV manifests carry neither and decode as before.
-- `capture_query` and the desktop capture gain `waveTimeMaps`: piecewise-linear maps from a decoded wave file's own clock onto the capture axis, applied wherever wave files are read. Captures without them are unchanged.
+- The capture model gains `waveTimeMaps`, serialized to the desktop frontend when present: piecewise-linear maps from a decoded wave file's own clock onto the capture axis, applied wherever wave files are read, so the wave tools return tokens already on the capture axis. `capture_query` has no dataset for the maps themselves. Captures without them are unchanged.
 
 ### Fixed
 
 - `profile_run` and `profile_stop` no longer return a silent empty file list when rocprofv3 writes nothing for an application that opens `/dev/kfd` without loading the ROCm runtime; the report names the cause and points at tracer `hrx`.
+
+### Upgrade notes
+
+- An installed binary, including one run as a systemd service, must be rebuilt and reinstalled to pick up 0.4.0. Bumping the source version does not change an installed service.
+- Tracer `hrx` needs an IREE HAL tooling binary that defines `--device_profiling_mode` and `--device_profiling_output` (`loom-serve`, `loom-run`, `iree-run-module`). The tracer appends and manages the `--device_profiling_*` flags, so an argv that already carries one is rejected.
+- Waves and ISA rows need a Loom tool built from hrx-system branch `profiling/executable-traces`, and hardware counters one built from `profiling/counters`, which contains the former. Both branches are local and not upstream. A stock tool rejects the `executable-traces` and `counters` families, and the `hrx` report says so.
+- A GPU + NPU device group needs a Loom tool built with `docs/hrx-device-profiling-allow-partial.patch` and `hrx.allowPartial: true` to record GPU dispatch timing. Without the patch the group aborts when asked for `dispatch-events`.
+- The desktop `live_profile_start` command now rejects a malformed request for any tracer (an unknown key, an unsupported value, a tracer-only key on the wrong tracer) that it used to ignore or reject later. A caller of the Tauri command that sent such keys must drop them. The MCP `profile_start` tool already validated its input and is unchanged.
+- An IRPF bundle with no dispatch record no longer opens as a capture with 0 dispatches; `capture_open` rejects it and states what the bundle holds.
+
+### Limits and compatibility
+
+- Thread traces and counters are implemented by the native AMD GPU driver for gfx11.5 and USER-published PM4 queues only. Other GPU generations, AQL queues and KERNEL-published queues return unimplemented. The collection and the numbers quoted here were measured on gfx1151 only.
+- A thread trace is a sample of about 2% of waves, never a census: one SIMD of one workgroup processor per shader engine. Wave counts, instruction hit counts and hotspots describe the sampled waves only; per-kernel time still comes from every dispatch event. Measured on gfx1151 on a hybrid Loom run: 12,295 dispatches, 3,464 waves, 38,964 ISA rows (10,428 with hits), stable power state held.
+- A recorded command buffer is traced whole or not at all, and a full buffer truncates the trace. The driver default of 16 MiB per shader engine covered 31 ms of a 577 ms recorded execution in the measured run. `capture_open` decodes every trace partition, at about 1.5 s per MiB of trace in that run.
+- Counter values are window sums over the sampled dispatches. Event counts (waves, work items, instructions) are the dispatch's own only among the producing device's queues and only when the capture reports an exclusive sample window; otherwise they are upper bounds. Cycle counters (`SQG_BUSY_CYCLES`, `SQG_WAVE_CYCLES`, `SQG_CYCLES`) are never per-dispatch.
+- Only the first dispatches matching the filter are sampled, up to `hrx.counters.maxSamples` (driver default 4,096; the tracer accepts 1 to 1,000,000). Later dispatches carry no counter values, and totals cover the sampled dispatches only. Measured on gfx1151: 7,489 dispatches, 4,096 samples, `SQG_WAVES` equal to the dispatch geometry in 4,064 of the 4,064 samples with a recorded grid.
+- Sampling stretches the run: about 44 µs per dispatch for the `sqg` set and about 210 µs with the `instructions` set added, measured on gfx1151 inside one recorded execution. Dispatch intervals moved by about 2%.
+- Loom kernels on gfx1151 run as 32-lane waves, so the expected `SQG_WAVES` of a dispatch is its workgroup count times `ceil(threads per workgroup / 32)`. The workgroup count is the capture's grid divided by the workgroup size per dimension.
+- The per-workgroup-processor `SQ_*` counters are 32 bits wide. The XDNA driver's own counter set is not collected through this tracer, the `counter-ranges` family is not implemented by the native GPU driver, and kernels placed on the NPU never appear as dispatches.
+- Tracer `hrx` records from process start to exit. There is no trigger or window and no attach to an already running server, and the Live profiling panel reports the `.irpf` path without opening it.
+- Existing inputs are unaffected: bundles without trace or counter chunks import as before, RADV placed manifests decode as before, and the import caps (`ROCPROF_MAX_*`) are unchanged and apply to the new trace and counter data.
 
 ## [0.3.0] - 2026-10-14
 
