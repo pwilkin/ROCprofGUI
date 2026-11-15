@@ -39,10 +39,68 @@ export const HRX_TRACE_OPTIONS = [
   { name: "maxTraces", low: 1, high: 4096 },
 ] as const;
 
+// The family that asks the driver for dispatch-scoped hardware counters
+// (HRX_COUNTER_FAMILY).
+export const HRX_COUNTER_FAMILY = "counters";
+
+// Set aliases the native AMD GPU driver expands (HRX_COUNTER_SETS).
+export const HRX_COUNTER_SETS = ["sqg", "instructions"] as const;
+
+// Bound on sampled dispatches a request may ask for (HRX_COUNTER_MAX_SAMPLES).
+export const HRX_COUNTER_MAX_SAMPLES = 1_000_000;
+
+// How a hardware counter of the native AMD GPU driver may be read. An event
+// count is the dispatch's own when the capture reports an exclusive sample
+// window; a cycle count never is: the queue enable that isolates event counts
+// does not isolate cycles (measured on gfx1151).
+export type HrxCounterKind = "event" | "cycles";
+
+export interface HrxCounterInfo {
+  name: string;
+  // Set alias that selects the counter, when one does.
+  set?: (typeof HRX_COUNTER_SETS)[number];
+  // Hardware block and the instances a value is summed over.
+  block: "SQG" | "SQ";
+  instances: "shader engine" | "workgroup processor";
+  kind: HrxCounterKind;
+  description: string;
+}
+
+// Every counter the driver accepts (HRX_COUNTER_NAMES), classified.
+export const HRX_COUNTERS: readonly HrxCounterInfo[] = [
+  { name: "SQG_WAVES", set: "sqg", block: "SQG", instances: "shader engine", kind: "event", description: "waves launched" },
+  { name: "SQG_WAVES_32", set: "sqg", block: "SQG", instances: "shader engine", kind: "event", description: "wave32 waves launched" },
+  { name: "SQG_WAVES_64", set: "sqg", block: "SQG", instances: "shader engine", kind: "event", description: "wave64 waves launched" },
+  { name: "SQG_ITEMS", set: "sqg", block: "SQG", instances: "shader engine", kind: "event", description: "work items launched" },
+  { name: "SQG_BUSY_CYCLES", set: "sqg", block: "SQG", instances: "shader engine", kind: "cycles", description: "cycles with a wave in the shader engine" },
+  { name: "SQG_WAVE_CYCLES", block: "SQG", instances: "shader engine", kind: "cycles", description: "wave-cycles: cycles summed over live waves" },
+  { name: "SQG_CYCLES", block: "SQG", instances: "shader engine", kind: "cycles", description: "clock cycles while counting" },
+  { name: "SQG_WAVES_SAVED", block: "SQG", instances: "shader engine", kind: "event", description: "waves saved by a context switch" },
+  { name: "SQ_WAVES", set: "instructions", block: "SQ", instances: "workgroup processor", kind: "event", description: "waves launched, per workgroup processor" },
+  { name: "SQ_INSTS_VALU", set: "instructions", block: "SQ", instances: "workgroup processor", kind: "event", description: "vector ALU instructions executed" },
+  { name: "SQ_INSTS_SALU", set: "instructions", block: "SQ", instances: "workgroup processor", kind: "event", description: "scalar ALU instructions executed" },
+  { name: "SQ_INSTS_ALL", set: "instructions", block: "SQ", instances: "workgroup processor", kind: "event", description: "instructions executed" },
+];
+
+// Classifies a counter name of an hrx capture. Names the driver does not list
+// are classified by their suffix: hardware cycle counters end in _CYCLES.
+export function hrxCounterKind(name: string): HrxCounterKind {
+  const known = HRX_COUNTERS.find((counter) => counter.name === name);
+  if (known) return known.kind;
+  return /(^|_)cycles$/i.test(name) ? "cycles" : "event";
+}
+
+// What the panel says next to the hardware-counters option.
+export const HRX_COUNTER_LIMITS = [
+  "Window sums, not a census: each value is a counter's increase between a read just before a dispatch and one just after it. The hardware counts every counting-enabled queue of the process in that window.",
+  "The driver lets one of its queues into a sampled window at a time, so event counts (waves, work items, instructions) are the dispatch's own among that device's queues when the capture reports an exclusive window. Cycle counters (SQG_BUSY_CYCLES) are never per-dispatch: other queues raise them.",
+  "Only the first dispatches matching the filter are sampled, up to the bound below; the capture states how many of its dispatches carry values. Needs the native AMD GPU driver's PM4 counter producer (gfx11.5).",
+] as const;
+
 // What the panel says about the tracer before a run: its three limits.
 export const HRX_LIMITS = [
   "Records the whole run: the application writes its own IREE HAL profile from start to exit, so there is no window to trigger. Stop and collect interrupts it (SIGINT) so the bundle is finalized.",
-  "Dispatch-level by default: kernel names, grids and device time. Waves and ISA need the thread-trace option below; hardware counters are not available.",
+  "Dispatch-level by default: kernel names, grids and device time. Waves and ISA need the thread-trace option below, hardware counters the counters option.",
   "On a GPU + NPU group the XDNA device may record no dispatches: its driver implements no dispatch-events family.",
 ] as const;
 
@@ -74,6 +132,13 @@ export interface HrxForm {
   // Per shader engine, in MiB.
   traceBufferMib: string;
   traceMaxTraces: string;
+  // Adds the counters family and sends the counter fields below.
+  counters: boolean;
+  // "sqg" is the driver's default set; "sqg+instructions" adds the
+  // per-workgroup-processor instruction counts.
+  counterSet: "sqg" | "sqg+instructions";
+  // Bound on sampled dispatches; blank means the driver default (4096).
+  counterMaxSamples: string;
 }
 
 export const emptyHrxForm = (): HrxForm => ({
@@ -89,6 +154,9 @@ export const emptyHrxForm = (): HrxForm => ({
   traceShaderEngineMask: "",
   traceBufferMib: "",
   traceMaxTraces: "",
+  counters: false,
+  counterSet: "sqg",
+  counterMaxSamples: "",
 });
 
 // One `hrx.trace` field: blank is absent, anything else must be an integer in
@@ -110,14 +178,19 @@ export function hrxOptions(form: HrxForm): Json {
   if (form.familyMode === "custom") {
     const families = [...form.families, ...form.extraFamilies.split(/[\s,]+/).filter(Boolean)];
     if (form.trace && !families.includes(HRX_TRACE_FAMILY)) families.push(HRX_TRACE_FAMILY);
+    if (form.counters && !families.includes(HRX_COUNTER_FAMILY)) families.push(HRX_COUNTER_FAMILY);
     if (families.length === 0) throw new Error("hrx families cannot be empty");
     const unknown = families.find((family) => !(HRX_FAMILIES as readonly string[]).includes(family));
     if (unknown !== undefined) throw new Error(`Unknown hrx data family ${unknown}`);
     if (new Set(families).size !== families.length) throw new Error("hrx families must be unique");
     options.families = families;
-  } else if (form.trace) {
+  } else if (form.trace || form.counters) {
     // The default set no longer applies once a family is added to it.
-    options.families = [...HRX_DEFAULT_FAMILIES, HRX_TRACE_FAMILY];
+    options.families = [
+      ...HRX_DEFAULT_FAMILIES,
+      ...(form.trace ? [HRX_TRACE_FAMILY] : []),
+      ...(form.counters ? [HRX_COUNTER_FAMILY] : []),
+    ];
   }
   if (form.trace) {
     const bufferSize = traceOption("bufferSize", form.traceBufferMib, (mib) => mib * 1024 * 1024);
@@ -133,6 +206,19 @@ export function hrxOptions(form: HrxForm): Json {
     ];
     for (const [name, value] of fields) if (value !== undefined) trace[name] = value;
     if (Object.keys(trace).length > 0) options.trace = trace;
+  }
+  if (form.counters) {
+    // The set is always named: with no counter name every device of a group
+    // would start its own default set.
+    const counters: Json = { names: form.counterSet === "sqg" ? ["sqg"] : ["sqg", "instructions"] };
+    const limit = form.counterMaxSamples.trim();
+    if (limit !== "") {
+      const samples = Number(limit);
+      if (!Number.isInteger(samples) || samples < 1 || samples > HRX_COUNTER_MAX_SAMPLES)
+        throw new Error(`hrx counters maxSamples must be an integer between 1 and ${HRX_COUNTER_MAX_SAMPLES}`);
+      counters.maxSamples = samples;
+    }
+    options.counters = counters;
   }
   const flush = form.flushIntervalMs.trim();
   if (flush !== "") {
@@ -166,6 +252,35 @@ export function hrxStatusLine(status: Json): string {
 // Whether a live_profile_stop answer comes from the hrx tracer: only it carries
 // a `bundle` field (null when no readable bundle was written).
 export const isHrxResult = (result: Json): boolean => "bundle" in result;
+
+// The lines for a bundle that holds counter samples: what was counted, how the
+// values may be read, and what the producer said about the sample window.
+function hrxCounterLines(bundle: Json): string[] {
+  const names = Array.isArray(bundle.counterNames) ? (bundle.counterNames as string[]) : [];
+  const cycles = names.filter((name) => hrxCounterKind(name) === "cycles");
+  const lines = [
+    `Hardware counters: ${count(bundle.counterSamples)} sample(s) of ${names.length > 0 ? names.join(", ") : "counters the bundle does not name"}. Values are window sums over the sampled dispatches, not a census${cycles.length > 0 ? `; ${cycles.join(", ")} ${cycles.length > 1 ? "are" : "is"} never per-dispatch` : ""}.`,
+  ];
+  const capture = bundle.counterCapture as Json | null | undefined;
+  if (!capture) {
+    lines.push(
+      "Counter sample window: unknown. The bundle has no capture record, so it cannot tell whether other queues of the process overlapped a window; read values as upper bounds.",
+    );
+    return lines;
+  }
+  const foreign = typeof capture.foreignState === "number" ? capture.foreignState : 0;
+  lines.push(
+    foreign > 0
+      ? `Counter sample window: ANOTHER COLLECTOR reprogrammed the counters during ${count(foreign)} sampled operation(s); do not read the values as per-dispatch counts.`
+      : capture.exclusiveWindow
+        ? "Counter sample window: exclusive among the producing device's queues, per the driver. Event counts are each sampled dispatch's own there; queues of the process outside that device session are not visible to the capture."
+        : "Counter sample window: exclusivity not reported, so values may include other queues of the process; read them as upper bounds.",
+  );
+  lines.push(
+    `Sampled dispatches: ${count(capture.sampledDispatches)} in ${count(capture.sampledOperations)} operation(s), bound ${count(capture.sampleLimit)}${capture.limitReached ? " (reached)" : ""} · ${count(capture.skippedOperations)} matching operation(s) ran unsampled · ${count(capture.droppedSamples)} sample(s) dropped · ${count(capture.invalidSamples)} without hardware values`,
+  );
+  return lines;
+}
 
 // The lines the panel shows for a collected hrx run: what the bundle holds, per
 // device session, and what it cannot hold. A missing or unfinalized bundle is
@@ -207,10 +322,12 @@ export function hrxBundleLines(result: Json): string[] {
         ? `TRUNCATED thread trace: a buffer filled, tokens were dropped (${count(family.dropped)} counted) or the stop did not finish`
         : `TRUNCATED ${String(family.family)}: ${count(family.dropped)} record(s) dropped by the producer`,
     );
-  if (typeof bundle.executableTraces === "number" && bundle.executableTraces > 0)
-    lines.push(
-      `Thread trace: ${count(bundle.executableTraces)} partition(s), ${count(bundle.executableTraceBytes)} bytes of SQTT. Open the capture to decode waves and ISA rows: a sample of one SIMD of one workgroup processor per shader engine, not a census. Hardware counters: none.`,
-    );
+  const traced = typeof bundle.executableTraces === "number" && bundle.executableTraces > 0;
+  const counted = typeof bundle.counterSamples === "number" && bundle.counterSamples > 0;
+  const trace = `Thread trace: ${count(bundle.executableTraces)} partition(s), ${count(bundle.executableTraceBytes)} bytes of SQTT. Open the capture to decode waves and ISA rows: a sample of one SIMD of one workgroup processor per shader engine, not a census.`;
+  if (traced) lines.push(counted ? trace : `${trace} Hardware counters: none.`);
+  else if (counted) lines.push("Waves and ISA: none (no thread trace in the bundle).");
   else lines.push("Waves, ISA and hardware counters: none (the bundle is dispatch-level).");
+  if (counted) lines.push(...hrxCounterLines(bundle));
   return lines;
 }

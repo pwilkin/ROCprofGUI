@@ -7,11 +7,16 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 //     "cwd": "...", "readyUrl": "http://127.0.0.1:8093/v1/models",
 //     "workloadUrl": "http://127.0.0.1:8093/v1/chat/completions",
 //     "workloadFiles": ["request.json"], "outputDir": "...",
-//     "trace": { "bufferMib": "16", "maxTraces": "2", "targetCu": "0" } }
+//     "trace": { "bufferMib": "16", "maxTraces": "2", "targetCu": "0" },
+//     "counters": { "set": "sqg", "maxSamples": "4096" } }
 // naming a PRIVATE headless rocprof-studio and an HRX/Loom target. "trace" is
 // optional: with it the panel's thread-trace option is ticked and filled, and
 // the run must return thread-trace partitions (the target's driver needs the
-// PM4 thread-trace producer).
+// PM4 thread-trace producer). "counters" is optional too: with it the panel's
+// hardware-counters option is ticked ("set" is "sqg" or "sqg+instructions",
+// "maxSamples" may be left out), and the run must return counter samples with
+// the driver's capture record (the driver needs the PM4 counter producer). Both
+// may be given at once; the bundle must then hold both families.
 //
 // The panel runs in Chromium, where no Tauri IPC exists, so each live_profile_*
 // command is forwarded to the profile_* MCP tool of that instance. Both entries
@@ -132,6 +137,14 @@ test("hrx panel click-through captures a real run through a private instance", a
     if (config.trace.maxTraces) await page.getByLabel("Traces to take").fill(String(config.trace.maxTraces));
     if (config.trace.targetCu) await page.getByLabel("Workgroup processor").fill(String(config.trace.targetCu));
   }
+  if (config.counters) {
+    await page.getByLabel("Hardware counters (per sampled dispatch)").check();
+    const covers = page.getByRole("list", { name: "What hardware counters cover" });
+    await expect(covers).toContainText("Window sums, not a census");
+    await expect(covers).toContainText("never per-dispatch");
+    if (config.counters.set) await page.getByLabel("Counter set").selectOption(String(config.counters.set));
+    if (config.counters.maxSamples) await page.getByLabel("Dispatches to sample").fill(String(config.counters.maxSamples));
+  }
   await page.screenshot({ path: `${config.outputDir}/1-form.png`, fullPage: true });
   await page.getByRole("button", { name: "Start profiling", exact: true }).click();
   await expect(page.getByText(/Running [0-9a-f]{16,}/)).toBeVisible({ timeout: 60_000 });
@@ -171,8 +184,14 @@ test("hrx panel click-through captures a real run through a private instance", a
   if (config.trace) {
     await expect(summary).toContainText(/Thread trace: \d+ partition\(s\)/);
     await expect(summary).toContainText("not a census");
-  } else {
+  } else if (!config.counters) {
     await expect(summary).toContainText("Waves, ISA and hardware counters: none");
+  }
+  if (config.counters) {
+    await expect(summary).toContainText(/Hardware counters: [\d,]+ sample\(s\) of SQG_WAVES/);
+    await expect(summary).toContainText("window sums over the sampled dispatches, not a census");
+    await expect(summary).toContainText("Counter sample window:");
+    await expect(summary).toContainText(/Sampled dispatches: [\d,]+ in [\d,]+ operation\(s\)/);
   }
   await page.screenshot({ path: `${config.outputDir}/3-collected.png`, fullPage: true });
 
@@ -193,5 +212,17 @@ test("hrx panel click-through captures a real run through a private instance", a
     expect(start.hrx.families).toContain("executable-traces");
     expect(stop.bundle.executableTraces).toBeGreaterThan(0);
     expect(stop.bundle.executableTraceBytes).toBeGreaterThan(0);
+  }
+  if (config.counters) {
+    const start = calls[0].args as any;
+    expect(start.hrx.families).toContain("counters");
+    expect(start.hrx.counters.names).toEqual(
+      config.counters.set === "sqg+instructions" ? ["sqg", "instructions"] : ["sqg"],
+    );
+    expect(stop.bundle.counterSamples).toBeGreaterThan(0);
+    expect(stop.bundle.counterNames).toContain("SQG_WAVES");
+    // The driver states how the set was sampled; without that record the
+    // capture could not tell what a window held.
+    expect(stop.bundle.counterCapture.sampledDispatches).toBeGreaterThan(0);
   }
 });

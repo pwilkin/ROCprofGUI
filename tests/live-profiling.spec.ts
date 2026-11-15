@@ -420,6 +420,94 @@ test("live profiling hrx thread trace sends the family and trace options and rep
   await expect(page.getByRole("alert").filter({ hasText: "A thread trace is TRUNCATED" })).toBeVisible();
 });
 
+// The hardware-counters option adds the counters family and names the set; a
+// bundle with counter samples is shown as window sums with the driver's
+// statement about the sample window, next to a thread trace when both ran.
+test("live profiling hrx counters send the family and set and report window sums", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.isTauri = true;
+    w.calls = [];
+    w.__TAURI_INTERNALS__ = {
+      invoke: async (command: string, payload: any) => {
+        if (command === "mcp_status") return { active: null, revision: 0, workspace: {}, server: null };
+        w.calls.push({ command, args: payload?.args ?? {} });
+        if (command === "live_profile_start")
+          return { id: "live-hrx", pid: 80, directory: "/jobs/live-hrx", bundle: "/jobs/live-hrx/hrx-profile.irpf", captureMode: "whole-run" };
+        if (command === "live_profile_stop")
+          return {
+            status: "stopped",
+            exitCode: 0,
+            directory: "/jobs/live-hrx",
+            files: ["/jobs/live-hrx/hrx-profile.irpf"],
+            bundle: {
+              bytes: 21390925, finalized: true, sessions: 1, producers: ["amd-gpu"], functions: 78,
+              dispatchEvents: 12295, queueEvents: 16286, executableTraces: 2, executableTraceBytes: 8388544,
+              counterSamples: 256, counterSets: 1,
+              counterNames: ["SQG_WAVES", "SQG_WAVES_32", "SQG_WAVES_64", "SQG_ITEMS", "SQG_BUSY_CYCLES", "SQ_WAVES", "SQ_INSTS_VALU", "SQ_INSTS_SALU", "SQ_INSTS_ALL"],
+              counterCapture: {
+                records: 1, exclusiveWindow: true, stablePowerState: true, limitReached: true, sampleLimit: 256,
+                sampledOperations: 1, sampledDispatches: 256, skippedOperations: 0, droppedSamples: 0, invalidSamples: 0, foreignState: 0,
+              },
+              truncated: [], failedSessions: [],
+              perProducer: [{ producer: "amd-gpu", sessions: 1, dispatchEvents: 12295, queueEvents: 16286 }],
+            },
+            warnings: ["The counter sample bound of 256 dispatch(es) was reached: 256 dispatch(es) carry counter values and later matching dispatches ran unsampled."],
+          };
+        throw Error(command);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await page.getByLabel("Tracer").selectOption("hrx");
+  await page.getByLabel("Command").fill("/loom/loom-serve --listen=127.0.0.1:8093");
+  await page.getByLabel("Working directory").fill("/work");
+  // The counter fields stay hidden until the option is ticked.
+  await expect(page.getByLabel("Dispatches to sample")).toHaveCount(0);
+  await page.getByLabel("Hardware counters (per sampled dispatch)").check();
+  const covers = page.getByRole("list", { name: "What hardware counters cover" });
+  await expect(covers).toContainText("Window sums, not a census");
+  await expect(covers).toContainText("Cycle counters (SQG_BUSY_CYCLES) are never per-dispatch");
+  const listed = page.getByLabel("Counters in the selected set");
+  await expect(listed).toContainText("SQG_BUSY_CYCLES (cycles, never per-dispatch)");
+  await expect(listed).not.toContainText("SQ_INSTS_ALL");
+  await page.getByLabel("Counter set").selectOption("sqg+instructions");
+  await expect(listed).toContainText("SQ_INSTS_ALL (event count)");
+
+  await page.getByLabel("Dispatches to sample").fill("0");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "hrx counters maxSamples must be an integer between 1 and 1000000" })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).calls.length)).toBe(0);
+
+  await page.getByLabel("Dispatches to sample").fill("256");
+  await page.getByLabel("Thread trace (waves and ISA)").check();
+  await page.getByLabel("Traces to take").fill("1");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByText("Running live-hrx")).toBeVisible();
+  const started = await page.evaluate(() => (window as any).calls.at(-1));
+  expect(started.args).toEqual({
+    argv: ["/loom/loom-serve", "--listen=127.0.0.1:8093"],
+    cwd: "/work",
+    tracer: "hrx",
+    hrx: {
+      families: ["queue-events", "dispatch-events", "executable-metadata", "executable-traces", "counters"],
+      trace: { maxTraces: 1 },
+      counters: { names: ["sqg", "instructions"], maxSamples: 256 },
+    },
+  });
+
+  await page.getByRole("button", { name: "Stop and collect", exact: true }).click();
+  const summary = page.getByRole("list", { name: "Profile bundle summary" });
+  await expect(summary).toContainText("Thread trace: 2 partition(s), 8,388,544 bytes of SQTT");
+  await expect(summary).toContainText("Hardware counters: 256 sample(s) of SQG_WAVES");
+  await expect(summary).toContainText("Values are window sums over the sampled dispatches, not a census; SQG_BUSY_CYCLES is never per-dispatch.");
+  await expect(summary).toContainText("Counter sample window: exclusive among the producing device's queues, per the driver.");
+  await expect(summary).toContainText("Sampled dispatches: 256 in 1 operation(s), bound 256 (reached)");
+  await expect(summary).not.toContainText("Hardware counters: none");
+  await expect(page.getByRole("alert").filter({ hasText: "The counter sample bound of 256 dispatch(es) was reached" })).toBeVisible();
+});
+
 // Outside the desktop app the panel explains it is desktop-only and runs no IPC.
 test("live profiling is desktop-only in the browser preview", async ({ page }) => {
   await page.goto("/");

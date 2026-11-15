@@ -7,6 +7,9 @@ import {
   liveProfileStop,
 } from "../bridge";
 import {
+  HRX_COUNTER_LIMITS,
+  HRX_COUNTER_MAX_SAMPLES,
+  HRX_COUNTERS,
   HRX_DEFAULT_FAMILIES,
   HRX_DEFAULT_FLUSH_MS,
   HRX_LIMITS,
@@ -387,6 +390,63 @@ export default function LiveProfiling() {
                       value={hrxForm.traceMaxTraces}
                       onChange={(e) => setHrx({ traceMaxTraces: e.target.value })}
                       placeholder="1 (driver default)"
+                      disabled={busy}
+                    />
+                  </label>
+                </div>
+              )}
+              <label className="live-check">
+                <input
+                  type="checkbox"
+                  checked={hrxForm.counters}
+                  onChange={(e) => setHrx({ counters: e.target.checked })}
+                  disabled={busy}
+                />
+                Hardware counters (per sampled dispatch)
+              </label>
+              {hrxForm.counters && (
+                <div className="live-att">
+                  <ul className="live-note" aria-label="What hardware counters cover">
+                    {HRX_COUNTER_LIMITS.map((limit) => (
+                      <li key={limit}>{limit}</li>
+                    ))}
+                  </ul>
+                  <label>
+                    Counter set
+                    <select
+                      value={hrxForm.counterSet}
+                      onChange={(e) => setHrx({ counterSet: e.target.value as HrxForm["counterSet"] })}
+                      disabled={busy}
+                    >
+                      <option value="sqg">
+                        Default: waves, wave32/64, work items, busy cycles (per shader engine)
+                      </option>
+                      <option value="sqg+instructions">
+                        Default + instruction counts (per workgroup processor)
+                      </option>
+                    </select>
+                  </label>
+                  <p className="live-note" aria-label="Counters in the selected set">
+                    {HRX_COUNTERS.filter(
+                      (counter) =>
+                        counter.set === "sqg" ||
+                        (hrxForm.counterSet === "sqg+instructions" && counter.set === "instructions"),
+                    )
+                      .map(
+                        (counter) =>
+                          `${counter.name} (${counter.kind === "cycles" ? "cycles, never per-dispatch" : "event count"})`,
+                      )
+                      .join(" · ")}
+                  </p>
+                  <label>
+                    Dispatches to sample
+                    <input
+                      type="number"
+                      min={1}
+                      max={HRX_COUNTER_MAX_SAMPLES}
+                      value={hrxForm.counterMaxSamples}
+                      onChange={(e) => setHrx({ counterMaxSamples: e.target.value })}
+                      placeholder="4096 (driver default)"
                       disabled={busy}
                     />
                   </label>

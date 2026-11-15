@@ -1583,8 +1583,9 @@ const HRX_ONLY_KEYS: [&str; 1] = ["hrx"];
 const HRX_BUNDLE: &str = "hrx-profile.irpf";
 /// IREE HAL profiling data families (`--device_profiling_mode`). Which of them a
 /// device implements is the driver's decision: the native AMD GPU driver takes
-/// queue-events, dispatch-events and executable-metadata; the AMD XDNA NPU driver
-/// takes queue-events, host-execution, counters and executable-metadata.
+/// queue-events, dispatch-events and executable-metadata, plus executable-traces
+/// and counters when built with its PM4 producers; the AMD XDNA NPU driver takes
+/// queue-events, host-execution, counters and executable-metadata.
 const HRX_FAMILIES: [&str; 11] = [
     "queue-events",
     "host-execution",
@@ -1602,7 +1603,7 @@ const HRX_FAMILIES: [&str; 11] = [
 /// device timestamps, plus the metadata needed to resolve them.
 const HRX_DEFAULT_FAMILIES: [&str; 3] = ["queue-events", "dispatch-events", "executable-metadata"];
 /// Options of the `hrx` request object.
-const HRX_OPTIONS: [&str; 5] = ["families", "flushIntervalMs", "filterFunction", "allowPartial", "trace"];
+const HRX_OPTIONS: [&str; 6] = ["families", "flushIntervalMs", "filterFunction", "allowPartial", "trace", "counters"];
 /// The family that asks the driver for SQTT thread traces (waves and ISA).
 const HRX_TRACE_FAMILY: &str = "executable-traces";
 /// Options of `hrx.trace`, the thread-trace selection, with the tooling flag
@@ -1616,6 +1617,36 @@ const HRX_TRACE_OPTIONS: [(&str, &str, u64, u64); 5] = [
     ("bufferSize", "--device_profiling_trace_buffer_size", 128 * 1024, 512 * 1024 * 1024 - 4096),
     ("maxTraces", "--device_profiling_trace_max_traces", 1, 4096),
 ];
+/// The family that asks the driver for dispatch-scoped hardware counters.
+const HRX_COUNTER_FAMILY: &str = "counters";
+/// Options of `hrx.counters`.
+const HRX_COUNTER_OPTIONS: [&str; 2] = ["names", "maxSamples"];
+/// Set aliases the native AMD GPU driver expands: `sqg` is its default set
+/// (SQG_WAVES, SQG_WAVES_32, SQG_WAVES_64, SQG_ITEMS, SQG_BUSY_CYCLES),
+/// `instructions` the per-workgroup-processor set (SQ_WAVES, SQ_INSTS_VALU,
+/// SQ_INSTS_SALU, SQ_INSTS_ALL).
+const HRX_COUNTER_SETS: [&str; 2] = ["sqg", "instructions"];
+/// Counter names the native AMD GPU driver (gfx11.5) accepts.
+const HRX_COUNTER_NAMES: [&str; 12] = [
+    "SQG_WAVES",
+    "SQG_WAVES_32",
+    "SQG_WAVES_64",
+    "SQG_ITEMS",
+    "SQG_BUSY_CYCLES",
+    "SQG_WAVE_CYCLES",
+    "SQG_CYCLES",
+    "SQG_WAVES_SAVED",
+    "SQ_WAVES",
+    "SQ_INSTS_VALU",
+    "SQ_INSTS_SALU",
+    "SQ_INSTS_ALL",
+];
+/// The set named when the client names no counter. It is always sent: with no
+/// counter flag every device of a group would start its own default set, and
+/// the XDNA NPU driver would then measure its own counters unasked.
+const HRX_DEFAULT_COUNTER_SET: &str = "sqg";
+/// Bound on sampled dispatches a client may ask for.
+const HRX_COUNTER_MAX_SAMPLES: u64 = 1_000_000;
 /// Periodic flush used when the client names none. The native AMD GPU driver
 /// keeps a bounded ring of 4096 records per queue between flushes and drops the
 /// rest, so a long-running target needs a flush well inside that budget.
@@ -1693,6 +1724,43 @@ fn hrx_profiling_flags(a: &Value, argv: &[String], output: &Path) -> Result<Vec<
             flags.push(format!("{flag}={number}"));
         }
     }
+    let counted = families.iter().any(|f| f == HRX_COUNTER_FAMILY);
+    let counters = match options.get("counters") {
+        Some(value) => {
+            let counters = value.as_object().ok_or("hrx counters must be an object")?;
+            if !counted {
+                return Err(format!("hrx counters applies to the {HRX_COUNTER_FAMILY} family only; add it to hrx families"));
+            }
+            if let Some(unknown) = counters.keys().find(|key| !HRX_COUNTER_OPTIONS.contains(&key.as_str())) {
+                return Err(format!("Unknown hrx counters option {unknown}"));
+            }
+            Some(counters)
+        }
+        None => None,
+    };
+    if counted {
+        let names: Vec<String> = match counters.and_then(|c| c.get("names")) {
+            Some(value) => serde_json::from_value(value.clone()).map_err(|_| "hrx counters names must be an array of strings")?,
+            None => Vec::new(),
+        };
+        if let Some(unknown) = names.iter().find(|n| !HRX_COUNTER_SETS.contains(&n.as_str()) && !HRX_COUNTER_NAMES.contains(&n.as_str())) {
+            return Err(format!("Unknown hrx counter {unknown}; use a set ({}) or a counter name ({})", HRX_COUNTER_SETS.join(", "), HRX_COUNTER_NAMES.join(", ")));
+        }
+        if names.iter().enumerate().any(|(i, n)| names[..i].contains(n)) {
+            return Err("hrx counters names must be unique".into());
+        }
+        if names.is_empty() {
+            flags.push(format!("--device_profiling_counter={HRX_DEFAULT_COUNTER_SET}"));
+        }
+        flags.extend(names.iter().map(|name| format!("--device_profiling_counter={name}")));
+        if let Some(value) = counters.and_then(|c| c.get("maxSamples")) {
+            let limit = value
+                .as_u64()
+                .filter(|n| (1..=HRX_COUNTER_MAX_SAMPLES).contains(n))
+                .ok_or_else(|| format!("hrx counters maxSamples must be an integer between 1 and {HRX_COUNTER_MAX_SAMPLES}"))?;
+            flags.push(format!("--device_profiling_counter_max_samples={limit}"));
+        }
+    }
     Ok(flags)
 }
 
@@ -1733,6 +1801,7 @@ fn hrx_report(folder: &Path, output: &Path, status: &str, requested: &[String]) 
     let wanted = |family: &str| requested.iter().any(|f| f == family);
     // What capture_open will find beyond the dispatch table.
     let mut traces: Option<(usize, u64)> = None;
+    let mut counters: Option<(usize, String)> = None;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut bundle = Value::Null;
     let stderr = fs::read_to_string(folder.join("stderr.log")).unwrap_or_default();
@@ -1745,7 +1814,13 @@ fn hrx_report(folder: &Path, output: &Path, status: &str, requested: &[String]) 
         warnings.push(format!("The target rejected a profiling flag; tracer hrx needs an IREE HAL tooling binary that defines --device_profiling_mode/--device_profiling_output (loom-serve, loom-run, iree-run-module). Its stderr: {line}"));
     }
     if let Some(line) = stderr_line("unsupported XDNA profiling data families").or_else(|| stderr_line("unsupported GPU profiling data families")) {
-        warnings.push(format!("A device rejected a requested data family and the target aborted profiling for the whole device group. The native AMD GPU driver implements queue-events, dispatch-events and executable-metadata, and executable-traces when it is built with the PM4 thread-trace producer (gfx11.5, USER-published PM4 queues); the XDNA NPU driver implements queue-events, host-execution, counters and executable-metadata. For a GPU + NPU group either request only families both implement (no dispatch timing), or set hrx.allowPartial with a Loom tool built with docs/hrx-device-profiling-allow-partial.patch. Its stderr: {line}"));
+        warnings.push(format!("A device rejected a requested data family and the target aborted profiling for the whole device group. The native AMD GPU driver implements queue-events, dispatch-events and executable-metadata, and executable-traces and counters when it is built with the PM4 thread-trace and counter producers (gfx11.5, USER-published PM4 queues); the XDNA NPU driver implements queue-events, host-execution, counters and executable-metadata. For a GPU + NPU group either request only families both implement (no dispatch timing), or set hrx.allowPartial with a Loom tool built with docs/hrx-device-profiling-allow-partial.patch. Its stderr: {line}"));
+    }
+    if let Some(line) = stderr_line("device_profiling_counter") {
+        warnings.push(format!("The target rejected a counter option: hrx.counters needs a Loom tool whose native AMD GPU driver implements the counters family (its PM4 counter producer) and knows the counter names. Its stderr: {line}"));
+    }
+    if let Some(line) = stderr_line("does not support hardware counters") {
+        warnings.push(format!("The target's native AMD GPU driver predates the PM4 counter producer and refused hardware counters; rebuild the Loom tool from a tree that has it. Its stderr: {line}"));
     }
     if let Some(line) = stderr_line("device_profiling_trace_") {
         warnings.push(format!("The target rejected a thread-trace option: hrx.trace needs a Loom tool whose driver implements executable-traces and accepts the value. Its stderr: {line}"));
@@ -1773,8 +1848,32 @@ fn hrx_report(folder: &Path, output: &Path, status: &str, requested: &[String]) 
                     let reduced = stderr_line("keeps data families").map(|line| format!(" The target reported a per-device family reduction: {line}.")).unwrap_or_default();
                     warnings.push(format!("{HRX_TRACE_FAMILY} was requested but the bundle holds no thread trace, so capture_open will show no waves and no ISA rows. Either no captured operation matched the filter while the device's single trace bracket was free, or the device does not produce the family: the native AMD GPU driver traces only on gfx11.5 with USER-published PM4 queues and a Loom tool built with its PM4 thread-trace producer, and the XDNA NPU driver not at all.{reduced}"));
                 }
-                if summary.finalized && (wanted("counters") || wanted("counter-ranges")) && summary.counter_samples == 0 {
-                    warnings.push("Hardware counters were requested but the bundle holds no counter sample. The native AMD GPU driver does not implement the counters families; only the XDNA NPU driver does, and it recorded none here.".into());
+                if summary.finalized && (wanted(HRX_COUNTER_FAMILY) || wanted("counter-ranges")) && summary.counter_samples == 0 {
+                    let reduced = stderr_line("keeps data families").map(|line| format!(" The target reported a per-device family reduction: {line}.")).unwrap_or_default();
+                    warnings.push(format!("Hardware counters were requested but the bundle holds no counter sample, so capture_open will show no counter rows. Either no captured operation matched the filter and was sampled, or the device does not produce the family: the native AMD GPU driver samples dispatch counters only on gfx11.5 with USER-published PM4 queues and a Loom tool built with its PM4 counter producer (never counter-ranges), and the XDNA NPU driver rejects the GPU counter names this tracer sends.{reduced}"));
+                }
+                if summary.counter_samples > 0 {
+                    counters = Some((summary.counter_samples, summary.counter_names.join(", ")));
+                    match &summary.counter_capture {
+                        None => warnings.push("The bundle carries counter samples but no counter-captures record: nothing states whether other queues of the process overlapped the sample windows, so the capture cannot tell and every counter value is an upper bound on its dispatch's own count.".into()),
+                        Some(capture) => {
+                            if capture.foreign_state > 0 {
+                                warnings.push(format!("{} sampled operation(s) found the perfmon registers away from their reset defaults: another collector (rocprofv3 --pmc, a RADV performance query, a second profiling session) was programming the same device-wide registers, so the counter values of this run may be reset, reselected or inflated.", capture.foreign_state));
+                            }
+                            if !capture.exclusive_window {
+                                warnings.push("The producer did not report an exclusive sample window: counter values may include other queues of the process and are upper bounds on each dispatch's own count.".into());
+                            }
+                            if capture.limit_reached {
+                                warnings.push(format!("The counter sample bound of {} dispatch(es) was reached: {} dispatch(es) carry counter values and later matching dispatches ran unsampled. Raise hrx.counters.maxSamples or narrow hrx.filterFunction to move the sampled set.", capture.sample_limit, capture.sampled_dispatches));
+                            }
+                            if capture.skipped_operations > 0 {
+                                warnings.push(format!("{} matching operation(s) ran unsampled: another queue held the sample window, or the recording was made without counter slots.", capture.skipped_operations));
+                            }
+                            if capture.dropped_samples > 0 || capture.invalid_samples > 0 {
+                                warnings.push(format!("{} counter sample(s) were lost to host capacity and {} had no hardware values; lower hrx.flushIntervalMs to keep more.", capture.dropped_samples, capture.invalid_samples));
+                            }
+                        }
+                    }
                 }
                 if summary.executable_traces > 0 {
                     traces = Some((summary.executable_traces, summary.executable_trace_bytes));
@@ -1789,9 +1888,12 @@ fn hrx_report(folder: &Path, output: &Path, status: &str, requested: &[String]) 
     } else if warnings.is_empty() {
         warnings.push("The target wrote no profile bundle. Tracer hrx needs an IREE HAL tooling binary that defines --device_profiling_mode/--device_profiling_output (loom-serve, loom-run, iree-run-module); check stderr.log.".into());
     }
-    let next = match traces {
-        Some((partitions, bytes)) => format!("Use capture_open with the returned .irpf path for the dispatch table and per-kernel time. The bundle also carries {partitions} thread-trace partition(s) ({bytes} bytes of SQTT): capture_open decodes them into waves and ISA rows, which needs the ROCm trace decoder and takes roughly 1.5 s per MiB of trace. The trace is a sample (one SIMD of one workgroup processor per shader engine), not a census; the capture's coverage metadata states the selection, the covered window and what was dropped. It carries no hardware counters."),
-        None => "Use capture_open with the returned .irpf path for the dispatch table and per-kernel time. The bundle is dispatch-level: it carries no waves, ISA hotspots or hardware counters.".to_owned(),
+    let counted = counters.map(|(samples, names)| format!("{samples} counter sample(s) of {names}: capture_open attaches them as event counters joined to dispatches (capture_query dataset eventCounters) and as one series per counter (dataset counters). Counter values are window sums over the sampled dispatches, not a census: event counts are the dispatch's own only among the producing device's queues and only when the capture says the window was exclusive, and cycle counters are never per-dispatch. The capture's warnings and hrxCounter* metadata state the window, the bound and what ran unsampled."));
+    let next = match (traces, counted) {
+        (Some((partitions, bytes)), None) => format!("Use capture_open with the returned .irpf path for the dispatch table and per-kernel time. The bundle also carries {partitions} thread-trace partition(s) ({bytes} bytes of SQTT): capture_open decodes them into waves and ISA rows, which needs the ROCm trace decoder and takes roughly 1.5 s per MiB of trace. The trace is a sample (one SIMD of one workgroup processor per shader engine), not a census; the capture's coverage metadata states the selection, the covered window and what was dropped. It carries no hardware counters."),
+        (Some((partitions, bytes)), Some(counted)) => format!("Use capture_open with the returned .irpf path for the dispatch table and per-kernel time. The bundle also carries {partitions} thread-trace partition(s) ({bytes} bytes of SQTT): capture_open decodes them into waves and ISA rows, which needs the ROCm trace decoder and takes roughly 1.5 s per MiB of trace. The trace is a sample (one SIMD of one workgroup processor per shader engine), not a census; the capture's coverage metadata states the selection, the covered window and what was dropped. It also carries {counted}"),
+        (None, Some(counted)) => format!("Use capture_open with the returned .irpf path for the dispatch table and per-kernel time. The bundle carries no waves or ISA hotspots. It carries {counted}"),
+        (None, None) => "Use capture_open with the returned .irpf path for the dispatch table and per-kernel time. The bundle is dispatch-level: it carries no waves, ISA hotspots or hardware counters.".to_owned(),
     };
     json!({"status":status,"directory":folder,"files":files,"bundle":bundle,"stdout":folder.join("stdout.log"),"stderr":folder.join("stderr.log"),"warnings":warnings,"next":next})
 }
@@ -2637,7 +2739,8 @@ fn tools() -> Vec<Value> {
         .iter()
         .map(|(name, _, low, high)| ((*name).to_owned(), json!({"type":"integer","minimum":low,"maximum":high})))
         .collect();
-    let hrx = json!({"type":"object","properties":{"families":{"type":"array","items":{"enum":HRX_FAMILIES},"minItems":1},"flushIntervalMs":{"type":"integer","minimum":0,"maximum":60000},"filterFunction":str_,"allowPartial":{"type":"boolean"},"trace":{"type":"object","properties":hrx_trace,"additionalProperties":false}},"additionalProperties":false});
+    let hrx_counter_names: Vec<&str> = HRX_COUNTER_SETS.iter().chain(HRX_COUNTER_NAMES.iter()).copied().collect();
+    let hrx = json!({"type":"object","properties":{"families":{"type":"array","items":{"enum":HRX_FAMILIES},"minItems":1},"flushIntervalMs":{"type":"integer","minimum":0,"maximum":60000},"filterFunction":str_,"allowPartial":{"type":"boolean"},"trace":{"type":"object","properties":hrx_trace,"additionalProperties":false},"counters":{"type":"object","properties":{"names":{"type":"array","items":{"enum":hrx_counter_names},"uniqueItems":true},"maxSamples":{"type":"integer","minimum":1,"maximum":HRX_COUNTER_MAX_SAMPLES}},"additionalProperties":false}},"additionalProperties":false});
     let entries=vec![
  ("workspace","List open captures, tuning sessions, current view and MCP status.",json!({}),vec![]),
  ("capture_open","Import a trace, counters, ATT run, sampling data or portable capture from an explicit path.",json!({"path":str_,"samplingMethod":str_,"loadWaveStates":{"type":"boolean"}}),vec!["path"]),
@@ -2646,7 +2749,7 @@ fn tools() -> Vec<Value> {
  ("profile_trigger","Fire one capture in a live profile (tracers radv and rocprofv3; tracer hrx records the whole run and has no trigger). tracer radv: creates the file that arms one RADV RGP capture; send the workload request after this call; a pending trigger cannot be armed again until RADV consumes it. tracer rocprofv3: attaches rocprofv3 to the application, collecting the selected streams (counters, traces, att; kernel trace if none given, as in profile_run) plus optional kernelIncludeRegex/kernelExcludeRegex (mapped to --kernel-include-regex/--kernel-exclude-regex, honoured in attach mode including for att data) and optional kernelIterationRange (mapped to --kernel-iteration-range, e.g. \"64\" or \"0-3\": ATT otherwise samples the FIRST occurrence of each kernel name and a name regex cannot discriminate grids that share a name, so an iteration range is the only way to target a later dispatch) into a window-N directory. Two window modes: a TIMED window (windowMs milliseconds, default 5000) that detaches on its own, or a TRIGGERED window (triggered:true, no windowMs) that stays attached until you end it with profile_trigger end:true (writes a newline to rocprofv3's stdin so it detaches) or profile_stop — use it to capture exactly one request without guessing a duration. A window is time- or trigger-based and cannot isolate a single dispatch; only one window is open at a time; detachment can lag by 1-2 minutes (ROCm); and because rocprofv3 pickles each PID's attach options and reattaches only with identical ones, every window of one process must request the same streams, counters, att, kernel filters AND mode (timed vs triggered) — a mismatch is rejected up front, and an empty window still warns at profile_stop. Attach is retried with backoff when the ROCm set_profiler_active handshake times out on a busy queue; attachAttempts and any attachWarning are reported.",json!({"id":str_,"windowMs":{"type":"integer","minimum":1,"maximum":600000},"triggered":{"type":"boolean"},"end":{"type":"boolean"},"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_}),vec!["id"]),
  ("profile_status","Check whether a live profiled process is running. tracer radv also reports whether its trigger is pending and how many RGP saves RADV has announced; tracer rocprofv3 reports whether the current attach window is still open (windowRunning) and whether it is a triggered window (windowTriggered); tracer hrx reports the bundle path and its size so far (bundleBytes grows with each periodic flush). Call profile_stop to collect files.",json!({"id":str_}),vec!["id"]),
  ("profile_stop","Stop a live profiled application and collect its artifacts: RADV .rgp files (tracer radv), every attach window's trace/counter CSVs, .att files and decoded ui_output directories (tracer rocprofv3), or the native IREE HAL profile bundle (tracer hrx: the application is sent SIGINT and given 90 s to finalize the .irpf before it is killed; the report carries a bundle summary, with record counts per device producer under perProducer, and warns when the bundle is unfinalized, truncated or holds no dispatch events, or when one device of a group recorded none). An open triggered window is detached first by writing a newline to rocprofv3's stdin; a timed window detaches on its own. If a window has not detached after ~30 s it is sent SIGINT (rocprofv3's documented alternative detach, which still flushes --attach-sync-output), and only past 180 s is it SIGKILLed with a warning (SIGKILL can truncate the sync-output files). Warnings also surface the rocprofv3 stderr tail for any window that produced no files, and name the ROCm set_profiler_active attach failure explicitly when it occurred. Reports log paths and warnings.",json!({"id":str_}),vec!["id"]),
- ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex); kernelIterationRange (--kernel-iteration-range, e.g. \"64\" or \"0-3\") selects which occurrences are sampled, the only way to target a dispatch other than the first under a given kernel name. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. tracer hrx is for HRX/Loom applications that drive the GPU through their own native AMD driver (PM4 on KFD user queues): rocprofv3 sees none of their dispatches in any mode, so the application records its own IREE HAL profile bundle instead. argv must be an IREE HAL tooling binary that defines --device_profiling_mode/--device_profiling_output (loom-run, loom-serve, iree-run-module); those flags are appended for you and the run returns one .irpf to open with capture_open (dispatch names, grid, workgroup and device-timestamped durations; by default no waves, ISA or counters). The hrx object selects families (data families, default queue-events, dispatch-events, executable-metadata), flushIntervalMs (periodic flush, default 25; the native GPU driver keeps only 4096 records per queue between flushes, 0 disables), filterFunction (glob limiting heavy records to matching function names), allowPartial (lets each device of a GPU + NPU group keep the families it implements; needs a Loom tool built with docs/hrx-device-profiling-allow-partial.patch, otherwise a mixed group aborts on dispatch-events) and trace. Adding executable-traces to families asks the native AMD GPU driver (gfx11.5, a Loom tool built with its PM4 thread-trace producer) for SQTT thread traces, which capture_open decodes into waves and ISA rows; it is a SAMPLE of one SIMD of one workgroup processor per shader engine (about 2% of waves), never a census. Loom dispatches through recorded command buffers, so each trace brackets one whole recorded execution of the first operations matching the filter; a full buffer truncates it and the capture says how much was covered. hrx.trace selects targetCu (workgroup processor, default 0), simdSelect (default 0), shaderEngineMask (default every engine), bufferSize (bytes per shader engine, a 4096 multiple from 131072 to below 512 MiB, driver default 16 MiB; dense compute fills about 0.5 MiB per millisecond per engine) and maxTraces (driver default 1); it needs executable-traces in families. The report warns when a requested family produced nothing. A run that must be killed at the timeout leaves an unfinalized bundle; use profile_start/profile_stop for servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_,"tracer":{"enum":["rocprofv3","radv","hrx"]},"hrx":hrx,"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
+ ("profile_run","Run an application argv under a profiler and return output files to import with capture_open. tracer rocprofv3 (default) collects, in one combinable run: counters as --pmc hardware counters, traces as rocprofv3 trace streams (kernel, hip, marker, memoryCopy, memoryAllocation, scratchMemory, hsa, rccl, runtime, sys), and att as SQTT thread trace (--att) with options targetCu, simdSelect, bufferSize (bytes), shaderEngineMask; with none of the three, a kernel trace is collected. ATT writes *_shader_engine_SE_RUN.att files plus decoded ui_output directories when the rocprof trace decoder is installed; open one with capture_open for waves. kernelIncludeRegex/kernelExcludeRegex restrict collection to matching kernels (--kernel-include-regex/--kernel-exclude-regex); kernelIterationRange (--kernel-iteration-range, e.g. \"64\" or \"0-3\") selects which occurrences are sampled, the only way to target a dispatch other than the first under a given kernel name. tracer radv uses per-submit capture (experimental), which can greatly slow startup and overwrite same-second filenames; prefer profile_start/profile_trigger/profile_stop for long-lived servers. tracer hrx is for HRX/Loom applications that drive the GPU through their own native AMD driver (PM4 on KFD user queues): rocprofv3 sees none of their dispatches in any mode, so the application records its own IREE HAL profile bundle instead. argv must be an IREE HAL tooling binary that defines --device_profiling_mode/--device_profiling_output (loom-run, loom-serve, iree-run-module); those flags are appended for you and the run returns one .irpf to open with capture_open (dispatch names, grid, workgroup and device-timestamped durations; by default no waves, ISA or counters). The hrx object selects families (data families, default queue-events, dispatch-events, executable-metadata), flushIntervalMs (periodic flush, default 25; the native GPU driver keeps only 4096 records per queue between flushes, 0 disables), filterFunction (glob limiting heavy records to matching function names), allowPartial (lets each device of a GPU + NPU group keep the families it implements; needs a Loom tool built with docs/hrx-device-profiling-allow-partial.patch, otherwise a mixed group aborts on dispatch-events) , trace and counters. Adding executable-traces to families asks the native AMD GPU driver (gfx11.5, a Loom tool built with its PM4 thread-trace producer) for SQTT thread traces, which capture_open decodes into waves and ISA rows; it is a SAMPLE of one SIMD of one workgroup processor per shader engine (about 2% of waves), never a census. Loom dispatches through recorded command buffers, so each trace brackets one whole recorded execution of the first operations matching the filter; a full buffer truncates it and the capture says how much was covered. hrx.trace selects targetCu (workgroup processor, default 0), simdSelect (default 0), shaderEngineMask (default every engine), bufferSize (bytes per shader engine, a 4096 multiple from 131072 to below 512 MiB, driver default 16 MiB; dense compute fills about 0.5 MiB per millisecond per engine) and maxTraces (driver default 1); it needs executable-traces in families. Adding counters to families asks the same driver (gfx11.5, a Loom tool built with its PM4 counter producer) for hardware counters sampled around each dispatch, which capture_open attaches as event counters joined to dispatches (capture_query dataset eventCounters) and as one series per counter (dataset counters). hrx.counters selects names (default [\"sqg\"]: SQG_WAVES, SQG_WAVES_32, SQG_WAVES_64, SQG_ITEMS, SQG_BUSY_CYCLES; add \"instructions\" for the per-workgroup-processor SQ_WAVES, SQ_INSTS_VALU, SQ_INSTS_SALU, SQ_INSTS_ALL, or name single counters) and maxSamples (bound on sampled dispatches, driver default 4096); it needs counters in families, and combines with executable-traces in one run. Counter values are WINDOW SUMS over the sampled dispatches, never a census: the hardware counts every counting-enabled queue of the process inside a sample window. The driver admits one of its queues at a time, so event counts (waves, items, instructions) are the dispatch's own among that device's queues when the capture says the window was exclusive; cycle counters (SQG_BUSY_CYCLES and the other *_CYCLES) are not isolated and are never per-dispatch. The report warns when a requested family produced nothing. A run that must be killed at the timeout leaves an unfinalized bundle; use profile_start/profile_stop for servers. env adds environment variables such as VK_DRIVER_FILES or RADV_THREAD_TRACE_ROCPROF_COMPAT. Cancellable; timeoutSeconds defaults to 600, at most 3600. Does not execute a shell.",json!({"argv":{"type":"array","items":str_,"minItems":1},"cwd":str_,"profiler":str_,"counters":{"type":"array","items":str_},"traces":traces,"att":att,"kernelIncludeRegex":str_,"kernelExcludeRegex":str_,"kernelIterationRange":str_,"tracer":{"enum":["rocprofv3","radv","hrx"]},"hrx":hrx,"env":obj,"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600}}),vec!["argv","cwd"]),
  ("capture_close","Close an imported capture.",json!({"captureId":str_}),vec!["captureId"]),
  ("capture_query","Page/search capture datasets. Dataset: summary, dispatches, instructions, waves, counters, markers, hostCalls, codeObjects, intervals, events, eventCounters, monitorIntervals, otherSimd, metadata, sources, compileReports. Default limit 100, clamp 1000 (requests such as 2000 remain accepted). Returns additive effectiveLimit. Follow nextOffset until null; limit zero is count-only and can return a nonadvancing cursor. JSON key/null/nested/escaped-string search semantics are unchanged. Encoded row/page caps are 4/16 MiB, with explicit refusal and offline-export remedies. sources path inventory remains resident. Counter rows include recorded samples. compileReports returns Loom compile-time STATIC facts (unit static, version-zero/same-compiler-horizon), one row per report with report- and per-entry identity, detail flags, target resources (SGPR/VGPR, subgroup geometry, static occupancy percent, limiting resource, residency), instruction mix, allocation/spill and emitted-instruction counters, wait plan and workload geometry; these are compiler evidence, never measurements, dispatches or runtime counts.",json!({"captureId":str_,"dataset":str_,"query":str_,"offset":num,"limit":page_limit}),vec!["captureId","dataset"]),
  ("workspace_select","Follow a capture, view, range, wave, instruction or dispatch in the GUI. Views: reference, trace, hardware, summary, sampling, occupancy, dispatch, hotspots, flame, markers, counters, evidence.",json!({"captureId":str_,"view":str_,"range":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"waveId":str_,"dispatchId":str_,"instruction":num,"timeline":str_,"se":num}),vec!["captureId"]),
@@ -3630,6 +3733,102 @@ mod tests {
         }
     }
     #[test]
+    fn hrx_counter_options_need_the_counters_family_and_map_to_tooling_flags() {
+        let out = Path::new("/jobs/x/hrx-profile.irpf");
+        let app = vec!["/opt/loom/loom-serve".to_owned()];
+        let build = |a: Value| hrx_profiling_flags(&a, &app, out);
+        let counted = ["queue-events", "dispatch-events", "executable-metadata", "counters"];
+        // The family alone still names the GPU's default set: with no counter
+        // flag every device of a group would start its own default set.
+        let flags = build(json!({"hrx":{"families":counted}})).unwrap();
+        assert!(flags[0].ends_with(",counters"), "{flags:?}");
+        assert_eq!(flags[3..], ["--device_profiling_counter=sqg"]);
+        assert_eq!(build(json!({"hrx":{"families":counted,"counters":{}}})).unwrap()[3..], ["--device_profiling_counter=sqg"]);
+        assert_eq!(build(json!({"hrx":{"families":counted,"counters":{"names":[]}}})).unwrap()[3..], ["--device_profiling_counter=sqg"]);
+        // Sets and single counters pass through one flag each, in request order.
+        let flags = build(json!({"hrx":{"families":counted,"counters":{"names":["sqg","instructions"],"maxSamples":256}}})).unwrap();
+        assert_eq!(
+            flags[3..],
+            ["--device_profiling_counter=sqg", "--device_profiling_counter=instructions", "--device_profiling_counter_max_samples=256"]
+        );
+        let flags = build(json!({"hrx":{"families":counted,"counters":{"names":["SQG_WAVES","SQ_INSTS_ALL"]}}})).unwrap();
+        assert_eq!(flags[3..], ["--device_profiling_counter=SQG_WAVES", "--device_profiling_counter=SQ_INSTS_ALL"]);
+        // Thread traces and counters combine in one request; trace flags first.
+        let both = ["queue-events", "dispatch-events", "executable-metadata", "executable-traces", "counters"];
+        let flags = build(json!({"hrx":{"families":both,"allowPartial":true,"trace":{"bufferSize":4194304,"maxTraces":2},"counters":{"maxSamples":4096}}})).unwrap();
+        assert_eq!(
+            flags,
+            [
+                "--device_profiling_mode=queue-events,dispatch-events,executable-metadata,executable-traces,counters",
+                "--device_profiling_output=/jobs/x/hrx-profile.irpf",
+                "--device_profiling_flush_interval_ms=25",
+                "--device_profiling_allow_partial=true",
+                "--device_profiling_trace_buffer_size=4194304",
+                "--device_profiling_trace_max_traces=2",
+                "--device_profiling_counter=sqg",
+                "--device_profiling_counter_max_samples=4096",
+            ]
+        );
+        // Without the family no counter flag is sent at all.
+        assert!(!build(json!({})).unwrap().iter().any(|f| f.contains("device_profiling_counter")));
+        let bad = |hrx: Value| build(json!({"hrx":hrx})).unwrap_err();
+        assert_eq!(bad(json!({"counters":{}})), "hrx counters applies to the counters family only; add it to hrx families");
+        assert_eq!(bad(json!({"families":["dispatch-events","executable-traces"],"counters":{"maxSamples":8}})), "hrx counters applies to the counters family only; add it to hrx families");
+        assert_eq!(bad(json!({"families":counted,"counters":[]})), "hrx counters must be an object");
+        assert_eq!(bad(json!({"families":counted,"counters":{"set":"sqg"}})), "Unknown hrx counters option set");
+        assert_eq!(bad(json!({"families":counted,"counters":{"names":"sqg"}})), "hrx counters names must be an array of strings");
+        assert!(bad(json!({"families":counted,"counters":{"names":["GRBM_GUI_ACTIVE"]}})).starts_with("Unknown hrx counter GRBM_GUI_ACTIVE; use a set (sqg, instructions) or a counter name (SQG_WAVES, "));
+        assert_eq!(bad(json!({"families":counted,"counters":{"names":["sqg","sqg"]}})), "hrx counters names must be unique");
+        assert_eq!(bad(json!({"families":counted,"counters":{"maxSamples":0}})), "hrx counters maxSamples must be an integer between 1 and 1000000");
+        assert_eq!(bad(json!({"families":counted,"counters":{"maxSamples":1000001}})), "hrx counters maxSamples must be an integer between 1 and 1000000");
+        assert_eq!(bad(json!({"families":counted,"counters":{"maxSamples":"8"}})), "hrx counters maxSamples must be an integer between 1 and 1000000");
+        // Both tools publish the counters schema; only tracer hrx may carry it.
+        for tool in ["profile_run", "profile_start"] {
+            let schema = tools().into_iter().find(|t| t["name"] == tool).unwrap()["inputSchema"].clone();
+            let counters = &schema["properties"]["hrx"]["properties"]["counters"];
+            let names: std::collections::BTreeSet<String> = counters["properties"].as_object().unwrap().keys().cloned().collect();
+            assert_eq!(names, HRX_COUNTER_OPTIONS.iter().map(|name| (*name).to_owned()).collect::<std::collections::BTreeSet<_>>(), "{tool}");
+            assert_eq!(counters["additionalProperties"], false, "{tool}");
+            assert_eq!(counters["properties"]["names"]["items"]["enum"].as_array().unwrap().len(), HRX_COUNTER_SETS.len() + HRX_COUNTER_NAMES.len(), "{tool}");
+            let request = |hrx: Value| json!({"argv":["app"],"cwd":"/","tracer":"hrx","hrx":hrx});
+            assert!(validate(&request(json!({"families":both,"trace":{"maxTraces":1},"counters":{"names":["sqg","instructions"],"maxSamples":64}})), &schema).is_ok(), "{tool}");
+            assert!(validate(&request(json!({"families":counted,"counters":{"names":["NOT_A_COUNTER"]}})), &schema).is_err(), "{tool}");
+            assert!(validate(&request(json!({"families":counted,"counters":{"sets":["sqg"]}})), &schema).is_err(), "{tool}");
+            // The schema checks shape; hrx_profiling_flags checks ranges (above).
+            assert!(validate(&request(json!({"families":counted,"counters":{"maxSamples":"8"}})), &schema).is_err(), "{tool}");
+        }
+    }
+    #[test]
+    fn hrx_report_describes_counters_and_what_limits_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        let output = folder.join(HRX_BUNDLE);
+        let warnings = |report: &Value| report["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        // A synthetic bundle with the counter families: two of its three
+        // dispatches sampled, an exclusive window and the sample bound reached.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/irpf/synthetic-hrx-counters.irpf");
+        fs::copy(&fixture, &output).unwrap();
+        let requested: Vec<String> = ["queue-events", "dispatch-events", "executable-metadata", "counters"].iter().map(|f| (*f).to_owned()).collect();
+        let report = hrx_report(&folder, &output, "stopped", &requested);
+        assert_eq!(report["bundle"]["counterSamples"], 2);
+        assert_eq!(report["bundle"]["counterSets"], 1);
+        assert_eq!(report["bundle"]["counterNames"], json!(["SQG_WAVES", "SQG_WAVES_32", "SQG_WAVES_64", "SQG_ITEMS", "SQG_BUSY_CYCLES"]));
+        assert_eq!(report["bundle"]["counterCapture"]["exclusiveWindow"], true);
+        assert_eq!(report["bundle"]["counterCapture"]["sampledDispatches"], 2);
+        let said = warnings(&report);
+        assert_eq!(said.len(), 1, "{report}");
+        assert!(said[0].contains("The counter sample bound of 2 dispatch(es) was reached"), "{report}");
+        let next = report["next"].as_str().unwrap();
+        assert!(next.contains("2 counter sample(s) of SQG_WAVES, SQG_WAVES_32, SQG_WAVES_64, SQG_ITEMS, SQG_BUSY_CYCLES"), "{next}");
+        assert!(next.contains("window sums") && next.contains("cycle counters are never per-dispatch") && next.contains("no waves or ISA hotspots"), "{next}");
+        assert!(!next.contains("no hardware counters") && !next.contains("dispatch-level"), "{next}");
+        // An old tool's refusal and a rejected counter flag are named from stderr.
+        fs::write(folder.join("stderr.log"), "profile.c:683: UNIMPLEMENTED; GPU queue profiling does not support hardware counters\n").unwrap();
+        assert!(warnings(&hrx_report(&folder, &output, "failed", &requested)).iter().any(|w| w.contains("predates the PM4 counter producer")));
+        fs::write(folder.join("stderr.log"), "flags.c:521: INVALID_ARGUMENT; flag 'device_profiling_counter_max_samples' not recognized\n").unwrap();
+        assert!(warnings(&hrx_report(&folder, &output, "failed", &requested)).iter().any(|w| w.contains("rejected a counter option")));
+    }
+    #[test]
     fn hrx_report_says_when_a_requested_family_produced_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().to_path_buf();
@@ -3707,6 +3906,9 @@ mod tests {
             executable_traces: 0,
             executable_trace_bytes: 0,
             counter_samples: 0,
+            counter_sets: 0,
+            counter_names: vec![],
+            counter_capture: None,
             truncated: vec![],
             failed_sessions: vec![],
             per_producer,
