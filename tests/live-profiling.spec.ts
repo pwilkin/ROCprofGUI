@@ -259,7 +259,9 @@ test("live profiling hrx branch starts with the hrx object and shows the bundle 
   // The limits are stated before anything runs, and the rocprofv3 field is gone.
   const limits = page.getByRole("list", { name: "What the hrx tracer records" });
   await expect(limits).toContainText("no window to trigger");
-  await expect(limits).toContainText("No waves, no ISA, no hardware counters");
+  await expect(limits).toContainText("Dispatch-level by default");
+  // The thread-trace fields stay hidden until the option is ticked.
+  await expect(page.getByLabel("Trace buffer per shader engine (MiB)")).toHaveCount(0);
   await expect(limits).toContainText("XDNA device may record no dispatches");
   await expect(page.getByLabel("rocprofv3 path (optional)")).toHaveCount(0);
 
@@ -344,6 +346,78 @@ test("live profiling hrx defaults send an empty hrx object and report a missing 
   await expect(page.getByRole("list", { name: "Profile bundle summary" })).toContainText("No profile bundle was written.");
   await expect(page.getByText("0 file(s)", { exact: false })).toBeVisible();
   await expect(page.getByRole("alert").filter({ hasText: "rejected a requested data family" })).toBeVisible();
+});
+
+// The thread-trace option adds the executable-traces family and sends the trace
+// selection; a bad value is rejected locally with the core's message, and the
+// collected view presents the trace as a sample to decode, with its loss.
+test("live profiling hrx thread trace sends the family and trace options and reports a sampled trace", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as any;
+    w.isTauri = true;
+    w.calls = [];
+    w.__TAURI_INTERNALS__ = {
+      invoke: async (command: string, payload: any) => {
+        if (command === "mcp_status") return { active: null, revision: 0, workspace: {}, server: null };
+        w.calls.push({ command, args: payload?.args ?? {} });
+        if (command === "live_profile_start")
+          return { id: "live-hrx", pid: 79, directory: "/jobs/live-hrx", bundle: "/jobs/live-hrx/hrx-profile.irpf", captureMode: "whole-run" };
+        if (command === "live_profile_stop")
+          return {
+            status: "stopped",
+            exitCode: 0,
+            directory: "/jobs/live-hrx",
+            files: ["/jobs/live-hrx/hrx-profile.irpf"],
+            bundle: {
+              bytes: 11390925, finalized: true, sessions: 1, producers: ["amd-gpu"], functions: 78,
+              dispatchEvents: 4285, queueEvents: 16286, executableTraces: 2, executableTraceBytes: 8388544, counterSamples: 0,
+              truncated: [{ family: "executable-traces", dropped: 149 }], failedSessions: [],
+              perProducer: [{ producer: "amd-gpu", sessions: 1, dispatchEvents: 4285, queueEvents: 16286 }],
+            },
+            warnings: ["A thread trace is TRUNCATED: its buffer filled, the hardware dropped tokens (149 counted), or the stop did not finish."],
+          };
+        throw Error(command);
+      },
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Live profiling", exact: true }).click();
+  await page.getByLabel("Tracer").selectOption("hrx");
+  await page.getByLabel("Command").fill("/loom/loom-serve --listen=127.0.0.1:8093");
+  await page.getByLabel("Working directory").fill("/work");
+  await page.getByLabel("Thread trace (waves and ISA)").check();
+  const covers = page.getByRole("list", { name: "What a thread trace covers" });
+  await expect(covers).toContainText("A sample, not a census");
+  await expect(covers).toContainText("one whole recorded execution");
+
+  await page.getByLabel("Trace buffer per shader engine (MiB)").fill("512");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "hrx trace bufferSize must be an integer between 131072 and 536866816" })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).calls.length)).toBe(0);
+
+  await page.getByLabel("Trace buffer per shader engine (MiB)").fill("64");
+  await page.getByLabel("Workgroup processor").fill("4");
+  await page.getByLabel("Traces to take").fill("2");
+  await page.getByRole("button", { name: "Start profiling", exact: true }).click();
+  await expect(page.getByText("Running live-hrx")).toBeVisible();
+  const started = await page.evaluate(() => (window as any).calls.at(-1));
+  expect(started.args).toEqual({
+    argv: ["/loom/loom-serve", "--listen=127.0.0.1:8093"],
+    cwd: "/work",
+    tracer: "hrx",
+    hrx: {
+      families: ["queue-events", "dispatch-events", "executable-metadata", "executable-traces"],
+      trace: { targetCu: 4, bufferSize: 67108864, maxTraces: 2 },
+    },
+  });
+
+  await page.getByRole("button", { name: "Stop and collect", exact: true }).click();
+  const summary = page.getByRole("list", { name: "Profile bundle summary" });
+  await expect(summary).toContainText("Thread trace: 2 partition(s), 8,388,544 bytes of SQTT");
+  await expect(summary).toContainText("not a census");
+  await expect(summary).toContainText("TRUNCATED thread trace");
+  await expect(summary).not.toContainText("the bundle is dispatch-level");
+  await expect(page.getByRole("alert").filter({ hasText: "A thread trace is TRUNCATED" })).toBeVisible();
 });
 
 // Outside the desktop app the panel explains it is desktop-only and runs no IPC.

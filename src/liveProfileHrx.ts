@@ -27,11 +27,30 @@ export const HRX_DEFAULT_FAMILIES = ["queue-events", "dispatch-events", "executa
 // Periodic flush the core applies when the request names none (HRX_DEFAULT_FLUSH_MS).
 export const HRX_DEFAULT_FLUSH_MS = 25;
 
+// The family that asks the driver for SQTT thread traces (HRX_TRACE_FAMILY).
+export const HRX_TRACE_FAMILY = "executable-traces";
+
+// Options of `hrx.trace` with the range the core accepts (HRX_TRACE_OPTIONS).
+export const HRX_TRACE_OPTIONS = [
+  { name: "targetCu", low: 0, high: 15 },
+  { name: "simdSelect", low: 0, high: 3 },
+  { name: "shaderEngineMask", low: 1, high: 255 },
+  { name: "bufferSize", low: 128 * 1024, high: 512 * 1024 * 1024 - 4096 },
+  { name: "maxTraces", low: 1, high: 4096 },
+] as const;
+
 // What the panel says about the tracer before a run: its three limits.
 export const HRX_LIMITS = [
   "Records the whole run: the application writes its own IREE HAL profile from start to exit, so there is no window to trigger. Stop and collect interrupts it (SIGINT) so the bundle is finalized.",
-  "Dispatch-level only: kernel names, grids and device time. No waves, no ISA, no hardware counters.",
+  "Dispatch-level by default: kernel names, grids and device time. Waves and ISA need the thread-trace option below; hardware counters are not available.",
   "On a GPU + NPU group the XDNA device may record no dispatches: its driver implements no dispatch-events family.",
+] as const;
+
+// What the panel says next to the thread-trace option: what a trace is and is not.
+export const HRX_TRACE_LIMITS = [
+  "A sample, not a census: SQTT traces one SIMD of one workgroup processor per shader engine, about 2% of a dispatch's waves on gfx1151.",
+  "Loom dispatches through recorded command buffers, so each trace brackets one whole recorded execution of the first operations matching the filter. A full buffer truncates it; the capture states the covered window and what was dropped.",
+  "Needs the native AMD GPU driver's PM4 thread-trace producer (gfx11.5). A device that does not produce the family is reported after the run.",
 ] as const;
 
 export interface HrxForm {
@@ -46,6 +65,15 @@ export interface HrxForm {
   // Blank means every function.
   filterFunction: string;
   allowPartial: boolean;
+  // Adds the executable-traces family and sends the trace fields below.
+  trace: boolean;
+  // Thread-trace selection; blank means the driver default.
+  traceTargetCu: string;
+  traceSimdSelect: string;
+  traceShaderEngineMask: string;
+  // Per shader engine, in MiB.
+  traceBufferMib: string;
+  traceMaxTraces: string;
 }
 
 export const emptyHrxForm = (): HrxForm => ({
@@ -55,7 +83,25 @@ export const emptyHrxForm = (): HrxForm => ({
   flushIntervalMs: "",
   filterFunction: "",
   allowPartial: false,
+  trace: false,
+  traceTargetCu: "",
+  traceSimdSelect: "",
+  traceShaderEngineMask: "",
+  traceBufferMib: "",
+  traceMaxTraces: "",
 });
+
+// One `hrx.trace` field: blank is absent, anything else must be an integer in
+// the core's range for that option.
+function traceOption(name: string, raw: string, toValue: (n: number) => number = (n) => n): number | undefined {
+  const text = raw.trim();
+  if (text === "") return undefined;
+  const option = HRX_TRACE_OPTIONS.find((o) => o.name === name)!;
+  const value = toValue(Number(text));
+  if (!Number.isInteger(value) || value < option.low || value > option.high)
+    throw new Error(`hrx trace ${name} must be an integer between ${option.low} and ${option.high}`);
+  return value;
+}
 
 // Builds the `hrx` object of a profile_start request from the panel's fields.
 // Unset fields are left out so the core's defaults apply.
@@ -63,11 +109,30 @@ export function hrxOptions(form: HrxForm): Json {
   const options: Json = {};
   if (form.familyMode === "custom") {
     const families = [...form.families, ...form.extraFamilies.split(/[\s,]+/).filter(Boolean)];
+    if (form.trace && !families.includes(HRX_TRACE_FAMILY)) families.push(HRX_TRACE_FAMILY);
     if (families.length === 0) throw new Error("hrx families cannot be empty");
     const unknown = families.find((family) => !(HRX_FAMILIES as readonly string[]).includes(family));
     if (unknown !== undefined) throw new Error(`Unknown hrx data family ${unknown}`);
     if (new Set(families).size !== families.length) throw new Error("hrx families must be unique");
     options.families = families;
+  } else if (form.trace) {
+    // The default set no longer applies once a family is added to it.
+    options.families = [...HRX_DEFAULT_FAMILIES, HRX_TRACE_FAMILY];
+  }
+  if (form.trace) {
+    const bufferSize = traceOption("bufferSize", form.traceBufferMib, (mib) => mib * 1024 * 1024);
+    if (bufferSize !== undefined && bufferSize % 4096 !== 0)
+      throw new Error("hrx trace bufferSize must be a multiple of 4096 bytes");
+    const trace: Json = {};
+    const fields: [string, number | undefined][] = [
+      ["targetCu", traceOption("targetCu", form.traceTargetCu)],
+      ["simdSelect", traceOption("simdSelect", form.traceSimdSelect)],
+      ["shaderEngineMask", traceOption("shaderEngineMask", form.traceShaderEngineMask)],
+      ["bufferSize", bufferSize],
+      ["maxTraces", traceOption("maxTraces", form.traceMaxTraces)],
+    ];
+    for (const [name, value] of fields) if (value !== undefined) trace[name] = value;
+    if (Object.keys(trace).length > 0) options.trace = trace;
   }
   const flush = form.flushIntervalMs.trim();
   if (flush !== "") {
@@ -137,7 +202,15 @@ export function hrxBundleLines(result: Json): string[] {
     }
   const truncated = Array.isArray(bundle.truncated) ? (bundle.truncated as Json[]) : [];
   for (const family of truncated)
-    lines.push(`TRUNCATED ${String(family.family)}: ${count(family.dropped)} record(s) dropped by the producer`);
-  lines.push("Waves, ISA and hardware counters: none (the bundle is dispatch-level).");
+    lines.push(
+      family.family === HRX_TRACE_FAMILY
+        ? `TRUNCATED thread trace: a buffer filled, tokens were dropped (${count(family.dropped)} counted) or the stop did not finish`
+        : `TRUNCATED ${String(family.family)}: ${count(family.dropped)} record(s) dropped by the producer`,
+    );
+  if (typeof bundle.executableTraces === "number" && bundle.executableTraces > 0)
+    lines.push(
+      `Thread trace: ${count(bundle.executableTraces)} partition(s), ${count(bundle.executableTraceBytes)} bytes of SQTT. Open the capture to decode waves and ISA rows: a sample of one SIMD of one workgroup processor per shader engine, not a census. Hardware counters: none.`,
+    );
+  else lines.push("Waves, ISA and hardware counters: none (the bundle is dispatch-level).");
   return lines;
 }

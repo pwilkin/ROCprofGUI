@@ -10,6 +10,7 @@ import {
   HRX_DEFAULT_FAMILIES,
   HRX_DEFAULT_FLUSH_MS,
   HRX_LIMITS,
+  HRX_TRACE_LIMITS,
   emptyHrxForm,
   hrxBundleLines,
   hrxOptions,
@@ -312,6 +313,85 @@ export default function LiveProfiling() {
                 whole group failing. The application must define <code>--device_profiling_allow_partial</code>{" "}
                 (docs/hrx-device-profiling-allow-partial.patch).
               </p>
+              <label className="live-check">
+                <input
+                  type="checkbox"
+                  checked={hrxForm.trace}
+                  onChange={(e) => setHrx({ trace: e.target.checked })}
+                  disabled={busy}
+                />
+                Thread trace (waves and ISA)
+              </label>
+              {hrxForm.trace && (
+                <div className="live-att">
+                  <ul className="live-note" aria-label="What a thread trace covers">
+                    {HRX_TRACE_LIMITS.map((limit) => (
+                      <li key={limit}>{limit}</li>
+                    ))}
+                  </ul>
+                  <label>
+                    Workgroup processor
+                    <input
+                      type="number"
+                      min={0}
+                      max={15}
+                      value={hrxForm.traceTargetCu}
+                      onChange={(e) => setHrx({ traceTargetCu: e.target.value })}
+                      placeholder="0"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label>
+                    SIMD
+                    <input
+                      type="number"
+                      min={0}
+                      max={3}
+                      value={hrxForm.traceSimdSelect}
+                      onChange={(e) => setHrx({ traceSimdSelect: e.target.value })}
+                      placeholder="0"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label>
+                    Shader-engine mask
+                    <input
+                      type="number"
+                      min={1}
+                      max={255}
+                      value={hrxForm.traceShaderEngineMask}
+                      onChange={(e) => setHrx({ traceShaderEngineMask: e.target.value })}
+                      placeholder="every engine"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label>
+                    Trace buffer per shader engine (MiB)
+                    <input
+                      type="number"
+                      min={0.125}
+                      max={511}
+                      step="any"
+                      value={hrxForm.traceBufferMib}
+                      onChange={(e) => setHrx({ traceBufferMib: e.target.value })}
+                      placeholder="16 (driver default)"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label>
+                    Traces to take
+                    <input
+                      type="number"
+                      min={1}
+                      max={4096}
+                      value={hrxForm.traceMaxTraces}
+                      onChange={(e) => setHrx({ traceMaxTraces: e.target.value })}
+                      placeholder="1 (driver default)"
+                      disabled={busy}
+                    />
+                  </label>
+                </div>
+              )}
             </>
           )}
           <button onClick={start} disabled={busy || !argv.trim() || !cwd.trim()}>

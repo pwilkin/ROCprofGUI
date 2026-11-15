@@ -6,8 +6,12 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 //   { "mcpPort": 8799, "tokenFile": "...", "command": "<as typed in the panel>",
 //     "cwd": "...", "readyUrl": "http://127.0.0.1:8093/v1/models",
 //     "workloadUrl": "http://127.0.0.1:8093/v1/chat/completions",
-//     "workloadFiles": ["request.json"], "outputDir": "..." }
-// naming a PRIVATE headless rocprof-studio and an HRX/Loom target.
+//     "workloadFiles": ["request.json"], "outputDir": "...",
+//     "trace": { "bufferMib": "16", "maxTraces": "2", "targetCu": "0" } }
+// naming a PRIVATE headless rocprof-studio and an HRX/Loom target. "trace" is
+// optional: with it the panel's thread-trace option is ticked and filled, and
+// the run must return thread-trace partitions (the target's driver needs the
+// PM4 thread-trace producer).
 //
 // The panel runs in Chromium, where no Tauri IPC exists, so each live_profile_*
 // command is forwarded to the profile_* MCP tool of that instance. Both entries
@@ -121,6 +125,13 @@ test("hrx panel click-through captures a real run through a private instance", a
   await page.getByLabel("Command").fill(config.command);
   await page.getByLabel("Working directory").fill(config.cwd);
   await page.getByLabel("Allow partial families per device").check();
+  if (config.trace) {
+    await page.getByLabel("Thread trace (waves and ISA)").check();
+    await expect(page.getByRole("list", { name: "What a thread trace covers" })).toContainText("A sample, not a census");
+    if (config.trace.bufferMib) await page.getByLabel("Trace buffer per shader engine (MiB)").fill(String(config.trace.bufferMib));
+    if (config.trace.maxTraces) await page.getByLabel("Traces to take").fill(String(config.trace.maxTraces));
+    if (config.trace.targetCu) await page.getByLabel("Workgroup processor").fill(String(config.trace.targetCu));
+  }
   await page.screenshot({ path: `${config.outputDir}/1-form.png`, fullPage: true });
   await page.getByRole("button", { name: "Start profiling", exact: true }).click();
   await expect(page.getByText(/Running [0-9a-f]{16,}/)).toBeVisible({ timeout: 60_000 });
@@ -157,7 +168,12 @@ test("hrx panel click-through captures a real run through a private instance", a
   const summary = page.getByRole("list", { name: "Profile bundle summary" });
   await expect(summary).toBeVisible({ timeout: 3 * 60 * 1000 });
   await expect(summary).toContainText("· finalized");
-  await expect(summary).toContainText("Waves, ISA and hardware counters: none");
+  if (config.trace) {
+    await expect(summary).toContainText(/Thread trace: \d+ partition\(s\)/);
+    await expect(summary).toContainText("not a census");
+  } else {
+    await expect(summary).toContainText("Waves, ISA and hardware counters: none");
+  }
   await page.screenshot({ path: `${config.outputDir}/3-collected.png`, fullPage: true });
 
   const lines = await summary.getByRole("listitem").allTextContents();
@@ -172,4 +188,10 @@ test("hrx panel click-through captures a real run through a private instance", a
   const stop = calls[2].result as any;
   expect(stop.bundle.finalized).toBe(true);
   expect(stop.bundle.dispatchEvents).toBeGreaterThan(0);
+  if (config.trace) {
+    const start = calls[0].args as any;
+    expect(start.hrx.families).toContain("executable-traces");
+    expect(stop.bundle.executableTraces).toBeGreaterThan(0);
+    expect(stop.bundle.executableTraceBytes).toBeGreaterThan(0);
+  }
 });

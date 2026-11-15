@@ -258,7 +258,8 @@ export const exportCaptureArchive = (captureId: string) =>
 
 // Live profiling: thin wrappers over the live_profile_* desktop commands, which
 // share the same core as the MCP profile_* tools. Each takes the same argument
-// object the MCP tool would, passed through verbatim.
+// object the MCP tool would, passed through verbatim — including the hrx
+// tracer's `hrx` object with its `trace` selection (liveProfileHrx.ts builds it).
 export type LiveProfileResult = Record<string, unknown>;
 export const liveProfileStart = (args: Record<string, unknown>) =>
   invoke<LiveProfileResult>("live_profile_start", { args });
