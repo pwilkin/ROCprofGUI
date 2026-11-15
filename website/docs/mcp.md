@@ -23,7 +23,7 @@ When idle, the app shows the endpoint details it is serving:
 
 ## How this tool list was obtained
 
-The tool inventory below was captured from an installed 0.2.1 server with an isolated data directory on a free port. The argument and analysis contracts have been reviewed against the 0.3.0 source; this release review did not probe or redeploy the installed service:
+The tool inventory below was captured from an installed 0.2.1 server with an isolated data directory on a free port. The argument and analysis contracts were reviewed against the 0.3.0 source, and the profiling tools (`profile_*`, including tracer `hrx`) against the 0.4.0 source; neither review probed or redeployed the installed service:
 
 ```bash
 ROCPROFGUI_HOME=/tmp/rps-home rocprof-studio --headless --mcp-port 8791
@@ -32,7 +32,7 @@ ROCPROFGUI_HOME=/tmp/rps-home rocprof-studio --headless --mcp-port 8791
 Then `initialize` → `notifications/initialized` → `tools/list` were sent over the legacy SSE transport and the returned JSON schemas turned into the table. The live server reported `serverInfo` `{name: "rocprof-studio", version: "0.2.1"}` and 31 tools.
 
 ::: tip Count check
-The recorded 0.2.1 `tools/list` returned 31 tools; the 0.3.0 source retains that inventory. Some internal notes say 27; that count predates the four staged-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`). Trust 31.
+The recorded 0.2.1 `tools/list` returned 31 tools; the 0.4.0 source retains that inventory (31 tool entries). Some internal notes say 27; that count predates the four staged-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`). Trust 31.
 :::
 
 ## Tool reference (31 tools)
@@ -108,11 +108,11 @@ Kernel and timeline transport excludes unrelated capture datasets. Exact kernel 
 
 | Tool | Purpose | Key arguments |
 | --- | --- | --- |
-| `profile_run` | Run an argv under a profiler and return output files to import. `tracer` `rocprofv3` (default) collects, combinable in one run, `counters` (`--pmc`), `traces` (stream names `kernel`, `hip`, `marker`, `memoryCopy`, `memoryAllocation`, `scratchMemory`, `hsa`, `rccl`, `runtime`, `sys`) and `att` (SQTT thread trace; options `targetCu`, `simdSelect`, `bufferSize`, `shaderEngineMask`); with none of the three it collects a kernel trace. Kernel filters (`kernelIncludeRegex`, `kernelExcludeRegex`) and `kernelIterationRange` (`--kernel-iteration-range`, e.g. `64` or `0-3`) narrow collection to specific dispatches. `tracer` `radv` is per-submit Vulkan capture (experimental). `tracer` `hrx` is for HRX/Loom applications on the native AMD driver (PM4 on KFD user queues, invisible to rocprofv3): `--device_profiling_*` flags are appended to an IREE HAL tooling argv (`loom-serve`, `loom-run`, `iree-run-module`) and the run returns one native `.irpf` bundle; the `hrx` object takes `families`, `flushIntervalMs`, `filterFunction`, `allowPartial`, `trace` (SQTT thread traces for waves and ISA, with `executable-traces` in `families`) and `counters` (`names`, `maxSamples`; hardware counters sampled around dispatches, with `counters` in `families`). Counter values are window sums over the sampled dispatches, not a census. | `argv*`, `cwd*`, `profiler`, `tracer`, `counters`, `traces`, `att`, `kernelIncludeRegex`, `kernelExcludeRegex`, `kernelIterationRange`, `hrx`, `env`, `timeoutSeconds` |
+| `profile_run` | Run an argv under a profiler and return output files to import. `tracer` `rocprofv3` (default) collects, combinable in one run, `counters` (`--pmc`), `traces` (stream names `kernel`, `hip`, `marker`, `memoryCopy`, `memoryAllocation`, `scratchMemory`, `hsa`, `rccl`, `runtime`, `sys`) and `att` (SQTT thread trace; options `targetCu`, `simdSelect`, `bufferSize`, `shaderEngineMask`); with none of the three it collects a kernel trace. Kernel filters (`kernelIncludeRegex`, `kernelExcludeRegex`) and `kernelIterationRange` (`--kernel-iteration-range`, e.g. `64` or `0-3`) narrow collection to specific dispatches. `tracer` `radv` is per-submit Vulkan capture (experimental). `tracer` `hrx` is for HRX/Loom applications on the native AMD driver (PM4 on KFD user queues, invisible to rocprofv3): `--device_profiling_*` flags are appended to an IREE HAL tooling argv (`loom-serve`, `loom-run`, `iree-run-module`) and the run returns one native `.irpf` bundle; the `hrx` object takes `families`, `flushIntervalMs`, `filterFunction`, `allowPartial`, `trace` (SQTT thread traces for waves and ISA, with `executable-traces` in `families`) and `counters` (`names`, `maxSamples`; hardware counters sampled around dispatches, with `counters` in `families`). Counter values are window sums over the sampled dispatches, not a census. See [the `hrx` tracer](#hrx). | `argv*`, `cwd*`, `profiler`, `tracer`, `counters`, `traces`, `att`, `kernelIncludeRegex`, `kernelExcludeRegex`, `kernelIterationRange`, `hrx`, `env`, `timeoutSeconds` |
 | `profile_start` | Start a long-lived application for gated live profiling. `tracer` `radv` (default): a Vulkan server under RADV RGP **file-trigger** capture. `tracer` `rocprofv3`: a HIP/ROCm application armed with `ROCP_TOOL_ATTACH=1`, so each trigger attaches rocprofv3 for one bounded time window (`profiler` overrides the rocprofv3 path). `tracer` `hrx`: an HRX/Loom native-driver application that records its own IREE HAL profile for its whole lifetime (same `hrx` object as `profile_run`); it has no trigger window, and `profile_stop` interrupts it so the bundle is finalized. Returns an ID and log paths immediately. | `argv*`, `cwd*`, `env`, `tracer`, `profiler`, `hrx` |
-| `profile_trigger` | Fire one capture in a live profile. RADV: creates the file that arms one RGP capture. rocprofv3: attaches and collects the selected streams (same `counters`/`traces`/`att`/kernel filters/`kernelIterationRange` as `profile_run`) into a `window-N/` directory. A window is **timed** (`windowMs`, default 5000, detaches on its own) or **triggered** (`triggered: true`, no `windowMs`, stays attached until `{"end": true}` writes a newline to rocprofv3's stdin, or `profile_stop`). On a busy-queue attach abort it retries with backoff and reports `attachAttempts`. | `id*`, `windowMs`, `triggered`, `end`, `counters`, `traces`, `att`, `kernelIncludeRegex`, `kernelExcludeRegex`, `kernelIterationRange` |
-| `profile_status` | Whether the profiled process is running. RADV: also whether its trigger is pending and how many RGP saves RADV announced. rocprofv3: also `windowRunning` and, for a triggered window, `windowTriggered`. | `id*` |
-| `profile_stop` | Stop a live profiled application and collect artifacts: `.rgp` files (RADV), or every window's trace/counter CSVs, `.att` files and decoded output (rocprofv3; an open window is detached by newline/self-timer, escalated to SIGINT after ~30 s and SIGKILL only past 180 s). Warns on overwrites and on windows that produced no files. | `id*` |
+| `profile_trigger` | Fire one capture in a live profile (tracers `radv` and `rocprofv3`; tracer `hrx` records the whole run and has no trigger). RADV: creates the file that arms one RGP capture. rocprofv3: attaches and collects the selected streams (same `counters`/`traces`/`att`/kernel filters/`kernelIterationRange` as `profile_run`) into a `window-N/` directory. A window is **timed** (`windowMs`, default 5000, detaches on its own) or **triggered** (`triggered: true`, no `windowMs`, stays attached until `{"end": true}` writes a newline to rocprofv3's stdin, or `profile_stop`). On a busy-queue attach abort it retries with backoff and reports `attachAttempts`. | `id*`, `windowMs`, `triggered`, `end`, `counters`, `traces`, `att`, `kernelIncludeRegex`, `kernelExcludeRegex`, `kernelIterationRange` |
+| `profile_status` | Whether the profiled process is running. RADV: also whether its trigger is pending and how many RGP saves RADV announced. rocprofv3: also `windowRunning` and, for a triggered window, `windowTriggered`. hrx: the bundle path and its size so far (`bundleBytes`, which grows with each periodic flush). | `id*` |
+| `profile_stop` | Stop a live profiled application and collect artifacts: `.rgp` files (RADV), or every window's trace/counter CSVs, `.att` files and decoded output (rocprofv3; an open window is detached by newline/self-timer, escalated to SIGINT after ~30 s and SIGKILL only past 180 s), or the native `.irpf` bundle (hrx; the application is sent SIGINT and given 90 s to finalize the bundle before it is killed, and the report carries a bundle summary with record counts per device producer under `perProducer`). Warns on overwrites, on windows that produced no files, and on an hrx bundle that is unfinalized, truncated, holds no dispatch events or lacks a requested family. | `id*` |
 
 ### Tuning (compiles candidates; can write source) {#tuning}
 
@@ -126,7 +126,7 @@ Kernel and timeline transport excludes unrelated capture datasets. Exact kernel 
 The raw `tools/list` JSON — the full schema for every argument of every tool — was saved as the evidence this table was generated from.
 
 ::: tip Desktop Live profiling panel
-The four live-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`) also back a compact **Live profiling** panel in the desktop sidebar. It calls the same core through `live_profile_*` Tauri commands, so the launch, windowing and collection logic is shared, not forked: pick the tracer, enter the argv and working directory, start, trigger timed or triggered windows with streams, counters, ATT and its `targetCu`/`simdSelect`/`bufferSize`/`shaderEngineMask` sub-options, kernel include/exclude regexes and a kernel iteration range, watch windows and attach attempts, then stop to collect. The window duration is validated against the same 1–600000 ms bound the MCP schema enforces, and errors surface in the panel's own vocabulary rather than raw MCP tool names.
+The four live-profiling tools (`profile_start`, `profile_trigger`, `profile_status`, `profile_stop`) also back a compact **Live profiling** panel in the desktop sidebar. It calls the same core through `live_profile_*` Tauri commands, so the launch, windowing and collection logic is shared, not forked: pick the tracer, enter the argv and working directory, start, trigger timed or triggered windows with streams, counters, ATT and its `targetCu`/`simdSelect`/`bufferSize`/`shaderEngineMask` sub-options, kernel include/exclude regexes and a kernel iteration range, watch windows and attach attempts, then stop to collect. The window duration is validated against the same 1–600000 ms bound the MCP schema enforces, and errors surface in the panel's own vocabulary rather than raw MCP tool names. With tracer `hrx` the panel has no trigger; it offers the `hrx` options described [below](#hrx), including "Thread trace (waves and ISA)" and "Hardware counters (per sampled dispatch)", and on stop lists the bundle summary and every warning. The panel's start request is checked against the `profile_start` input schema for every tracer before anything starts.
 :::
 
 ## Profiling examples {#profiling-examples}
@@ -173,10 +173,58 @@ The returned `files` list holds `counter_collection.csv`, the `*_kernel_trace.cs
 - **Detachment can lag** the end of the window. `profile_status` reports `windowRunning` (and `windowTriggered` for a triggered window) until rocprofv3 has detached; `profile_stop` waits for an open window to detach, sending SIGINT (rocprofv3's documented alternative detach) after ~30 s and SIGKILL only past 180 s.
 :::
 
+### An HRX/Loom application on the native AMD driver {#hrx}
+
+Current Loom tooling (`loom-serve`, `loom-run`, `loom-benchmark`) drives the GPU through its own native AMD driver: it opens `/dev/kfd`, creates its own KFD user queues and writes PM4 into them. rocprofv3 sees none of those dispatches in any trace, counter or ATT mode. Tracer `hrx` has the application record its own IREE HAL profile bundle instead: the `--device_profiling_*` flags are appended to the argv you pass (an argv that already carries one is rejected), and the result is one `.irpf` to open with `capture_open`.
+
+```json
+{"name":"profile_start","arguments":{
+  "tracer":"hrx","cwd":"/path/to/run",
+  "argv":["/path/to/loom-serve","--devices=devices.json","--model=deployment.json","--listen=127.0.0.1:8093"],
+  "hrx":{"families":["queue-events","dispatch-events","executable-metadata","executable-traces","counters"],
+         "allowPartial":true,
+         "trace":{"bufferSize":4194304,"maxTraces":1},
+         "counters":{"names":["sqg"],"maxSamples":4096}}}}
+// → wait for the server to become ready, send the workload, then:
+{"name":"profile_stop","arguments":{"id":"…"}}
+{"name":"capture_open","arguments":{"path":"<job>/hrx-profile.irpf"}}
+// Per-dispatch rows of one counter, with kernel, grid and workgroup in "scope":
+{"name":"capture_query","arguments":{"captureId":"…","dataset":"eventCounters","query":"\"name\":\"sqg_waves\"","limit":1000}}
+// Coverage statement and the hrxTrace* / hrxCounter* keys:
+{"name":"capture_query","arguments":{"captureId":"…","dataset":"metadata"}}
+```
+
+With no `hrx` object the request collects the default families and gives dispatch names, grids, workgroup sizes and device-timestamped durations, with no waves, ISA or counters.
+
+| `hrx` option | Meaning | Default |
+| --- | --- | --- |
+| `families` | Data families to request. `executable-traces` adds SQTT thread traces (waves and ISA); `counters` adds hardware counters. | `queue-events`, `dispatch-events`, `executable-metadata` |
+| `flushIntervalMs` | Periodic flush, 0 to 60000; 0 disables it. The native GPU driver keeps 4,096 records per queue between flushes and drops the rest. | 25 |
+| `filterFunction` | Glob limiting the heavy records to matching function names. | none |
+| `allowPartial` | Lets each device of a GPU + NPU group keep the families it implements. Needs a Loom tool built with the allow-partial patch. | off |
+| `trace.targetCu`, `trace.simdSelect`, `trace.shaderEngineMask` | Which workgroup processor (0–15), SIMD (0–3) and shader engines (mask 1–255) are traced. | driver: WGP 0, SIMD 0, every engine |
+| `trace.bufferSize` | Bytes per shader engine, a 4,096 multiple from 131,072 to below 512 MiB. | driver: 16 MiB |
+| `trace.maxTraces` | Number of traces to take, 1–4,096. | driver: 1 |
+| `counters.names` | The sets `sqg` (`SQG_WAVES`, `SQG_WAVES_32`, `SQG_WAVES_64`, `SQG_ITEMS`, `SQG_BUSY_CYCLES`) and `instructions` (`SQ_WAVES`, `SQ_INSTS_VALU`, `SQ_INSTS_SALU`, `SQ_INSTS_ALL`), or single names: those nine plus `SQG_WAVE_CYCLES`, `SQG_CYCLES`, `SQG_WAVES_SAVED`. | `["sqg"]`, always sent |
+| `counters.maxSamples` | Bound on sampled dispatches, 1–1,000,000. | driver: 4,096 |
+
+`trace` is rejected unless `families` includes `executable-traces`, and `counters` unless it includes `counters`. The two combine in one run.
+
+::: warning hrx caveats
+- **Traces and counters need a patched Loom tool.** Waves and ISA need a tool built from hrx-system branch `profiling/executable-traces`, counters one built from `profiling/counters`. Both are local branches, not upstream, and the driver implements them for gfx11.5 and USER-published PM4 queues only. A stock tool rejects the families and the report says so.
+- **A thread trace is a sample of about 2% of waves**, never a census: one SIMD of one workgroup processor per shader engine. Loom dispatches through recorded command buffers, so a trace brackets one whole recorded execution, and a full buffer truncates it. The capture states the covered window.
+- **Counter values are window sums over the sampled dispatches.** Event counts (waves, work items, instructions) are the dispatch's own only among the producing device's queues and only when the capture reports an exclusive sample window. Cycle counters are never per-dispatch.
+- **Only the first matching dispatches are sampled**, up to `counters.maxSamples`. Later dispatches carry no counter values.
+- **There is no trigger and no attach.** The target records from start to exit; `profile_stop` interrupts it (SIGINT) and waits up to 90 s for the bundle to be finalized. With `profile_run`, a run killed at the timeout leaves an unfinalized bundle.
+- **A GPU + NPU device group** aborts on `dispatch-events` unless the tool carries the allow-partial patch and the request sets `allowPartial`. The XDNA device then records queue events only, and kernels placed on the NPU never appear as dispatches.
+:::
+
+The full reference, with the measured captures behind these statements, is [HRX profiling](https://github.com/pwilkin/ROCprofGUI/blob/main/docs/hrx-profiling.md). Limits are summarized under [Limits](/limits#hrx).
+
 ## Safety & boundaries
 
 - **Analysis tools are read-only.** `capture_*` (except open/close of in-memory state), `wave_*`, `hidden_latency`, `source_read`, `reference_query`, `capture_query` only read.
-- **`profile_run` / `profile_start` launch a program you supply.** `profile_run` runs `[profiler, --output-format csv, --output-directory <job dir>, …] -- <argv>` with no shell, a default profiler of `/opt/rocm/bin/rocprofv3`, counter names validated to `[A-Za-z0-9_]`, and a 600 s default timeout (max 3600 s). `profile_start` with `tracer: "rocprofv3"` launches the argv itself (armed with `ROCP_TOOL_ATTACH=1`); each `profile_trigger` then runs the profiler with `--attach <pid>` for the window. Output goes to a job folder under `~/.rocprofgui/mcp/jobs/` and stays there (it is the capture). `env` is honoured except the runner's own `LD_PRELOAD`/`HSA_TOOLS_*`/`TMPDIR` handling. RADV writes to a fixed `/tmp` path, so a RADV run moves what it wrote into the job folder after checking for space.
+- **`profile_run` / `profile_start` launch a program you supply.** `profile_run` runs `[profiler, --output-format csv, --output-directory <job dir>, …] -- <argv>` with no shell, a default profiler of `/opt/rocm/bin/rocprofv3`, counter names validated to `[A-Za-z0-9_]`, and a 600 s default timeout (max 3600 s). `profile_start` with `tracer: "rocprofv3"` launches the argv itself (armed with `ROCP_TOOL_ATTACH=1`); each `profile_trigger` then runs the profiler with `--attach <pid>` for the window. With `tracer: "hrx"` both tools launch the argv itself with `--device_profiling_*` flags appended and no profiler process. Output goes to a job folder under `~/.rocprofgui/mcp/jobs/` and stays there (it is the capture). `env` is honoured except the runner's own `LD_PRELOAD`/`HSA_TOOLS_*`/`TMPDIR` handling. RADV writes to a fixed `/tmp` path, so a RADV run moves what it wrote into the job folder after checking for space.
 - **Tuning tools compile and run candidate kernels/shaders, and `save` writes a replacement source definition back to disk.** See [Kernel tuning](/kernel-tuning) and [Shader tuning](/shader-tuning).
 - **`capture_analyze` needs Node.js at runtime** (it runs the frontend's own analysis modules bundled as a Node CLI).
 - Calls are serialized, except `tuning_status` and `profile_status`, which answer while another call runs. After a dropped connection, repeat the same call with the same arguments — it joins the running call or returns its finished result. Cancel with `notifications/cancelled` or the desktop Cancel button.
@@ -248,8 +296,8 @@ curl -s --max-time 10 -D - http://127.0.0.1:8765/mcp \
        "params":{"protocolVersion":"2024-11-05","capabilities":{},
                  "clientInfo":{"name":"demo","version":"1.0"}}}'
 # → Mcp-Session-Id: <id>
-# Example response from a 0.3.0 build:
-# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.3.0"},...}}
+# Example response from a 0.4.0 build:
+# → data: {"id":1,...,"result":{"serverInfo":{"name":"rocprof-studio","version":"0.4.0"},...}}
 ```
 
 ::: warning The handshake is per-connection

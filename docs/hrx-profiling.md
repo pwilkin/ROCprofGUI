@@ -2,9 +2,21 @@
 
 This note records how rocprof studio opens profiles produced by **HRX**, which
 trace paths actually work on this hardware, and the exact scope and limits of the
-native IRPF importer. Everything here is grounded in the retained hrx-b99 beta
-artifacts; nothing is inferred from a guessed schema (see
-[blocked-inputs.md](blocked-inputs.md) for that rule).
+native IRPF importer. The legacy-driver sections are grounded in the retained
+hrx-b99 beta artifacts, and the native AMD driver sections in captures taken on
+gfx1151 against hrx-system `23e9b32232`; nothing is inferred from a guessed
+schema (see [blocked-inputs.md](blocked-inputs.md) for that rule).
+
+What ships in rocprof studio 0.4.0 for the native AMD driver, with the section
+that states each one's limits:
+
+| Surface | Where | Needs |
+|---|---|---|
+| Tracer `hrx` on `profile_run`, `profile_start`, `profile_stop` | [Collecting: tracer `hrx`](#collecting-tracer-hrx) | an IREE HAL tooling binary with `--device_profiling_*` flags |
+| Tracer `hrx` in the desktop Live profiling panel | [In the desktop app](#in-the-desktop-app-the-live-profiling-panel) | the same |
+| Dispatch timing on a GPU + NPU device group | [A GPU + NPU device group needs a patched tool](#a-gpu--npu-device-group-needs-a-patched-tool) | a Loom tool built with `hrx-device-profiling-allow-partial.patch` |
+| Waves and ISA rows (a sample of about 2% of waves) | [Thread traces](#thread-traces-executable-traces) | hrx-system branch `profiling/executable-traces` (not upstream), gfx11.5 |
+| Hardware counters for the sampled dispatches (window sums) | [Hardware counters](#hardware-counters-counters) | hrx-system branch `profiling/counters` (not upstream), gfx11.5 |
 
 ## What HRX and Loom are
 
@@ -558,7 +570,12 @@ bracket per device, because the trace registers are device-wide:
   per engine), `hrxTraceWindow` (covered time and share of the traced operation),
   `hrxTraceWaves`, `hrxTraceWavesAreASample`, `hrxTraceSkippedOperations`,
   `hrxTraceLimit` and `hrxTraceClockPlacement`, plus a warning that waves and ISA
-  rows are a sample, and one for each kind of loss.
+  rows are a sample, and one for each kind of loss. `hrxTraceImport` says how
+  the import went (`N of M trace(s) decoded`, or `not imported` when no trace
+  could be staged or decoded), and a decoded import adds `hrxTraceCount`,
+  `hrxTraceInstructionRows`, `hrxTraceInstructionRowsWithHits` and, when the
+  decoder reports it, `hrxTraceDecoderGfxip`. A bundle without trace chunks
+  carries no `hrxTrace*` key.
 - Imports a lossy trace with those warnings instead of rejecting it. A trace that
   cannot be staged, decoded or placed is left out with the reason, and the
   dispatch capture still opens. Only a malformed trace chunk rejects the bundle.
@@ -671,8 +688,10 @@ the capture filter are sampled, up to the bound (`counters.maxSamples`, driver
 default 4,096). The capture warns with the sampled share (`N of M dispatches carry
 counter values`) and with every reason a dispatch has none: the bound was
 reached, a matching operation ran unsampled, samples were dropped for lack of
-host capacity or had no hardware values. Totals in `metadata` cover the sampled
-dispatches only. As with the roughly 2% wave sample of a thread trace, nothing
+host capacity or had no hardware values. The tracer sends
+`--device_profiling_counter_max_samples` only when `counters.maxSamples` is
+given (1 to 1,000,000), so the 4,096 default is the driver's. Totals in
+`metadata` cover the sampled dispatches only. As with the roughly 2% wave sample of a thread trace, nothing
 here is presented as a census.
 
 **What the importer refuses to do.**
@@ -721,8 +740,11 @@ that kernel's rows.
 A check that is worth doing on a kernel whose geometry is known: `SQG_WAVES`
 equals workgroups times `ceil(threads per workgroup / wave size)`, where the
 workgroups are grid over workgroup size per dimension and the wave size is the
-one whose counter (`SQG_WAVES_32` or `SQG_WAVES_64`) is nonzero. The env-gated
-test `real_counters_bundle_joins_wave_counts_to_dispatch_geometry` prints that
+one whose counter (`SQG_WAVES_32` or `SQG_WAVES_64`) is nonzero. The capture's
+grid is the workgroup count times the workgroup size, so the workgroup count is
+not the grid itself. For Loom kernels on gfx1151 the wave size is 32 (measured
+below), which makes the expected count workgroups times `ceil(threads / 32)`.
+The env-gated test `real_counters_bundle_joins_wave_counts_to_dispatch_geometry` prints that
 comparison for a real bundle.
 
 **The real captures (2026-11-15).** `loom-serve` on the Qwen3.8-27B hybrid

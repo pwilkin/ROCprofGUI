@@ -71,6 +71,27 @@ A smaller kernel page cannot reduce exact aggregate input or union state. For of
 - Raw counter series retain their names and scopes; no architecture-derived normalization is guessed.
 - Timeline **Detail** aggregation is a pixel-bucket approximation, not pixel-identical Qt rendering.
 
+## HRX / Loom native-driver profiling {#hrx}
+
+Tracer `hrx` and the IRPF importer cover HRX/Loom applications on the native AMD driver, which rocprofv3 cannot observe. These limits are stated by the capture itself (`metadata.coverage`, the `hrxTrace*` and `hrxCounter*` metadata keys, and warnings); the numbers below were measured on gfx1151 only. The full account is in [HRX profiling](https://github.com/pwilkin/ROCprofGUI/blob/main/docs/hrx-profiling.md).
+
+| Limit | What it means |
+| --- | --- |
+| Driver build | Waves and ISA need a Loom tool built from hrx-system branch `profiling/executable-traces`; hardware counters need `profiling/counters`. Both are local branches, not upstream. A stock tool gives dispatch names, grids and timing only. |
+| Hardware | The driver implements thread traces and counters for gfx11.5 and USER-published PM4 queues. Other GPU generations, AQL queues and KERNEL-published queues return unimplemented. |
+| Wave coverage | A thread trace is a sample of about 2% of waves: one SIMD of one workgroup processor per shader engine. Wave counts, instruction hits and hotspots describe the sampled waves only. Per-kernel time still comes from every dispatch event. |
+| Trace extent | A recorded command buffer is traced whole or not at all, and a full buffer truncates the trace. The driver default of 16 MiB per shader engine covered 31 ms of a 577 ms recorded execution. One trace is in flight per device. |
+| Trace decode time | `capture_open` decodes every trace partition: about 1.5 s per MiB of trace (79 s for a 64 MiB capture). |
+| Counter values | Window sums over the sampled dispatches. Event counts are the dispatch's own only among the producing device's queues and only when the capture reports an exclusive sample window; otherwise they are upper bounds. Cycle counters (`SQG_BUSY_CYCLES`, `SQG_WAVE_CYCLES`, `SQG_CYCLES`) are never per-dispatch. |
+| Counter coverage | Only the first dispatches matching the filter are sampled, up to `hrx.counters.maxSamples` (driver default 4,096). Totals cover the sampled dispatches only; a counter with no sample reads "not collected", never zero. |
+| Counter cost | About 44 µs per dispatch for the `sqg` set and about 210 µs with the `instructions` set added; dispatch intervals moved by about 2%. |
+| Counter width | The per-workgroup-processor `SQ_*` counters are 32 bits wide. |
+| Collection window | The target records from start to exit. There is no trigger, no window and no attach to a running server. |
+| GPU + NPU groups | Dispatch timing needs a Loom tool built with the allow-partial patch and `hrx.allowPartial`. The XDNA device records queue events and executable metadata only; kernels placed on the NPU never appear as dispatches. |
+| Time base | Dispatch ticks are device-relative; events are not placed on a host timeline. |
+
+Loom kernels on gfx1151 run as 32-lane waves, so the expected `SQG_WAVES` of a dispatch is its workgroup count times `ceil(threads per workgroup / 32)`: a 256-thread workgroup is 8 waves. The workgroup count is the capture's grid divided by the workgroup size per dimension.
+
 ## What is not implemented
 
 - **LLM source iteration.** The sidebar's "Kernel experiments · Isolation, tuning & AI iteration" placeholder is marked PLANNED; the AI-iteration part does not exist. (Kernel and shader *tuning* themselves are implemented and wired — see [Kernel tuning](/kernel-tuning) / [Shader tuning](/shader-tuning).)
